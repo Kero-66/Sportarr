@@ -310,9 +310,6 @@ public class EventPartDetector
             new("Race", new[] { @"(?<!practice\s)(?<!sprint\s)(?<!qualifying\s)(?<!quali\s)(?<!shootout\s)\brace\b" }),
         },
 
-        // NOTE: Formula E sessions removed - Sportarr API only has main race events, not individual sessions.
-        // Can be added back when the API provides FP1/FP2/FP3/Qualifying as separate events.
-
         // MotoGP sessions - Similar structure to F1 but with different terminology
         // IMPORTANT: Most specific patterns MUST come first (first match wins)
         // MotoGP has separate Qualifying 1 and Qualifying 2 events
@@ -410,6 +407,16 @@ public class EventPartDetector
             new("Qualifying", new[] { @"\bqualif(ying|ier)?\b", @"\bquali\b", @"\bduels?\b" }),
             // Listed so the selector can offer it. The race is the E Prix
             // itself, which the default below reads.
+            new("Race", new[] { @"\brace\b" }),
+        },
+
+        // NASCAR support sessions name themselves, while the race uses its
+        // sponsor title. The default below identifies that unnamed race.
+        ["NASCAR"] = new List<MotorsportSessionType>
+        {
+            new("Practice 2", new[] { @"\b(final\s*|free\s*)?practice\s*(2|two)\b", @"\bfp2\b" }),
+            new("Practice 1", new[] { @"\b(final\s*|free\s*)?practice\s*(1|one)?\b", @"\bfp1\b" }),
+            new("Qualifying", new[] { @"\bqualif(ying|ier)?\b", @"\bquali\b" }),
             new("Race", new[] { @"\brace\b" }),
         },
 
@@ -1121,6 +1128,7 @@ public class EventPartDetector
         ["IndyCar"] = "Race",
         ["WEC"] = "Race",
         ["Formula E"] = "Race",
+        ["NASCAR"] = "Race",
     };
 
     /// <summary>

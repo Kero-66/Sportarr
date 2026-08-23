@@ -734,24 +734,32 @@ public class ImportMatchingService
             }
         }
 
-        // Motorsport session match: if parsed filename has a session (Race, Qualifying, etc.),
-        // compare against the event's title to disambiguate events sharing the same round number
-        if (sportsResult != null && !string.IsNullOrEmpty(sportsResult.Session) && sportsResult.RoundNumber.HasValue)
+        // Session identity does not depend on a round number. Some series do
+        // not publish one, and unfamiliar filename shapes can still carry a
+        // clear session label in the original name.
+        var releaseSession = sportsResult?.Session;
+        if (sportsResult != null && EventPartDetector.IsMotorsport(eventSport ?? ""))
+        {
+            releaseSession = EventPartDetector.DetectMotorsportSessionFromFilename(
+                sportsResult.OriginalFilename, evt.League?.Name);
+        }
+
+        if (!string.IsNullOrEmpty(releaseSession))
         {
             var eventSession = EventPartDetector.DetectMotorsportSessionType(evt.Title, evt.League?.Name ?? "");
             if (!string.IsNullOrEmpty(eventSession))
             {
-                if (eventSession.Equals(sportsResult.Session, StringComparison.OrdinalIgnoreCase))
+                if (eventSession.Equals(releaseSession, StringComparison.OrdinalIgnoreCase))
                 {
                     confidence += 20; // Session matches — strong signal
                     _logger.LogDebug("[Import Matching] Session match boost: '{Session}' matches event '{EventTitle}'",
-                        sportsResult.Session, evt.Title);
+                        releaseSession, evt.Title);
                 }
                 else
                 {
                     confidence -= 100; // Session mismatch — hard reject (e.g., file is "Practice 1" but event is "Race")
                     _logger.LogDebug("[Import Matching] Session mismatch REJECT: parsed '{ParsedSession}' vs event '{EventSession}' for '{EventTitle}'",
-                        sportsResult.Session, eventSession, evt.Title);
+                        releaseSession, eventSession, evt.Title);
                 }
             }
             else
@@ -760,7 +768,7 @@ public class ImportMatchingService
                 // e.g., "Practice 1" file matching a generic "Grand Prix" event
                 confidence -= 30;
                 _logger.LogDebug("[Import Matching] File has session '{Session}' but event '{EventTitle}' has no session — penalizing",
-                    sportsResult.Session, evt.Title);
+                    releaseSession, evt.Title);
             }
         }
 

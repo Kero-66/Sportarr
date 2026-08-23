@@ -83,6 +83,46 @@ public class MotorsportSessionIdentityTests
         result.Rejections.Should().Contain("Session mismatch: release is 'Practice 1', event is 'Race'");
     }
 
+    [Theory]
+    [InlineData("NASCAR.Cup.Series.2026.Daytona.Practice.1080p.WEB-DL.H264-MWR", "Practice 1")]
+    [InlineData("NASCAR.Cup.Series.2026.Daytona.Qualifying.1080p.WEB-DL.H264-MWR", "Qualifying")]
+    public async Task NascarSupportSessionDoesNotMatchSponsorTitledRace(
+        string releaseTitle, string session)
+    {
+        await using var rig = await PartIdentityIntegrationHarness.CreateAsync(
+            title: "Coke Zero Sugar 400",
+            sport: "Motorsport", leagueName: "NASCAR Cup Series", relational: true);
+        rig.Event.Season = "2026";
+        rig.Event.SeasonNumber = 2026;
+        rig.Event.EventDate = new DateTime(2026, 8, 29, 18, 30, 0, DateTimeKind.Utc);
+
+        var result = rig.Services.GetRequiredService<ReleaseMatchingService>()
+            .ValidateRelease(
+                Release(releaseTitle),
+                rig.Event, null, true);
+
+        result.IsHardRejection.Should().BeTrue();
+        result.Rejections.Should().Contain($"Session mismatch: release is '{session}', event is 'Race'");
+    }
+
+    [Fact]
+    public async Task NascarRaceReleaseCanMatchSponsorTitledRace()
+    {
+        await using var rig = await PartIdentityIntegrationHarness.CreateAsync(
+            title: "Coke Zero Sugar 400",
+            sport: "Motorsport", leagueName: "NASCAR Cup Series", relational: true);
+        rig.Event.Season = "2026";
+        rig.Event.SeasonNumber = 2026;
+        rig.Event.EventDate = new DateTime(2026, 8, 29, 18, 30, 0, DateTimeKind.Utc);
+
+        var result = rig.Services.GetRequiredService<ReleaseMatchingService>()
+            .ValidateRelease(
+                Release("NASCAR.Cup.Series.2026.Coke.Zero.Sugar.400.Race.1080p.WEB-DL.H264-MWR"),
+                rig.Event, null, true);
+
+        result.IsHardRejection.Should().BeFalse(string.Join("; ", result.Rejections));
+    }
+
     private static ReleaseSearchResult Release(string title) => new()
     {
         Title = title,

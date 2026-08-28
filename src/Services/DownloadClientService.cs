@@ -437,7 +437,7 @@ public class DownloadClientService : IDownloadClientService
                 DownloadClientType.Sabnzbd => WrapLegacyResult(await AddToSabnzbdAsync(config, url, category, expectedName)),
                 DownloadClientType.NzbGet => WrapLegacyResult(await AddToNzbGetAsync(config, url, category)),
                 DownloadClientType.Decypharr => await AddToDecypharrWithResultAsync(config, url, category, expectedName, seedRatioLimit, seedTimeLimitMinutes),
-                DownloadClientType.DecypharrUsenet => WrapLegacyResult(await AddToDecypharrUsenetAsync(config, url, category)), // Decypharr usenet only supports addfile mode (not addurl) and requires a specific request format. See https://docs.decypharr.com/guides/usenet/sabnzbd/
+                DownloadClientType.DecypharrUsenet => WrapLegacyResult(await AddToDecypharrUsenetAsync(config, url, category, expectedName)), // Decypharr usenet only supports addfile mode (not addurl) and requires a specific request format. See https://docs.decypharr.com/guides/usenet/sabnzbd/
                 DownloadClientType.NZBdav => WrapLegacyResult(await AddToSabnzbdViaUrlAsync(config, url, category, expectedName)), // NZBdav uses SABnzbd API but only supports addurl mode (not addfile)
                 DownloadClientType.TorrentBlackhole or DownloadClientType.UsenetBlackhole => await AddToBlackholeAsync(config, url, expectedName),
                 DownloadClientType.Aria2 => WrapLegacyResult(await AddToAria2Async(config, url, category)),
@@ -488,12 +488,11 @@ public class DownloadClientService : IDownloadClientService
     /// <param name="expectedCategory">
     /// The category this download was actually grabbed under (DownloadQueueItem.GrabCategory),
     /// null for legacy rows created before that field existed. Clients that support
-    /// category/label scoping compare the live item's current category against this
-    /// (falling back to config.Category when null) and report it as not found on a
-    /// mismatch, so a download reassigned to another app sharing the same client isn't
-    /// tracked forever - the item id never disappears, only its owner does. Using the
-    /// grab-time value rather than the client's live Category avoids false positives for
-    /// downloads grabbed under a per-root-folder category override.
+    /// category or label scoping compare the live item's current category against this.
+    /// SAB-compatible clients keep an exact client ID authoritative because some
+    /// emulators do not preserve the submitted category. Using the grab-time value
+    /// rather than the client's live Category avoids false positives for downloads
+    /// grabbed under a per-root-folder category override.
     /// </param>
     public async Task<DownloadClientStatus?> GetDownloadStatusAsync(DownloadClient config, string downloadId, string? expectedCategory = null)
     {
@@ -539,8 +538,8 @@ public class DownloadClientService : IDownloadClientService
             {
                 DownloadClientType.QBittorrent => await FindQBittorrentDownloadByTitleAsync(config, title, category),
                 DownloadClientType.Decypharr => await FindDecypharrDownloadByTitleAsync(config, title, category),
-                // DecypharrUsenet uses SABnzbd API which doesn't support title-based lookup
-                // Other clients can be added later - for now return null
+                DownloadClientType.Sabnzbd or DownloadClientType.NZBdav or DownloadClientType.DecypharrUsenet =>
+                    await FindSabnzbdDownloadByTitleAsync(config, title, category),
                 _ => (null, null)
             };
         }
@@ -1237,10 +1236,11 @@ public class DownloadClientService : IDownloadClientService
     ///   - File field name "name" (not "nzbfile")
     /// See: https://docs.decypharr.com/guides/usenet/sabnzbd/
     /// </summary>
-    private async Task<string?> AddToDecypharrUsenetAsync(DownloadClient config, string url, string category)
+    private async Task<string?> AddToDecypharrUsenetAsync(
+        DownloadClient config, string url, string category, string? expectedName)
     {
         var client = GetSabnzbdClient(config);
-        return await client.AddNzbForDecypharrAsync(config, url, category);
+        return await client.AddNzbForDecypharrAsync(config, url, category, expectedName);
     }
 
     private async Task<string?> AddToNzbGetAsync(DownloadClient config, string url, string category)
@@ -1479,6 +1479,13 @@ public class DownloadClientService : IDownloadClientService
     {
         var client = GetQBittorrentClient(config);
         return await client.FindTorrentByTitleAsync(config, title, category);
+    }
+
+    private async Task<(DownloadClientStatus? Status, string? NewDownloadId)> FindSabnzbdDownloadByTitleAsync(
+        DownloadClient config, string title, string category)
+    {
+        var client = GetSabnzbdClient(config);
+        return await client.FindDownloadByTitleAsync(config, title, category);
     }
 
     // Aria2 client methods

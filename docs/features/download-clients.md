@@ -12,6 +12,12 @@
 
 Sportarr does not unpack archives for torrents. Where an indexer delivers packed releases, run [Unpackerr](../integrations/unpackerr.md) against the same download folder and it extracts them before Sportarr imports.
 
+## SAB-compatible clients
+
+Give Sportarr its own category when SABnzbd, NZBdav, or Decypharr shares a queue with another application. Sportarr sends both common category parameter names so compatible clients keep the job in that category.
+
+Sportarr tracks each grab by the job ID returned by the client. That exact ID remains authoritative if a compatible client files the job under the wrong category. If the client replaces the ID, Sportarr can recover a single exact release-title match. It refuses partial or ambiguous title matches.
+
 ## Post-import behavior
 
 Each download client has a **Post-Import Mode** controlling how files reach your library:

@@ -152,10 +152,75 @@ public class FileImportService : IFileImportService
     /// <param name="download">The download queue item to import</param>
     /// <param name="overridePath">Optional: Use this path instead of querying download client.
     /// Used for manual imports where we already know the file path.</param>
-    public async Task<ImportHistory> ImportDownloadAsync(
+    public Task<ImportHistory> ImportDownloadAsync(
         DownloadQueueItem download,
         string? overridePath = null,
-        PostImportMode? manualImportMode = null)
+        PostImportMode? manualImportMode = null) =>
+        ImportDownloadWithScopeAsync(download, overridePath, manualImportMode);
+
+    internal Task<ImportHistory> ImportCompletedPackAsync(DownloadQueueItem download, Func<Task> completeImport, bool retryHeld = false) =>
+        ImportDownloadWithScopeAsync(download, null, null, completeImport, retryHeld);
+
+    private async Task<ImportHistory> ImportDownloadWithScopeAsync(
+        DownloadQueueItem download, string? overridePath, PostImportMode? manualImportMode,
+        Func<Task>? completeImport = null, bool retryHeld = false)
+    {
+        var resolvePackMember = download.IsPack && (string.IsNullOrEmpty(overridePath) || !File.Exists(overridePath));
+        if (!resolvePackMember) return await ImportDownloadCoreAsync(download, overridePath, manualImportMode);
+        if (download.Id == 0 || !download.DownloadClientId.HasValue || string.IsNullOrWhiteSpace(download.DownloadId))
+            return await HoldPackMemberAsync(download, "The directory has no persisted client job identity.");
+
+        using var jobScope = await PackImportJobScope.EnterAsync(_db, download);
+        var clientId = download.DownloadClientId;
+        var downloadId = download.DownloadId;
+        var completedAt = download.CompletedAt;
+        var outputPath = download.OutputPath;
+        if (_db.Entry(download).State == EntityState.Detached) _db.Entry(download).State = EntityState.Unchanged;
+        await _db.Entry(download).ReloadAsync();
+        if (_db.Entry(download).State == EntityState.Detached) return null!;
+        if (download.DownloadClientId != clientId || download.DownloadId != downloadId || !download.IsPack)
+        {
+            _logger.LogWarning("[Import] The pack job changed while this import waited. Skipping the old request.");
+            return null!;
+        }
+        if (download.Status == DownloadStatus.Imported) return null!;
+        if (retryHeld)
+        {
+            if (!PackImportBoundary.IsHeld(download) || download.Progress < 100) return null!;
+            download.Status = DownloadStatus.Importing;
+            download.ErrorMessage = null;
+            await _db.SaveChangesAsync();
+        }
+        download.CompletedAt ??= completedAt;
+        download.OutputPath ??= outputPath;
+
+        var owners = await PackImportBoundary.ReadOwnersAsync(_db, download);
+        var eventIds = owners.Select(owner => owner.EventId).ToHashSet();
+        // Tracked siblings may predate the import that just released this job.
+        foreach (var tracked in _db.ChangeTracker.Entries<Event>().Where(x => eventIds.Contains(x.Entity.Id)).ToList())
+            await tracked.ReloadAsync();
+        foreach (var tracked in _db.ChangeTracker.Entries<EventFile>().Where(x => eventIds.Contains(x.Entity.EventId)).ToList())
+            await tracked.ReloadAsync();
+        foreach (var tracked in _db.ChangeTracker.Entries<DownloadQueueItem>()
+            .Where(x => x.Entity.Id != download.Id && x.Entity.DownloadClientId == clientId && x.Entity.DownloadId == downloadId).ToList())
+            await tracked.ReloadAsync();
+        var result = await ImportDownloadCoreAsync(download, overridePath, manualImportMode);
+        if (result != null && completeImport != null)
+        {
+            try
+            {
+                await completeImport();
+            }
+            catch (Exception cleanupError)
+            {
+                _logger.LogWarning(cleanupError, "[Import] Client cleanup failed after the pack member was imported: {Title}", download.Title);
+            }
+        }
+        return result;
+    }
+
+    private async Task<ImportHistory> ImportDownloadCoreAsync(
+        DownloadQueueItem download, string? overridePath, PostImportMode? manualImportMode)
     {
         _logger.LogInformation("Starting import for download: {Title} (ID: {DownloadId})",
             download.Title, download.DownloadId);
@@ -301,6 +366,8 @@ public class FileImportService : IFileImportService
             // downloads with no IndexerId) skip this block entirely.
             await CheckFailDownloadsAsync(download, downloadPath);
 
+            var packDirectory = download.IsPack && (string.IsNullOrEmpty(overridePath) || !File.Exists(overridePath));
+
             // Find video files
             var videoFiles = FindVideoFiles(downloadPath);
 
@@ -369,7 +436,15 @@ public class FileImportService : IFileImportService
             // show, analysis, highlights) edges out the actual session by a few
             // percent - then the biggest cleanly-named file is preferred (#205).
             // Uses symlink-resolving file size for debrid service compatibility.
-            var sourceFile = Helpers.MainFileSelector.SelectMainVideoFile(videoFiles, GetFileSizeResolvingSymlinks);
+            string sourceFile;
+            if (packDirectory)
+            {
+                var owners = await PackImportBoundary.ReadOwnersAsync(_db, download);
+                var selection = PackImportBoundary.SelectMember(download, owners, videoFiles);
+                if (selection.File == null) return await HoldPackMemberAsync(download, selection.Error!);
+                sourceFile = selection.File;
+            }
+            else sourceFile = Helpers.MainFileSelector.SelectMainVideoFile(videoFiles, GetFileSizeResolvingSymlinks);
             var fileInfo = new FileInfo(sourceFile);
             var actualFileSize = GetFileSizeResolvingSymlinks(sourceFile);
 
@@ -420,38 +495,38 @@ public class FileImportService : IFileImportService
                 ? download.Quality
                 : _parser.BuildQualityString(parsed);
 
-            var destinationPath = await BuildDestinationPath(settings, eventInfo, parsed, fileInfo.Extension, rootFolder, sourceFile, download.Part, qualityString, download.IndexerFlags);
-
-            _logger.LogInformation("Destination path: {Path}", destinationPath);
             var config = await _configService.GetConfigAsync();
-            EventPartInfo? partInfo = null;
-            if (config.EnableMultiPartEpisodes)
+            var partIdentity = PartIdentityResolver.Resolve(
+                download.Part, null, Path.GetFileName(sourceFile), eventInfo.Sport,
+                eventInfo.Title, eventInfo.League?.Name, config.EnableMultiPartEpisodes, download.IsPack);
+
+            var partInfo = partIdentity.Part;
+            if (string.IsNullOrWhiteSpace(download.Part) &&
+                (partIdentity.Kind is PartIdentityKind.Ambiguous or PartIdentityKind.Unlabelled or PartIdentityKind.UnsupportedLabel))
             {
-                // First, try to detect part from the release title
-                // Pass eventInfo.Title so the detector knows if this is a Fight Night (2 parts) vs PPV (3 parts)
-                partInfo = _partDetector.DetectPart(parsed.EventTitle, eventInfo.Sport, eventInfo.Title);
-
-                // If detection failed but we have Part stored from the queue item (set during grab),
-                // use that instead. This handles cases where Fight Night releases don't include
-                // "Main Card" or "Prelims" in the filename but were grabbed for a specific part.
-                if (partInfo == null && !string.IsNullOrEmpty(download.Part))
+                // Preserve only labels the old basename parser exposed to the detector.
+                var legacyPart = _partDetector.DetectPart(parsed.EventTitle, eventInfo.Sport!, eventInfo.Title);
+                if (legacyPart != null)
                 {
-                    _logger.LogInformation("[Import] Using stored part from download queue: {Part}", download.Part);
-                    var segmentDefinitions = EventPartDetector.GetSegmentDefinitions(eventInfo.Sport ?? "Fighting", eventInfo.Title ?? "", eventInfo.League?.Name);
-                    var matchingSegment = segmentDefinitions.FirstOrDefault(s =>
-                        s.Name.Equals(download.Part, StringComparison.OrdinalIgnoreCase));
-
-                    if (matchingSegment != null)
+                    var canonicalLegacy = PartIdentityResolver.Resolve(
+                        null, legacyPart.SegmentName, null, eventInfo.Sport, eventInfo.Title,
+                        eventInfo.League?.Name, config.EnableMultiPartEpisodes).Part;
+                    if (canonicalLegacy != null)
                     {
-                        partInfo = new EventPartInfo
-                        {
-                            SegmentName = matchingSegment.Name,
-                            PartNumber = matchingSegment.PartNumber,
-                            PartSuffix = $"pt{matchingSegment.PartNumber}"
-                        };
+                        partInfo = canonicalLegacy;
+                        _logger.LogDebug("[Import] Preserved legacy basename part {Part}", partInfo.SegmentName);
                     }
                 }
             }
+            // Remaining nulls retain the existing unknown-coverage behavior.
+            _logger.LogDebug("[Import] Part identity {Kind}: {Part}", partIdentity.Kind, partInfo?.SegmentName);
+            var destinationPath = await BuildDestinationPath(settings, eventInfo, parsed, fileInfo.Extension,
+                rootFolder, sourceFile, partInfo, qualityString, download.IndexerFlags);
+
+            _logger.LogInformation("Destination path: {Path}", destinationPath);
+            if (packDirectory && await _db.EventFiles.AsNoTracking()
+                .AnyAsync(file => file.FilePath == destinationPath && file.EventId != eventInfo.Id))
+                return await HoldPackMemberAsync(download, "The destination belongs to another event.");
 
             // UPGRADE CHECK: Must happen BEFORE file transfer so we can reject without
             // leaving orphan files on disk, and delete old files before the new one
@@ -460,6 +535,9 @@ public class FileImportService : IFileImportService
                 .Where(f => f.EventId == eventInfo.Id && f.Exists)
                 .ToListAsync();
 
+            var fullEventFiles = existingFiles.Where(f => f.PartNumber is null or 0).ToList();
+            var fullEventFile = fullEventFiles.FirstOrDefault(f =>
+                string.Equals(f.FilePath, eventInfo.FilePath, StringComparison.OrdinalIgnoreCase)) ?? fullEventFiles.FirstOrDefault();
             var freeSpaceChecked = false;
             EventFile? upgradedFile = null;
 
@@ -473,6 +551,20 @@ public class FileImportService : IFileImportService
                 // Single file: Find any existing file (prefer full event file)
                 upgradedFile = existingFiles.FirstOrDefault(f => f.PartName == null) ??
                                existingFiles.FirstOrDefault();
+            }
+
+            if (partInfo != null && existingFiles.Any(f =>
+                (upgradedFile == null || f.Id != upgradedFile.Id) &&
+                string.Equals(f.FilePath, destinationPath, StringComparison.OrdinalIgnoreCase)))
+            {
+                // A name without a part token can target a sibling file.
+                download.Status = DownloadStatus.ImportWarning;
+                download.ErrorMessage = "The part destination matches another existing file. Change the file naming format before importing this part.";
+                download.LastUpdate = DateTime.UtcNow;
+                await _db.SaveChangesAsync();
+                _logger.LogInformation("[Import] Refused part {Part} at another existing file's destination: {Path}",
+                    partInfo.SegmentName, destinationPath);
+                return null!;
             }
 
             if (upgradedFile != null)
@@ -720,6 +812,7 @@ public class FileImportService : IFileImportService
                 Quality = qualityString,
                 Size = actualFileSize,
                 Decision = ImportDecision.Approved,
+                Part = partInfo?.SegmentName,
                 ImportedAt = DateTime.UtcNow
             };
 
@@ -796,9 +889,18 @@ public class FileImportService : IFileImportService
             // below after the new EventFile is persisted, because for multi-part
             // events one imported part must NOT mark the whole event complete.
             // Note: Use actualFileSize captured BEFORE transfer - source file no longer exists after move
-            eventInfo.FilePath = destinationPath;
-            eventInfo.FileSize = actualFileSize;
-            eventInfo.Quality = qualityString;
+            if (partInfo != null && fullEventFile != null)
+            {
+                eventInfo.FilePath = fullEventFile.FilePath;
+                eventInfo.FileSize = fullEventFile.Size;
+                eventInfo.Quality = fullEventFile.Quality;
+            }
+            else
+            {
+                eventInfo.FilePath = destinationPath;
+                eventInfo.FileSize = actualFileSize;
+                eventInfo.Quality = qualityString;
+            }
 
             // An event holding a file must carry a season and episode number.
             // Sync clears the episode index for postponed and cancelled events
@@ -858,9 +960,11 @@ public class FileImportService : IFileImportService
             // either replaced their file or upgraded past it. Leaving their
             // flag set made every old row still advertise "File Exists", which
             // is what invited the delete that removed the wrong file.
+            var importedPartName = partInfo?.SegmentName;
             var replacedGrabs = await _db.GrabHistory
                 .Where(g => g.EventId == download.EventId
-                            && g.PartName == download.Part
+                            && (g.PartName == importedPartName ||
+                                (importedPartName == null && g.PartName == download.Part))
                             && g.FileExists
                             && (grabHistoryEntry == null || g.Id != grabHistoryEntry.Id)
                             && (g.DestinationPath == null || g.DestinationPath != destinationPath))
@@ -902,7 +1006,8 @@ public class FileImportService : IFileImportService
             // POST-IMPORT CATEGORY: Change torrent category after successful import.
             // This allows users to move imported torrents to a different category for automated management
             // (e.g., move to "imported" category which uses different storage tier or seeding rules).
-            await ApplyPostImportCategoryAsync(download);
+            var packCoverageComplete = !packDirectory || await PackImportJobScope.HasCompleteCoverageAsync(_db, download, config);
+            if (packCoverageComplete) await ApplyPostImportCategoryAsync(download);
 
             // NOTIFICATIONS: Send notifications (Discord, Telegram, Plex, Jellyfin, Emby, etc.) for the import.
             // Media server refresh (Plex/Jellyfin/Emby) is handled through the notification system.
@@ -994,7 +1099,7 @@ public class FileImportService : IFileImportService
             {
                 _logger.LogInformation("[Import] Source preserved ({Reason}): {File}", plan.Reason, sourceFile);
             }
-            else if (shouldRemoveCompleted)
+            else if (shouldRemoveCompleted && packCoverageComplete)
             {
                 await CleanupDownloadAsync(downloadPath, sourceFile, download.Title);
             }
@@ -1192,6 +1297,15 @@ public class FileImportService : IFileImportService
         return files;
     }
 
+    private async Task<ImportHistory> HoldPackMemberAsync(DownloadQueueItem download, string reason)
+    {
+        download.Status = DownloadStatus.ImportWarning;
+        download.ErrorMessage = PackImportBoundary.WarningPrefix + reason;
+        if (download.Id != 0) await _db.SaveChangesAsync();
+        _logger.LogWarning("[Import] {Reason}", download.ErrorMessage);
+        return null!;
+    }
+
     /// <summary>
     /// Apply post-import category to download in download client.
     /// This moves the torrent to a different category after successful import, allowing
@@ -1274,7 +1388,7 @@ public class FileImportService : IFileImportService
     /// <summary>
     /// Build destination file path
     /// </summary>
-    /// <param name="queueItemPart">Optional part from download queue (e.g., "Main Card") to use as fallback</param>
+    /// <param name="partInfo">The same resolved part used for the stored file and upgrade slot.</param>
     private async Task<string> BuildDestinationPath(
         MediaManagementSettings settings,
         Event eventInfo,
@@ -1282,7 +1396,7 @@ public class FileImportService : IFileImportService
         string extension,
         string rootFolder,
         string sourceFile,
-        string? queueItemPart = null,
+        EventPartInfo? partInfo = null,
         string? downloadQuality = null,
         string? indexerFlags = null)
     {
@@ -1313,47 +1427,8 @@ public class FileImportService : IFileImportService
         string filename;
         if (settings.RenameEvents)
         {
-            // Get config for multi-part episode detection
-            var config = await _configService.GetConfigAsync();
-
-            // Detect multi-part episode segment (Early Prelims, Prelims, Main Card) for Fighting sports
-            string partSuffix = string.Empty;
-            string partNameSuffix = string.Empty;
-            if (config.EnableMultiPartEpisodes)
-            {
-                // First try to detect from release title
-                // Pass eventInfo.Title so the detector knows if this is a Fight Night (2 parts) vs PPV (3 parts)
-                var partInfo = _partDetector.DetectPart(parsed.EventTitle, eventInfo.Sport, eventInfo.Title);
-
-                // If detection failed but we have Part stored from the queue item (set during grab),
-                // use that instead. This handles cases where Fight Night releases don't include
-                // "Main Card" or "Prelims" in the filename but were grabbed for a specific part.
-                if (partInfo == null && !string.IsNullOrEmpty(queueItemPart))
-                {
-                    _logger.LogInformation("[Import] Using stored part from download queue for filename: {Part}", queueItemPart);
-                    var segmentDefinitions = EventPartDetector.GetSegmentDefinitions(eventInfo.Sport ?? "Fighting", eventInfo.Title ?? "", eventInfo.League?.Name);
-                    var matchingSegment = segmentDefinitions.FirstOrDefault(s =>
-                        s.Name.Equals(queueItemPart, StringComparison.OrdinalIgnoreCase));
-
-                    if (matchingSegment != null)
-                    {
-                        partInfo = new EventPartInfo
-                        {
-                            SegmentName = matchingSegment.Name,
-                            PartNumber = matchingSegment.PartNumber,
-                            PartSuffix = $"pt{matchingSegment.PartNumber}"
-                        };
-                    }
-                }
-
-                if (partInfo != null)
-                {
-                    partSuffix = $" - {partInfo.PartSuffix}";
-                    partNameSuffix = $" - {partInfo.SegmentName}";
-                    _logger.LogInformation("[Import] Detected multi-part episode: {Segment} ({PartSuffix})",
-                        partInfo.SegmentName, partInfo.PartSuffix);
-                }
-            }
+            var partSuffix = partInfo == null ? string.Empty : $" - {partInfo.PartSuffix}";
+            var partNameSuffix = partInfo == null ? string.Empty : $" - {partInfo.SegmentName}";
 
             // Use download quality if provided (from original release title at grab time)
             // Fall back to parsed filename quality if not available

@@ -41,7 +41,7 @@ public class DownloadMonitorImportWarningTests
         factory.Setup(instance => instance.CreateClient(It.IsAny<string>())).Returns(http);
         var clientService = new DownloadClientService(factory.Object, NullLoggerFactory.Instance,
             NullLogger<DownloadClientService>.Instance, cache, config,
-            Mock.Of<IRemotePathMappingService>());
+            Mock.Of<IRemotePathMappingService>(), new DownloadOwnershipCoordinator());
 
         using (var db = new SportarrDbContext(options))
         {

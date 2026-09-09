@@ -543,6 +543,9 @@ public class SportsFileNameParser
         year >= 1950 && year <= DateTime.UtcNow.Year + 2;
 
     private static readonly Regex DatePattern = new(@"(?<!\d)(?<year>\d{4})(?<sep>[\.\-\s]+)(?<month>\d{2})\k<sep>(?<day>\d{2})(?!\d)", RegexOptions.Compiled);
+    private static readonly Regex CompactDatePattern = new(
+        @"(?<!\d)(?<year>20[12]\d)(?<month>\d{2})(?<day>\d{2})(?!\d)",
+        RegexOptions.Compiled);
     // European day-first dating ("Spain vs Argentina 19.07.2026"). Only
     // consulted when the year-first pattern found nothing; the lookarounds
     // keep the two-digit groups from binding inside longer digit runs.
@@ -555,6 +558,9 @@ public class SportsFileNameParser
     private static readonly Regex TrailingDayMonthPattern = new(
         @"(?<!\d)(?<day>\d{2})[\.\s_-](?<month>\d{2})(?=[\.\s_-]+(?:\d{3,4}p|WEB|HDTV|SDTV|Blu|x26[45]|[Hh]\.?26[45])|[\.\s_-]*$)",
         RegexOptions.Compiled);
+    private static readonly Regex ShortYearDayFirstDatePattern = new(
+        @"(?<!\d)(?<day>\d{2})[\.\s_-](?<month>\d{2})[\.\s_-](?<year>\d{2})(?=[\.\s_-]+(?:\d{3,4}p|WEB|HDTV|SDTV|Blu|x26[45]|[Hh]\.?26[45])|[\.\s_-]*$)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex YearOnlyPattern = new(@"\b(?<year>20[12]\d)\b", RegexOptions.Compiled);
     // Season span pattern for multi-year seasons: "2025-2026", "2025/2026", "2025-26"
     // (hyphen/slash separator, full or short end year), or "2025.2026" (dot separator,
@@ -734,6 +740,39 @@ public class SportsFileNameParser
             }
 
             if (result.EventDate != null) break;
+        }
+
+        if (result.EventDate == null &&
+            CompactDatePattern.Match(cleanName) is { Success: true } compactMatch &&
+            int.TryParse(compactMatch.Groups["year"].Value, out var compactYear) &&
+            int.TryParse(compactMatch.Groups["month"].Value, out var compactMonth) &&
+            int.TryParse(compactMatch.Groups["day"].Value, out var compactDay))
+        {
+            try
+            {
+                result.EventDate = new DateTime(compactYear, compactMonth, compactDay);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                result.EventYear = compactYear;
+            }
+        }
+
+        if (result.EventDate == null &&
+            ShortYearDayFirstDatePattern.Match(cleanName) is { Success: true } shortDateMatch &&
+            int.TryParse(shortDateMatch.Groups["year"].Value, out var shortYear) &&
+            int.TryParse(shortDateMatch.Groups["month"].Value, out var shortMonth) &&
+            int.TryParse(shortDateMatch.Groups["day"].Value, out var shortDay))
+        {
+            shortYear += shortYear >= 50 ? 1900 : 2000;
+            try
+            {
+                result.EventDate = new DateTime(shortYear, shortMonth, shortDay);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                result.EventYear = shortYear;
+            }
         }
 
         if (result.EventDate == null)

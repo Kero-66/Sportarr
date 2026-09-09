@@ -97,6 +97,14 @@ public class PlayoffSeriesDateMatchingTests
         result.EventDate.Should().BeNull("without a year there is nothing to anchor the pair to");
     }
 
+    [Theory]
+    [InlineData("NBA RS 24 25 Spurs@Knicks 25 12 24 WEB DL 720p", 2024, 12, 25)]
+    [InlineData("Chelsea v Arsenal 10 20231021 Sky Sport Main Event UHD", 2023, 10, 21)]
+    public void Parse_ObservedCompactDates(string title, int y, int m, int d)
+    {
+        _parser.Parse(title).EventDate.Should().Be(new DateTime(y, m, d));
+    }
+
     // -- Matcher: exact-day gate for team sports --
 
     [Fact]
@@ -120,6 +128,55 @@ public class PlayoffSeriesDateMatchingTests
         result.IsHardRejection.Should().BeTrue(
             "series games run every 2-3 days, so a 3-day-off release is the previous game, not this one");
         result.Rejections.Should().Contain(r => r.Contains("Date mismatch"));
+    }
+
+    [Theory]
+    [InlineData("NBA RS 24 25 Spurs@Knicks 25 12 24 WEB DL 720p", "San Antonio Spurs", "New York Knicks", "Basketball")]
+    [InlineData("Chelsea v Arsenal 10 20231021 Sky Sport Main Event UHD", "Arsenal", "Chelsea", "Soccer")]
+    public void HistoricalReleaseWithObservedDateFormat_IsRejected(
+        string title,
+        string homeTeam,
+        string awayTeam,
+        string sport)
+    {
+        var evt = new Event
+        {
+            Id = 3,
+            Title = $"{homeTeam} vs {awayTeam}",
+            Sport = sport,
+            HomeTeamName = homeTeam,
+            AwayTeamName = awayTeam,
+            EventDate = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc),
+            BroadcastDateVerified = true,
+            League = new League { Id = 3, Name = "Test League", Sport = sport }
+        };
+
+        var result = _svc.ValidateRelease(Rel(title), evt);
+
+        result.IsHardRejection.Should().BeTrue();
+        result.Rejections.Should().Contain(reason => reason.Contains("Date mismatch"));
+    }
+
+    [Fact]
+    public void HistoricalTeamReleaseWithWrongWeek_IsRejected()
+    {
+        var evt = new Event
+        {
+            Id = 4,
+            Title = "Arsenal vs Chelsea",
+            Sport = "Soccer",
+            HomeTeamName = "Arsenal",
+            AwayTeamName = "Chelsea",
+            Round = "3",
+            EventDate = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc),
+            League = new League { Id = 4, Name = "English Premier League", Sport = "Soccer" }
+        };
+
+        var result = _svc.ValidateRelease(Rel("WK 28 Arsenal v Chelsea 1080p50fps"), evt);
+
+        result.IsHardRejection.Should().BeTrue();
+        result.Rejections.Should().Contain(reason => reason.Contains("Round mismatch"));
     }
 
     [Fact]

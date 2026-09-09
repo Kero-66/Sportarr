@@ -172,8 +172,8 @@ public class EventQueryService
         var lower = leagueName.ToLowerInvariant();
 
         // Common abbreviations
-        if (lower.Contains("national basketball association") || lower == "nba")
-            return "NBA";
+        if (BasketballLeagueIdentity.Detect(leagueName) is { } basketballLeague)
+            return basketballLeague;
         if (lower.Contains("national football league") || lower == "nfl")
             return "NFL";
         if (lower.Contains("national hockey league") || lower == "nhl")
@@ -381,6 +381,40 @@ public class EventQueryService
         { "Spanish", "Spain" },
         { "United States", "USA" },
     };
+
+    internal string? BuildMetadataTitleProbe(Event evt, IEnumerable<string> existingQueries)
+    {
+        if (GetTeamSportLeaguePrefix(evt.League?.Name) == "NBA")
+        {
+            var (homeName, awayName) = ResolveTeamNames(evt);
+            var hasStablePair = !string.IsNullOrWhiteSpace(homeName) &&
+                !string.IsNullOrWhiteSpace(awayName) &&
+                evt.HomeTeamId.HasValue &&
+                evt.AwayTeamId.HasValue &&
+                evt.HomeTeamId.Value != evt.AwayTeamId.Value;
+            if (!hasStablePair)
+                return null;
+
+            var queryDate = evt.BroadcastDate ?? evt.EventDate.Date;
+            var datedQuery = $"NBA {queryDate:yyyy MM dd}";
+            return existingQueries.Contains(datedQuery, StringComparer.OrdinalIgnoreCase) ? null : datedQuery;
+        }
+
+        if (!EventPartDetector.IsMotorsport(evt.Sport ?? "") || string.IsNullOrWhiteSpace(evt.Title))
+            return null;
+
+        var phrase = string.Join(" ", Regex.Matches(evt.Title, @"[\p{L}\p{N}]+")
+            .Select(match => match.Value));
+        if (phrase.Length is 0 or > 256)
+            return null;
+
+        // A meeting name keeps a session-only title from becoming a broad query.
+        var meeting = Regex.Match(phrase, @"^(?<name>.+?)\s+Grand Prix(?:\s+.*)?$", RegexOptions.IgnoreCase);
+        if (!meeting.Success || !Regex.IsMatch(meeting.Groups["name"].Value, @"\p{L}"))
+            return null;
+
+        return existingQueries.Contains(phrase, StringComparer.OrdinalIgnoreCase) ? null : phrase;
+    }
 
     private void BuildMotorsportQueries(Event evt, string? leagueName, List<string> queries)
     {
@@ -781,6 +815,33 @@ public class EventQueryService
         var leaguePrefix = GetTeamSportLeaguePrefix(leagueName);
         var queryDate = evt.BroadcastDate ?? evt.EventDate.Date;
         var year = queryDate.Year;
+        var (homeName, awayName) = ResolveTeamNames(evt);
+        var hasStablePair = !string.IsNullOrWhiteSpace(homeName) &&
+            !string.IsNullOrWhiteSpace(awayName) &&
+            evt.HomeTeamId.HasValue &&
+            evt.AwayTeamId.HasValue &&
+            evt.HomeTeamId.Value != evt.AwayTeamId.Value;
+
+        if (hasStablePair && (leaguePrefix == "NBA" ||
+            string.Equals(leagueName, "English Premier League", StringComparison.OrdinalIgnoreCase)))
+        {
+            var homeFirst = evt.HomeTeamId.GetValueOrDefault() < evt.AwayTeamId.GetValueOrDefault();
+            var first = homeFirst ? homeName! : awayName!;
+            var second = homeFirst ? awayName! : homeName!;
+            if (leaguePrefix == "NBA")
+            {
+                first = first.Split(' ', StringSplitOptions.RemoveEmptyEntries).Last();
+                second = second.Split(' ', StringSplitOptions.RemoveEmptyEntries).Last();
+                queries.Add($"NBA {first} {second}");
+            }
+            else
+            {
+                queries.Add($"{first} {second}");
+            }
+
+            AddTeamAliasQueries(evt, leaguePrefix, year, queries);
+            return;
+        }
 
         if (string.IsNullOrEmpty(leaguePrefix))
         {
@@ -798,12 +859,12 @@ public class EventQueryService
             // sports especially - the very case this fallback exists for)
             // never get. The canonical "Home vs Away" title is the last resort
             // when both are absent.
-            var homeName = evt.HomeTeamName ?? evt.HomeTeam?.Name;
-            var awayName = evt.AwayTeamName ?? evt.AwayTeam?.Name;
+            var fallbackHomeName = evt.HomeTeamName ?? evt.HomeTeam?.Name;
+            var fallbackAwayName = evt.AwayTeamName ?? evt.AwayTeam?.Name;
             string? reversed = null;
-            if (!string.IsNullOrWhiteSpace(homeName) && !string.IsNullOrWhiteSpace(awayName))
+            if (!string.IsNullOrWhiteSpace(fallbackHomeName) && !string.IsNullOrWhiteSpace(fallbackAwayName))
             {
-                reversed = $"{awayName} vs {homeName}";
+                reversed = $"{fallbackAwayName} vs {fallbackHomeName}";
             }
             else
             {
@@ -1061,7 +1122,7 @@ public class EventQueryService
             // NFL: Season starts first Thursday after Labor Day (first Monday of September)
             seasonStart = GetNflSeasonStart(eventDate.Year);
         }
-        else if (leagueName.Contains("nba") || leagueName.Contains("national basketball association"))
+        else if (BasketballLeagueIdentity.Detect(leagueName) == "NBA")
         {
             // NBA: Season typically starts mid-October
             seasonStart = new DateTime(eventDate.Year, 10, 15);
@@ -1133,8 +1194,8 @@ public class EventQueryService
 
         var lower = leagueName.ToLowerInvariant();
 
-        if (lower.Contains("national basketball association") || lower.Contains("nba"))
-            return "NBA";
+        if (BasketballLeagueIdentity.Detect(leagueName) is { } basketballLeague)
+            return basketballLeague;
         if (lower.Contains("national football league") || lower.Contains("nfl"))
             return "NFL";
         if (lower.Contains("national hockey league") || lower.Contains("nhl"))
@@ -1237,6 +1298,8 @@ public class EventQueryService
         // This handles seasonal league names in the database
         var yearPattern = new Regex(@"\s+(19|20)\d{2}(-\d{2,4})?$", RegexOptions.IgnoreCase);
         var cleanedName = yearPattern.Replace(leagueName, "").Trim();
+        if (BasketballLeagueIdentity.Detect(cleanedName) is { } basketballLeague)
+            return basketballLeague;
 
         // Common league name mappings for searches
         var mappings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)

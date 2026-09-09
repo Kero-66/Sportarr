@@ -18,6 +18,20 @@ public class PendingReleaseReaperService : BackgroundService
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<PendingReleaseReaperService> _logger;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMinutes(1);
+    private readonly List<OwnershipRecovery> _ownershipRecoveries = new();
+
+    private sealed record PendingState(int Id, PendingReleaseStatus Status, string Reason);
+    private sealed record OwnershipRecovery(DownloadQueueItem Owner, List<PendingState> Pending, IDisposable Lease, IDisposable Decision)
+    {
+        public IDisposable? Quarantine { get; set; }
+    }
+
+    private sealed class AcquisitionLease(IDisposable lease) : IDisposable
+    {
+        private IDisposable? _lease = lease;
+        public IDisposable Detach() => Interlocked.Exchange(ref _lease, null)!;
+        public void Dispose() => Interlocked.Exchange(ref _lease, null)?.Dispose();
+    }
 
     public PendingReleaseReaperService(
         IServiceProvider serviceProvider,
@@ -60,6 +74,9 @@ public class PendingReleaseReaperService : BackgroundService
     {
         using var scope = _serviceProvider.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
+        var coordinator = scope.ServiceProvider.GetRequiredService<DownloadOwnershipCoordinator>();
+        foreach (var recovery in _ownershipRecoveries.ToList())
+            await RecoverOwnershipAsync(db, coordinator, recovery);
         var downloadClientService = scope.ServiceProvider.GetRequiredService<DownloadClientService>();
         var notificationService = scope.ServiceProvider.GetRequiredService<NotificationService>();
         var configService = scope.ServiceProvider.GetRequiredService<ConfigService>();
@@ -101,6 +118,12 @@ public class PendingReleaseReaperService : BackgroundService
                 continue;
             }
 
+            if (_ownershipRecoveries.Any(r => r.Owner.EventId == evt.Id)) continue;
+
+            using var eventDecision = new AcquisitionLease(await downloadClientService.EnterEventDecisionAsync(evt.Id, cancellationToken));
+            await db.Entry(evt).ReloadAsync(cancellationToken);
+            if (db.Entry(evt).State == EntityState.Detached) continue;
+
             // If the event already has a file or is no longer monitored, drop everything.
             if (!evt.Monitored || evt.HasFile)
             {
@@ -129,9 +152,11 @@ public class PendingReleaseReaperService : BackgroundService
             // as not an upgrade. Dropping on any file at all went too far the
             // other way and cancelled the upgrades RSS sync had let through.
             var groupPart = group.Key.Part;
+            var currentFiles = await db.EventFiles.AsNoTracking()
+                .Where(f => f.EventId == evt.Id && f.Exists).ToListAsync(cancellationToken);
             var partFile = string.IsNullOrEmpty(groupPart)
                 ? null
-                : evt.Files.FirstOrDefault(f => f.Exists && string.Equals(f.PartName, groupPart, StringComparison.OrdinalIgnoreCase));
+                : currentFiles.FirstOrDefault(f => string.Equals(f.PartName, groupPart, StringComparison.OrdinalIgnoreCase));
             if (partFile != null)
             {
                 // The same decision RSS sync makes, from the same helper.
@@ -173,7 +198,7 @@ public class PendingReleaseReaperService : BackgroundService
                 loser.Reason = $"Superseded by {winner.Title}";
             }
 
-            var outcome = await TryGrabPendingAsync(db, downloadClientService, notificationService, evt, winner, cancellationToken);
+            var outcome = await TryGrabPendingAsync(db, downloadClientService, notificationService, evt, winner, eventDecision, cancellationToken);
 
             if (outcome == GrabOutcome.Grabbed)
             {
@@ -218,12 +243,52 @@ public class PendingReleaseReaperService : BackgroundService
 
     private enum GrabOutcome { Grabbed, Failed, Superseded, Importing }
 
+    private async Task RecoverOwnershipAsync(SportarrDbContext db, DownloadOwnershipCoordinator coordinator, OwnershipRecovery recovery)
+    {
+        using var recoveryDecision = recovery.Quarantine == null ? null : coordinator.TryEnterExternalDecision();
+        if (recovery.Quarantine != null && recoveryDecision == null) return;
+
+        var downloadIdentity = recovery.Owner.DownloadId.ToUpperInvariant();
+        var existing = await db.DownloadQueue.Where(q =>
+            q.DownloadClientId == recovery.Owner.DownloadClientId && q.DownloadId.ToUpper() == downloadIdentity).ToListAsync();
+        if (existing.Any(q => q.EventId != recovery.Owner.EventId ||
+            !string.Equals(q.Part, recovery.Owner.Part, StringComparison.OrdinalIgnoreCase)))
+        {
+            // Keep this identity excluded before other downloads can proceed.
+            recovery.Quarantine ??= coordinator.QuarantineDownload(recovery.Owner.DownloadClientId!.Value, recovery.Owner.DownloadId);
+            recovery.Lease.Dispose();
+            _logger.LogError("[Pending Release Reaper] Quarantined accepted download {DownloadId} with conflicting queue ownership", recovery.Owner.DownloadId);
+            return;
+        }
+        if (existing.Count == 0)
+        {
+            recovery.Owner.Id = 0;
+            db.DownloadQueue.Add(recovery.Owner);
+        }
+
+        var ids = recovery.Pending.Select(p => p.Id).ToList();
+        var pending = await db.PendingReleases.Where(p => ids.Contains(p.Id)).ToListAsync();
+        foreach (var row in pending)
+        {
+            var state = recovery.Pending.First(p => p.Id == row.Id);
+            row.Status = state.Status;
+            row.Reason = state.Reason;
+        }
+        await db.SaveChangesAsync(CancellationToken.None);
+        _ownershipRecoveries.Remove(recovery);
+        recovery.Quarantine?.Dispose();
+        recovery.Lease.Dispose();
+        recovery.Decision.Dispose();
+        _logger.LogInformation("[Pending Release Reaper] Recovered queue ownership for accepted download {DownloadId}", recovery.Owner.DownloadId);
+    }
+
     private async Task<GrabOutcome> TryGrabPendingAsync(
         SportarrDbContext db,
         DownloadClientService downloadClientService,
         NotificationService notificationService,
         Event evt,
         PendingRelease pending,
+        AcquisitionLease eventDecision,
         CancellationToken cancellationToken)
     {
         var supportedTypes = DownloadClientService.GetClientTypesForProtocol(pending.Protocol);
@@ -294,6 +359,7 @@ public class PendingReleaseReaperService : BackgroundService
             }
         }
 
+        using var acquisition = new AcquisitionLease(await downloadClientService.BeginAcquisitionAsync(cancellationToken));
         var downloadId = await downloadClientService.AddDownloadAsync(
             downloadClient,
             pending.DownloadUrl,
@@ -308,6 +374,51 @@ public class PendingReleaseReaperService : BackgroundService
             return GrabOutcome.Failed;
         }
 
+        cancellationToken = AcceptedDownloadPersistence.AfterAdd(downloadId, cancellationToken);
+
+        var queueOwner = new DownloadQueueItem
+        {
+            EventId = evt.Id,
+            Title = pending.Title,
+            DownloadId = downloadId,
+            DownloadClientId = downloadClient.Id,
+            GrabCategory = reaperGrabCategory,
+            Status = DownloadStatus.Queued,
+            Quality = pending.Quality,
+            Codec = pending.Codec,
+            Source = pending.Source,
+            Size = pending.Size,
+            Downloaded = 0,
+            Progress = 0,
+            Indexer = pending.Indexer,
+            IndexerId = indexerRecord?.Id,
+            Protocol = pending.Protocol,
+            TorrentInfoHash = pending.TorrentInfoHash,
+            RetryCount = 0,
+            LastUpdate = DateTime.UtcNow,
+            QualityScore = pending.QualityScore,
+            CustomFormatScore = pending.CustomFormatScore,
+            Part = pending.Part,
+            IsPack = pending.IsPack ?? PackImportBoundary.IsPackRelease(pending.Title),
+            IsManualSearch = false
+        };
+        db.DownloadQueue.Add(queueOwner);
+
+        var ownerPersisted = await AcceptedDownloadPersistence.PersistOwnerAsync(token => db.SaveChangesAsync(token));
+        if (!ownerPersisted)
+        {
+            // A failed acknowledgement can follow a committed save. Keep the accepted job.
+            var pendingStates = db.ChangeTracker.Entries<PendingRelease>()
+                .Where(p => p.Entity.EventId == evt.Id && p.Entity.Part == pending.Part)
+                .Select(p => new PendingState(p.Entity.Id, p.Entity.Status, p.Entity.Reason)).ToList();
+            var ownerSnapshot = (DownloadQueueItem)db.Entry(queueOwner).CurrentValues.ToObject();
+            _ownershipRecoveries.Add(new OwnershipRecovery(ownerSnapshot, pendingStates, acquisition.Detach(), eventDecision.Detach()));
+            _logger.LogError(
+                "[Pending Release Reaper] Retained accepted download {DownloadId} for ownership recovery before further promotions",
+                downloadId);
+            throw new InvalidOperationException($"Accepted download {downloadId} requires queue ownership recovery");
+        }
+
         foreach (var loser in losers)
         {
             var loserClient = await db.DownloadClients
@@ -316,16 +427,22 @@ public class PendingReleaseReaperService : BackgroundService
             {
                 try
                 {
-                    await downloadClientService.RemoveDownloadAsync(loserClient, loser.DownloadId, deleteFiles: true);
+                    if (!await downloadClientService.RemoveDownloadAsync(loserClient, loser.DownloadId, deleteFiles: true))
+                    {
+                        _logger.LogWarning("[Pending Release Reaper] Retained queue ownership because client refused removal of {DownloadId}", loser.DownloadId);
+                        continue;
+                    }
                     _logger.LogInformation("[Pending Release Reaper] Cancelled queued download {DownloadId}; {Title} replaces it",
                         loser.DownloadId, pending.Title);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[Pending Release Reaper] Could not cancel download {DownloadId}; removing its queue row anyway",
+                    _logger.LogWarning(ex, "[Pending Release Reaper] Could not cancel download {DownloadId}; retained its queue row",
                         loser.DownloadId);
+                    continue;
                 }
             }
+            else continue;
             db.DownloadQueue.Remove(loser);
         }
 
@@ -349,37 +466,8 @@ public class PendingReleaseReaperService : BackgroundService
             _logger.LogWarning(ex, "[Pending Release Reaper] Error setting queue priority for {DownloadId}", downloadId);
         }
 
-        db.DownloadQueue.Add(new DownloadQueueItem
-        {
-            EventId = evt.Id,
-            Title = pending.Title,
-            DownloadId = downloadId,
-            DownloadClientId = downloadClient.Id,
-            GrabCategory = reaperGrabCategory,
-            Status = DownloadStatus.Queued,
-            Quality = pending.Quality,
-            Codec = pending.Codec,
-            Source = pending.Source,
-            Size = pending.Size,
-            Downloaded = 0,
-            Progress = 0,
-            Indexer = pending.Indexer,
-            IndexerId = indexerRecord?.Id,
-            Protocol = pending.Protocol,
-            TorrentInfoHash = pending.TorrentInfoHash,
-            RetryCount = 0,
-            LastUpdate = DateTime.UtcNow,
-            QualityScore = pending.QualityScore,
-            CustomFormatScore = pending.CustomFormatScore,
-            Part = pending.Part,
-            IsManualSearch = false
-        });
-
-        // Save before anything optional runs. The client already holds this
-        // download, and the caller saved once after the whole loop, so a
-        // failure there orphaned every download the loop had added. Nothing
-        // would import them and the client would keep them for ever.
-        await db.SaveChangesAsync(cancellationToken);
+        acquisition.Dispose();
+        eventDecision.Dispose();
 
         try
         {

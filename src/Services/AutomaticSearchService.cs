@@ -1,4 +1,5 @@
 using Sportarr.Api.Data;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
@@ -88,6 +89,7 @@ public class AutomaticSearchService : IAutomaticSearchService
         {
             // Load config for multi-part episode setting and queue threshold
             var config = await _configService.GetConfigAsync();
+            var fullEventUpper = EventPartDetector.FullEventSegmentName.ToUpperInvariant();
 
             // QUEUE THRESHOLD CHECK (Huntarr-style)
             // For automatic searches, check if download queue exceeds threshold
@@ -233,10 +235,13 @@ public class AutomaticSearchService : IAutomaticSearchService
             // A manual search is the user asking on purpose, so it still runs.
             if (!isManualSearch)
             {
+                var isFullEventRequest = EventPartDetector.IsFullEvent(part);
                 var activeDownload = await _db.DownloadQueue
                     .Where(d => d.EventId == eventId &&
                                 ActiveDownloadGate.InFlightStatuses.Contains(d.Status))
-                    .Where(d => part == null ? d.Part == null : d.Part == part)
+                    .Where(d => isFullEventRequest
+                        ? d.Part == null || d.Part == "" || d.Part.ToUpper() == fullEventUpper
+                        : d.Part == part)
                     .OrderByDescending(d => d.LastUpdate)
                     .FirstOrDefaultAsync();
 
@@ -298,30 +303,28 @@ public class AutomaticSearchService : IAutomaticSearchService
             // Indexers return different results: "UFC 299" vs "UFC 299 Prelims"
             // Pass league's custom search template if available
             var customTemplate = evt.League?.SearchQueryTemplate;
+            var hasCustomTemplates = SearchTemplateList.Parse(customTemplate).Count > 0;
             var queries = _eventQueryService.BuildEventQueries(evt, part, customTemplate);
+            var metadataProbe = hasCustomTemplates ? null : _eventQueryService.BuildMetadataTitleProbe(evt, queries);
 
             _logger.LogInformation("[Automatic Search] Built {Count} prioritized queries for {Sport}{PartInfo}{TemplateInfo}",
                 queries.Count, evt.Sport, part != null ? $" (Part: {part})" : "",
                 !string.IsNullOrEmpty(customTemplate) ? " (using custom template)" : "");
 
-            // Check cache for primary query first (avoids redundant API calls)
-            // Multiple events often share the same primary query (e.g., "Formula1.2025" for all F1 races)
+            // Reuse a complete source request for repeated searches of this event.
             var allReleases = new List<ReleaseSearchResult>();
             var seenGuids = new HashSet<string>();
             var primaryQuery = queries.FirstOrDefault();
             bool usedCache = false;
+            var searchComplete = true;
+            var searchCacheable = true;
+            DateTimeOffset? cacheExpiresAt = null;
+            var sportarrId = Helpers.SportarrIdToken.Normalize(evt.ExternalId);
+            var leagueTags = evt.League?.Tags ?? new List<int>();
+            var sourceFingerprint = await _indexerSearchService.GetSearchSourceFingerprintAsync(isManualSearch, leagueTags);
 
-            // What gets stored is the MERGED result of every query, so the key
-            // has to name every query. Keyed on the first one alone, editing a
-            // later search template left the key unchanged and the old merged
-            // results came back for as long as the cache held them.
-            // Tags decide which indexers the search reaches, so an answer cached
-            // for one league must not be handed to a league pointing at different
-            // indexers.
-            // Joined on a separator no query can contain. Run together, the
-            // variant lists "ab","c" and "a","bc" produce the same key and one
-            // event reuses the other's merged releases.
-            var cacheKey = SearchResultCache.ScopeKey(string.Join("\u001f", queries), evt.League?.Tags);
+            // The merged answer belongs to the complete source request.
+            var cacheKey = SearchResultCache.RequestKey(queries, leagueTags, 100, true, sportarrId, sourceFingerprint);
 
             // Only one caller fills a given key. A fighting event searches
             // once per part and the part is not in the query, so all of its
@@ -338,6 +341,8 @@ public class AutomaticSearchService : IAutomaticSearchService
                 if (cachedResults != null)
                 {
                     allReleases = _searchResultCache.ToSearchResults(cachedResults);
+                    searchComplete &= cachedResults.SearchComplete;
+                    result.SearchDiagnostics.AddRange(cachedResults.SearchDiagnostics);
                     usedCache = true;
                     _logger.LogInformation("[Automatic Search] Using cached results for query '{Query}' ({Count} releases, cache valid for {Duration}s)",
                         primaryQuery, allReleases.Count, config.SearchCacheDuration);
@@ -345,7 +350,7 @@ public class AutomaticSearchService : IAutomaticSearchService
                     // Re-evaluate cached releases against quality profile
                     // Cached releases have Approved=true and empty Rejections by default
                     // We must run ReleaseEvaluator to apply CF minimum score and other profile requirements
-                    await ReEvaluateCachedReleasesAsync(allReleases, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes, evt.Title, evt.League?.Tags,
+                    await ReEvaluateCachedReleasesAsync(allReleases, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes, evt.Title, leagueTags,
                         allowHighlights: evt.League?.AllowHighlights ?? false);
 
                     // Pre-populate seenGuids so supplementary queries below don't re-add cached releases
@@ -355,20 +360,12 @@ public class AutomaticSearchService : IAutomaticSearchService
                 }
             }
 
-            // Run all queries: live queries when no cache hit; supplementary queries always.
-            // Supplementary queries (Skip(1)) target alternative naming conventions (e.g. BILLIE-style
-            // F1 location releases) that the primary query may not reach. They must run even when the
-            // primary query hit the cache or returned enough results.
-            // What is stored is the merge of every query, so a hit already
-            // holds the supplementary results. Re-running them sent the same
-            // queries back to the indexers on every cache hit.
+            // A cached plan already includes its alternate query forms.
             var queriesToRun = usedCache ? new List<string>() : queries.ToList();
 
             if (queriesToRun.Any())
             {
                 int queriesAttempted = 0;
-                int consecutiveEmptyResults = 0;
-                const int MaxConsecutiveEmpty = 2;
 
                 foreach (var query in queriesToRun)
                 {
@@ -377,27 +374,24 @@ public class AutomaticSearchService : IAutomaticSearchService
                         queriesAttempted, queriesToRun.Count, query);
 
                     // Pass part to indexer for proper filtering (with league tag-based indexer selection)
-                    var leagueTags = evt.League?.Tags ?? new List<int>();
-                    var releases = await _indexerSearchService.SearchAllIndexersAsync(query, maxResultsPerIndexer: 100, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes, evt.Title, leagueTags,
+                    var outcome = await _indexerSearchService.SearchAllIndexersDetailedAsync(query, maxResultsPerIndexer: 100, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes, evt.Title, leagueTags,
                         allowHighlights: evt.League?.AllowHighlights ?? false,
-                        sportarrId: Helpers.SportarrIdToken.Normalize(evt.ExternalId));
+                        sportarrId: sportarrId,
+                        interactiveSearch: isManualSearch,
+                        cacheSuccessfulSources: true);
+                    var releases = outcome.Releases;
+                    result.SearchDiagnostics.AddRange(outcome.Diagnostics);
+                    searchComplete &= outcome.SatisfiesRequest;
+                    searchCacheable &= outcome.CanCache;
+                    if (outcome.CacheExpiresAt is { } expiry && (!cacheExpiresAt.HasValue || expiry < cacheExpiresAt.Value))
+                        cacheExpiresAt = expiry;
 
                     if (releases.Count == 0)
                     {
-                        consecutiveEmptyResults++;
-                        _logger.LogInformation("[Automatic Search] No results for query '{Query}' ({Empty}/{MaxEmpty} consecutive empty)",
-                            query, consecutiveEmptyResults, MaxConsecutiveEmpty);
-
-                        if (consecutiveEmptyResults >= MaxConsecutiveEmpty)
-                        {
-                            _logger.LogInformation("[Automatic Search] Stopping search - {Empty} consecutive empty results (event likely not released yet)",
-                                consecutiveEmptyResults);
-                            break;
-                        }
+                        _logger.LogInformation("[Automatic Search] No results for query '{Query}'", query);
                     }
                     else
                     {
-                        consecutiveEmptyResults = 0;
                         foreach (var release in releases)
                         {
                             if (string.IsNullOrEmpty(release.Guid) || seenGuids.Add(release.Guid))
@@ -417,9 +411,10 @@ public class AutomaticSearchService : IAutomaticSearchService
                 // The cache-hit path correctly handles empty results (short-circuits to "No releases found").
                 // Skip re-storing on a cache hit so the supplementary-query results don't overwrite the
                 // primary-query cache entry.
-                if (!usedCache && !string.IsNullOrEmpty(primaryQuery))
+                if (!usedCache && searchCacheable && !string.IsNullOrEmpty(primaryQuery))
                 {
-                    _searchResultCache.Store(cacheKey, allReleases, config.SearchCacheDuration);
+                    _searchResultCache.Store(cacheKey, allReleases, config.SearchCacheDuration,
+                        searchComplete: searchComplete, diagnostics: result.SearchDiagnostics, expiresAt: cacheExpiresAt);
                     _logger.LogDebug("[Automatic Search] Cached {Count} results for query '{Query}'",
                         allReleases.Count, primaryQuery);
                 }
@@ -431,61 +426,7 @@ public class AutomaticSearchService : IAutomaticSearchService
             // the parts waiting behind it for no reason. Disposing twice is
             // safe, so the using declaration stays as the failure backstop.
             fillSlot?.Dispose();
-
-            if (!allReleases.Any())
-            {
-                result.Success = false;
-                result.Message = "No releases found";
-                _logger.LogWarning("[Automatic Search] No releases found for: {Title}", evt.Title);
-                return result;
-            }
-
-            result.ReleasesFound = allReleases.Count;
-            _logger.LogInformation("[Automatic Search] Found {Count} total releases", allReleases.Count);
-
-            // MONITORED-PART FILTER (part-less automatic searches of fighting events).
-            // Callers like the backlog/missing search invoke this with part == null, and
-            // with no specific part requested the release evaluator accepts ANY part - so
-            // an unmonitored pre-lims release could be grabbed while the monitored main
-            // card is ignored. When the event (or, by inheritance, its league) monitors
-            // only specific parts, drop releases whose detected part is not monitored.
-            // Full-event files (no detected part) are kept; manual searches are untouched
-            // so an explicit user search still sees everything.
-            if (!isManualSearch && string.IsNullOrEmpty(part) &&
-                config.EnableMultiPartEpisodes && EventPartDetector.IsFightingSport(evt.Sport ?? ""))
-            {
-                var effectiveMonitoredParts = evt.MonitoredParts ?? evt.League?.MonitoredParts;
-                if (!string.IsNullOrEmpty(effectiveMonitoredParts))
-                {
-                    var monitoredSet = effectiveMonitoredParts
-                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-                    var beforeCount = allReleases.Count;
-                    allReleases = allReleases.Where(r =>
-                    {
-                        var detected = _partDetector.DetectPart(r.Title, evt.Sport ?? "Fighting", evt.Title);
-                        // Keep full-event files (no part) and monitored parts; drop the rest.
-                        return detected == null || monitoredSet.Contains(detected.SegmentName);
-                    }).ToList();
-
-                    var dropped = beforeCount - allReleases.Count;
-                    if (dropped > 0)
-                    {
-                        _logger.LogInformation("[Automatic Search] Dropped {Dropped} release(s) for unmonitored parts (monitored: {Parts}) for: {Title}",
-                            dropped, effectiveMonitoredParts, evt.Title);
-                    }
-
-                    if (allReleases.Count == 0)
-                    {
-                        result.Success = false;
-                        result.Message = $"Only unmonitored parts available (monitored: {effectiveMonitoredParts}). Waiting for a monitored part to be released.";
-                        _logger.LogInformation("[Automatic Search] No monitored-part releases yet for: {Title} (monitored: {Parts})",
-                            evt.Title, effectiveMonitoredParts);
-                        return result;
-                    }
-                }
-            }
+            result.SearchComplete = searchComplete;
 
             var knownLeagues = await LeagueMatchContext.LoadAsync(_db);
             IReadOnlyCollection<Event>? datePeers = null;
@@ -496,282 +437,408 @@ public class AutomaticSearchService : IAutomaticSearchService
                 datePeers = await EventDateMatchContext.LoadAsync(_db, evt);
             }
 
-            // MATCH SCORING: Calculate how well each release matches the event
-            // This is critical for filtering out wrong releases (different games, TV shows, etc.)
-            // Cached releases already have MatchScore set, but live indexer results need calculation
-            var scoredCount = 0;
-            foreach (var release in allReleases)
+            const int AutoGrabMinMatchScore = ReleaseMatchScorer.AutoGrabMatchScore;
+            var allowMetadataProbe = true;
+            async Task<List<ReleaseSearchResult>?> ValidateCandidatesAsync()
             {
-                // Only calculate if not already scored (cached releases have scores)
-                if (release.MatchScore == 0)
+                if (!allReleases.Any())
                 {
-                    release.MatchScore = _releaseMatchScorer.CalculateMatchScore(release.Title, evt, knownLeagues);
-                    scoredCount++;
+                    result.Success = false;
+                    result.Message = "No releases found";
+                    _logger.LogWarning("[Automatic Search] No releases found for: {Title}", evt.Title);
+                    return null;
                 }
 
-                // Mark releases that don't meet minimum match score as rejected
-                // This ensures they're filtered out and the rejection reason is visible
-                if (release.MatchScore < ReleaseMatchScorer.MinimumMatchScore)
+                result.ReleasesFound = allReleases.Count;
+                _logger.LogInformation("[Automatic Search] Found {Count} total releases", allReleases.Count);
+
+                // MONITORED-PART FILTER (part-less automatic searches of fighting events).
+                // Callers like the backlog/missing search invoke this with part == null, and
+                // with no specific part requested the release evaluator accepts ANY part - so
+                // an unmonitored pre-lims release could be grabbed while the monitored main
+                // card is ignored. When the event (or, by inheritance, its league) monitors
+                // only specific parts, drop releases whose detected part is not monitored.
+                // Full-event files (no detected part) are kept; manual searches are untouched
+                // so an explicit user search still sees everything.
+                if (!isManualSearch && string.IsNullOrEmpty(part) &&
+                    config.EnableMultiPartEpisodes && EventPartDetector.IsFightingSport(evt.Sport ?? ""))
                 {
-                    release.Approved = false;
-                    if (!release.Rejections.Contains($"Release doesn't match event (score: {release.MatchScore})"))
+                    var effectiveMonitoredParts = evt.MonitoredParts ?? evt.League?.MonitoredParts;
+                    if (!string.IsNullOrEmpty(effectiveMonitoredParts))
                     {
-                        release.Rejections.Add($"Release doesn't match event (score: {release.MatchScore})");
+                        var monitoredSet = effectiveMonitoredParts
+                            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                        var beforeCount = allReleases.Count;
+                        allReleases = allReleases.Where(r =>
+                        {
+                            var detected = _partDetector.DetectPart(r.Title, evt.Sport ?? "Fighting", evt.Title);
+                            // Keep full-event files (no part) and monitored parts; drop the rest.
+                            return detected == null || monitoredSet.Contains(detected.SegmentName);
+                        }).ToList();
+
+                        var dropped = beforeCount - allReleases.Count;
+                        if (dropped > 0)
+                        {
+                            _logger.LogInformation("[Automatic Search] Dropped {Dropped} release(s) for unmonitored parts (monitored: {Parts}) for: {Title}",
+                                dropped, effectiveMonitoredParts, evt.Title);
+                        }
+
+                        if (allReleases.Count == 0)
+                        {
+                            result.Success = false;
+                            result.Message = $"Only unmonitored parts available (monitored: {effectiveMonitoredParts}). Waiting for a monitored part to be released.";
+                            _logger.LogInformation("[Automatic Search] No monitored-part releases yet for: {Title} (monitored: {Parts})",
+                                evt.Title, effectiveMonitoredParts);
+                            return null;
+                        }
                     }
                 }
-            }
 
-            if (scoredCount > 0)
-            {
-                _logger.LogInformation("[{SearchType}] Calculated match scores for {Count} live indexer results",
-                    searchType, scoredCount);
-
-                // Log match score distribution for debugging
-                var matchingCount = allReleases.Count(r => r.MatchScore >= ReleaseMatchScorer.MinimumMatchScore);
-                var nonMatchingCount = allReleases.Count - matchingCount;
-                if (nonMatchingCount > 0)
+                // MATCH SCORING: Calculate how well each release matches the event
+                // This is critical for filtering out wrong releases (different games, TV shows, etc.)
+                // Cached releases already have MatchScore set, but live indexer results need calculation
+                var scoredCount = 0;
+                foreach (var release in allReleases)
                 {
-                    _logger.LogDebug("[{SearchType}] Match score distribution: {Matching} matching (>={MinScore}), {NonMatching} non-matching",
-                        searchType, matchingCount, ReleaseMatchScorer.MinimumMatchScore, nonMatchingCount);
+                    // Only calculate if not already scored (cached releases have scores)
+                    if (release.MatchScore == 0)
+                    {
+                        release.MatchScore = _releaseMatchScorer.CalculateMatchScore(release.Title, evt, knownLeagues);
+                        scoredCount++;
+                    }
+
+                    // Mark releases that don't meet minimum match score as rejected
+                    // This ensures they're filtered out and the rejection reason is visible
+                    if (release.MatchScore < ReleaseMatchScorer.MinimumMatchScore)
+                    {
+                        release.Approved = false;
+                        if (!release.Rejections.Contains($"Release doesn't match event (score: {release.MatchScore})"))
+                        {
+                            release.Rejections.Add($"Release doesn't match event (score: {release.MatchScore})");
+                        }
+                    }
                 }
-            }
 
-            // BLOCKLIST CHECK: Reject releases that are in the blocklist
-            // This prevents auto-grabbing releases that were previously removed/failed
-            // Supports both torrent (by hash) and Usenet (by title+indexer)
-            var blocklistItems = await _db.Blocklist
-                .Select(b => new { b.TorrentInfoHash, b.Title, b.Indexer, b.Protocol })
-                .ToListAsync();
-
-            // Build hash set for torrent blocklist (fast lookup)
-            var blocklistHashSet = new HashSet<string>(
-                blocklistItems.Where(b => !string.IsNullOrEmpty(b.TorrentInfoHash)).Select(b => b.TorrentInfoHash!),
-                StringComparer.OrdinalIgnoreCase);
-
-            // Build set for Usenet blocklist (title+indexer combinations)
-            var usenetBlocklist = blocklistItems
-                .Where(b => b.Protocol == "Usenet" || string.IsNullOrEmpty(b.TorrentInfoHash))
-                .Select(b => $"{b.Title}|{b.Indexer}".ToLowerInvariant())
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            // Indexers that opted out of hash-based blocklist rejection
-            // (RejectBlocklistedTorrentHashes = false). Title-based Usenet
-            // blocking always applies.
-            var hashRejectionDisabled = (await _db.Indexers
-                .Where(i => !i.RejectBlocklistedTorrentHashes)
-                .Select(i => i.Name)
-                .ToListAsync())
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            var blocklistedCount = 0;
-            foreach (var release in allReleases)
-            {
-                bool isBlocked = false;
-
-                // Check torrent hash blocklist
-                if (!string.IsNullOrEmpty(release.TorrentInfoHash) &&
-                    blocklistHashSet.Contains(release.TorrentInfoHash) &&
-                    !hashRejectionDisabled.Contains(release.Indexer ?? ""))
+                if (scoredCount > 0)
                 {
-                    isBlocked = true;
+                    _logger.LogInformation("[{SearchType}] Calculated match scores for {Count} live indexer results",
+                        searchType, scoredCount);
+
+                    // Log match score distribution for debugging
+                    var matchingCount = allReleases.Count(r => r.MatchScore >= ReleaseMatchScorer.MinimumMatchScore);
+                    var nonMatchingCount = allReleases.Count - matchingCount;
+                    if (nonMatchingCount > 0)
+                    {
+                        _logger.LogDebug("[{SearchType}] Match score distribution: {Matching} matching (>={MinScore}), {NonMatching} non-matching",
+                            searchType, matchingCount, ReleaseMatchScorer.MinimumMatchScore, nonMatchingCount);
+                    }
                 }
-                // Check Usenet blocklist (by title+indexer)
-                else if (release.Protocol == "Usenet" || string.IsNullOrEmpty(release.TorrentInfoHash))
+
+                // BLOCKLIST CHECK: Reject releases that are in the blocklist
+                // This prevents auto-grabbing releases that were previously removed/failed
+                // Supports both torrent (by hash) and Usenet (by title+indexer)
+                var blocklistItems = await _db.Blocklist
+                    .AsNoTracking()
+                    .ToListAsync();
+
+                // Build hash set for torrent blocklist (fast lookup)
+                var blocklistHashSet = new HashSet<string>(
+                    blocklistItems.Where(b => !string.IsNullOrEmpty(b.TorrentInfoHash)).Select(b => b.TorrentInfoHash!),
+                    StringComparer.OrdinalIgnoreCase);
+
+                var blocklistMatcher = new BlocklistMatcher(blocklistItems);
+
+                // Indexers that opted out of hash-based blocklist rejection
+                // (RejectBlocklistedTorrentHashes = false). Title-based Usenet
+                // blocking always applies.
+                var hashRejectionDisabled = (await _db.Indexers
+                    .Where(i => !i.RejectBlocklistedTorrentHashes)
+                    .Select(i => i.Name)
+                    .ToListAsync())
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var blocklistedCount = 0;
+                foreach (var release in allReleases)
                 {
-                    var usenetKey = $"{release.Title}|{release.Indexer}".ToLowerInvariant();
-                    if (usenetBlocklist.Contains(usenetKey))
+                    bool isBlocked = false;
+
+                    // Check torrent hash blocklist
+                    if (!string.IsNullOrEmpty(release.TorrentInfoHash) &&
+                        blocklistHashSet.Contains(release.TorrentInfoHash) &&
+                        !hashRejectionDisabled.Contains(release.Indexer ?? ""))
                     {
                         isBlocked = true;
                     }
-                }
-
-                if (isBlocked)
-                {
-                    release.IsBlocklisted = true;
-                    release.Approved = false;
-                    release.Rejections.Add("Release is blocklisted");
-                    blocklistedCount++;
-                }
-            }
-
-            if (blocklistedCount > 0)
-            {
-                _logger.LogInformation("[{SearchType}] {Count} releases rejected (blocklisted)", searchType, blocklistedCount);
-            }
-
-            // RELEASE FILTERING: Use releases that passed ReleaseEvaluator validation
-            // ReleaseEvaluator already handles:
-            // - Part validation (Main Card vs Prelims)
-            // - Size validation (min/max per quality)
-            // - Quality cutoff checking
-            // - Custom format minimum score
-            // Releases with Approved=true and no rejections are valid candidates
-            var approvedReleases = allReleases
-                .Where(r => r.Approved && !r.Rejections.Any())
-                .ToList();
-
-            // Minimum-age filter: hold off grabbing releases that just
-            // appeared at the indexer. Manual searches bypass.
-            if (!isManualSearch && config.IndexerMinimumAgeMinutes > 0)
-            {
-                var ageThreshold = DateTime.UtcNow.AddMinutes(-config.IndexerMinimumAgeMinutes);
-                var beforeFilter = approvedReleases.Count;
-                approvedReleases = approvedReleases
-                    .Where(r => r.PublishDate == default || r.PublishDate <= ageThreshold)
-                    .ToList();
-                if (approvedReleases.Count < beforeFilter)
-                {
-                    _logger.LogInformation(
-                        "[Automatic Search] Minimum-age filter: {Filtered}/{Before} releases held back (need {Min}m old)",
-                        beforeFilter - approvedReleases.Count, beforeFilter, config.IndexerMinimumAgeMinutes);
-                }
-            }
-
-            _logger.LogInformation("[Automatic Search] {ApprovedCount}/{TotalCount} releases approved by quality/part validation",
-                approvedReleases.Count, allReleases.Count);
-
-            // MATCH SCORE FILTERING: For automatic searches, require minimum match score
-            // This prevents auto-grabbing releases that only loosely match the event
-            // Manual searches show all results but automatic grabbing needs high confidence
-            const int AutoGrabMinMatchScore = 50;
-            if (!isManualSearch)
-            {
-                var highConfidenceReleases = approvedReleases
-                    .Where(r => r.MatchScore >= AutoGrabMinMatchScore)
-                    .ToList();
-
-                if (highConfidenceReleases.Count < approvedReleases.Count)
-                {
-                    _logger.LogInformation("[Automatic Search] Match score filter: {HighCount}/{TotalCount} releases have score >= {MinScore}",
-                        highConfidenceReleases.Count, approvedReleases.Count, AutoGrabMinMatchScore);
-
-                    // Log low-scoring releases for debugging
-                    var lowScoreReleases = approvedReleases
-                        .Where(r => r.MatchScore < AutoGrabMinMatchScore)
-                        .OrderByDescending(r => r.MatchScore)
-                        .Take(3);
-                    foreach (var low in lowScoreReleases)
+                    else if (blocklistMatcher.MatchesTitleIdentity(
+                                 release.Title, release.Indexer, release.Protocol))
                     {
-                        _logger.LogDebug("[Automatic Search] Low match score release: '{Title}' (Score: {Score})",
-                            low.Title, low.MatchScore);
+                        isBlocked = true;
+                    }
+
+                    if (isBlocked)
+                    {
+                        release.IsBlocklisted = true;
+                        release.Approved = false;
+                        release.Rejections.Add("Release is blocklisted");
+                        blocklistedCount++;
                     }
                 }
 
-                if (!highConfidenceReleases.Any() && approvedReleases.Any())
+                if (blocklistedCount > 0)
                 {
-                    // Have approved releases but none meet match score threshold
+                    _logger.LogInformation("[{SearchType}] {Count} releases rejected (blocklisted)", searchType, blocklistedCount);
+                }
+
+                if (metadataProbe?.StartsWith("NBA ", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    var validateRetrievedIdentity = await CreateIdentityValidatorAsync();
+                    allowMetadataProbe = !allReleases.Any(release =>
+                        !release.IsBlocklisted &&
+                        release.MatchScore >= AutoGrabMinMatchScore &&
+                        !validateRetrievedIdentity(release).IsHardRejection);
+                }
+
+                // RELEASE FILTERING: Use releases that passed ReleaseEvaluator validation
+                // ReleaseEvaluator already handles:
+                // - Part validation (Main Card vs Prelims)
+                // - Size validation (min/max per quality)
+                // - Quality cutoff checking
+                // - Custom format minimum score
+                // Releases with Approved=true and no rejections are valid candidates
+                var approvedReleases = allReleases
+                    .Where(r => r.Approved && !r.Rejections.Any())
+                    .ToList();
+
+                async Task<Func<ReleaseSearchResult, ReleaseMatchResult>> CreateIdentityValidatorAsync()
+                {
+                    var earlyReleaseLimits = await _db.Indexers
+                        .Where(i => i.EarlyReleaseLimit.HasValue)
+                        .Select(i => new { i.Id, i.EarlyReleaseLimit })
+                        .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit);
+
+                    // A release that counts races inside its round ("Round09 ... Race 3")
+                    // means nothing without the races that round holds. The library
+                    // knows them, so read them once for this event and let the matcher
+                    // resolve the number.
+                    List<int>? roundRaceNumbers = null;
+                    if (!string.IsNullOrEmpty(evt.Round) && EventPartDetector.IsMotorsport(evt.Sport ?? ""))
+                    {
+                        roundRaceNumbers = await _db.Events
+                            .AsNoTracking()
+                            .Where(e => e.LeagueId == evt.LeagueId && e.Season == evt.Season && e.Round == evt.Round)
+                            .Select(e => e.Title)
+                            .ToListAsync()
+                            .ContinueWith(t => t.Result
+                                .Select(ReleaseMatchingService.RaceNumberInTitle)
+                                .Where(n => n.HasValue)
+                                .Select(n => n!.Value)
+                                .Distinct()
+                                .OrderBy(n => n)
+                                .ToList());
+                    }
+
+                    return release =>
+                    {
+                        var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(release, earlyReleaseLimits);
+                        return _releaseMatchingService.ValidateRelease(release, evt, part, config.EnableMultiPartEpisodes,
+                            earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers,
+                            knownLeagues: knownLeagues, datePeers: datePeers);
+                    };
+                }
+
+                // Minimum-age filter: hold off grabbing releases that just
+                // appeared at the indexer. Manual searches bypass.
+                if (!isManualSearch && config.IndexerMinimumAgeMinutes > 0)
+                {
+                    var ageThreshold = DateTime.UtcNow.AddMinutes(-config.IndexerMinimumAgeMinutes);
+                    var beforeAgeFilter = approvedReleases;
+                    var beforeFilter = approvedReleases.Count;
+                    approvedReleases = approvedReleases
+                        .Where(r => r.PublishDate == default || r.PublishDate <= ageThreshold)
+                        .ToList();
+                    if (metadataProbe != null && beforeFilter > 0 && approvedReleases.Count == 0)
+                    {
+                        // A young wrong-event release must not suppress retrieval.
+                        var validateHeldIdentity = await CreateIdentityValidatorAsync();
+                        allowMetadataProbe &= !beforeAgeFilter.Any(release =>
+                            release.MatchScore >= AutoGrabMinMatchScore && !validateHeldIdentity(release).IsHardRejection);
+                    }
+                    if (approvedReleases.Count < beforeFilter)
+                    {
+                        _logger.LogInformation(
+                            "[Automatic Search] Minimum-age filter: {Filtered}/{Before} releases held back (need {Min}m old)",
+                            beforeFilter - approvedReleases.Count, beforeFilter, config.IndexerMinimumAgeMinutes);
+                    }
+                }
+
+                _logger.LogInformation("[Automatic Search] {ApprovedCount}/{TotalCount} releases approved by quality/part validation",
+                    approvedReleases.Count, allReleases.Count);
+
+                // MATCH SCORE FILTERING: For automatic searches, require minimum match score
+                // This prevents auto-grabbing releases that only loosely match the event
+                // Manual searches show all results but automatic grabbing needs high confidence
+                if (!isManualSearch)
+                {
+                    var highConfidenceReleases = approvedReleases
+                        .Where(r => r.MatchScore >= AutoGrabMinMatchScore)
+                        .ToList();
+
+                    if (highConfidenceReleases.Count < approvedReleases.Count)
+                    {
+                        _logger.LogInformation("[Automatic Search] Match score filter: {HighCount}/{TotalCount} releases have score >= {MinScore}",
+                            highConfidenceReleases.Count, approvedReleases.Count, AutoGrabMinMatchScore);
+
+                        // Log low-scoring releases for debugging
+                        var lowScoreReleases = approvedReleases
+                            .Where(r => r.MatchScore < AutoGrabMinMatchScore)
+                            .OrderByDescending(r => r.MatchScore)
+                            .Take(3);
+                        foreach (var low in lowScoreReleases)
+                        {
+                            _logger.LogDebug("[Automatic Search] Low match score release: '{Title}' (Score: {Score})",
+                                low.Title, low.MatchScore);
+                        }
+                    }
+
+                    if (!highConfidenceReleases.Any() && approvedReleases.Any())
+                    {
+                        // Have approved releases but none meet match score threshold
+                        result.Success = false;
+                        result.Message = $"Found {approvedReleases.Count} releases but none have sufficient match confidence (need score >= {AutoGrabMinMatchScore})";
+                        _logger.LogWarning("[Automatic Search] All {Count} approved releases have low match scores for: {Title}. " +
+                            "Top score: {TopScore}. Consider using manual search.",
+                            approvedReleases.Count, evt.Title,
+                            approvedReleases.Max(r => r.MatchScore));
+                        return null;
+                    }
+
+                    approvedReleases = highConfidenceReleases;
+                }
+
+                if (!approvedReleases.Any())
+                {
+                    // Log rejection reasons for debugging
+                    var rejectionSummary = allReleases
+                        .Where(r => r.Rejections.Any())
+                        .GroupBy(r => r.Rejections.FirstOrDefault() ?? "Unknown")
+                        .Select(g => $"{g.Key}: {g.Count()}")
+                        .Take(5);
+
                     result.Success = false;
-                    result.Message = $"Found {approvedReleases.Count} releases but none have sufficient match confidence (need score >= {AutoGrabMinMatchScore})";
-                    _logger.LogWarning("[Automatic Search] All {Count} approved releases have low match scores for: {Title}. " +
-                        "Top score: {TopScore}. Consider using manual search.",
-                        approvedReleases.Count, evt.Title,
-                        approvedReleases.Max(r => r.MatchScore));
-                    return result;
+                    result.Message = $"No approved releases found. {allReleases.Count} releases were rejected.";
+                    _logger.LogWarning("[Automatic Search] All {Count} releases rejected for: {Title}. Top reasons: {Reasons}",
+                        allReleases.Count, evt.Title, string.Join(", ", rejectionSummary));
+                    return null;
                 }
 
-                approvedReleases = highConfidenceReleases;
-            }
+                // DATE/EVENT VALIDATION: Apply ReleaseMatchingService validation to filter out wrong dates
+                // This catches releases like NBA.2024.03.12... when searching for a June 2025 event
+                // The validation uses SportsFileNameParser to extract dates and hard-rejects mismatches >30 days
+                var validateIdentity = await CreateIdentityValidatorAsync();
+                var validatedReleases = new List<ReleaseSearchResult>();
+                var dateRejectionCount = 0;
 
-            if (!approvedReleases.Any())
-            {
-                // Log rejection reasons for debugging
-                var rejectionSummary = allReleases
-                    .Where(r => r.Rejections.Any())
-                    .GroupBy(r => r.Rejections.FirstOrDefault() ?? "Unknown")
-                    .Select(g => $"{g.Key}: {g.Count()}")
-                    .Take(5);
-
-                result.Success = false;
-                result.Message = $"No approved releases found. {allReleases.Count} releases were rejected.";
-                _logger.LogWarning("[Automatic Search] All {Count} releases rejected for: {Title}. Top reasons: {Reasons}",
-                    allReleases.Count, evt.Title, string.Join(", ", rejectionSummary));
-                return result;
-            }
-
-            // DATE/EVENT VALIDATION: Apply ReleaseMatchingService validation to filter out wrong dates
-            // This catches releases like NBA.2024.03.12... when searching for a June 2025 event
-            // The validation uses SportsFileNameParser to extract dates and hard-rejects mismatches >30 days
-            var earlyReleaseLimits = await _db.Indexers
-                .Where(i => i.EarlyReleaseLimit.HasValue)
-                .Select(i => new { i.Id, i.EarlyReleaseLimit })
-                .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit);
-
-            var validatedReleases = new List<ReleaseSearchResult>();
-            var dateRejectionCount = 0;
-
-            // A release that counts races inside its round ("Round09 ... Race 3")
-            // means nothing without the races that round holds. The library
-            // knows them, so read them once for this event and let the matcher
-            // resolve the number.
-            List<int>? roundRaceNumbers = null;
-            if (!string.IsNullOrEmpty(evt.Round) && EventPartDetector.IsMotorsport(evt.Sport ?? ""))
-            {
-                roundRaceNumbers = await _db.Events
-                    .AsNoTracking()
-                    .Where(e => e.LeagueId == evt.LeagueId && e.Season == evt.Season && e.Round == evt.Round)
-                    .Select(e => e.Title)
-                    .ToListAsync()
-                    .ContinueWith(t => t.Result
-                        .Select(ReleaseMatchingService.RaceNumberInTitle)
-                        .Where(n => n.HasValue)
-                        .Select(n => n!.Value)
-                        .Distinct()
-                        .OrderBy(n => n)
-                        .ToList());
-            }
-
-            foreach (var release in approvedReleases)
-            {
-                var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(release, earlyReleaseLimits);
-                var matchResult = _releaseMatchingService.ValidateRelease(release, evt, part, config.EnableMultiPartEpisodes,
-                    earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers, knownLeagues: knownLeagues,
-                    datePeers: datePeers);
-
-                if (matchResult.IsHardRejection)
+                foreach (var release in approvedReleases)
                 {
-                    // Hard rejection (date mismatch, year mismatch, etc.)
-                    dateRejectionCount++;
-                    _logger.LogDebug("[Automatic Search] Release rejected by validation: {Title} - {Reason}",
-                        release.Title, string.Join(", ", matchResult.Rejections));
+                    var matchResult = validateIdentity(release);
 
-                    // Add rejection reason to the release so it shows in UI
-                    release.Approved = false;
-                    release.Rejections.AddRange(matchResult.Rejections);
+                    if (matchResult.IsHardRejection)
+                    {
+                        // Hard rejection (date mismatch, year mismatch, etc.)
+                        dateRejectionCount++;
+                        _logger.LogDebug("[Automatic Search] Release rejected by validation: {Title} - {Reason}",
+                            release.Title, string.Join(", ", matchResult.Rejections));
+
+                        // Add rejection reason to the release so it shows in UI
+                        release.Approved = false;
+                        release.Rejections.AddRange(matchResult.Rejections);
+                    }
+                    else
+                    {
+                        validatedReleases.Add(release);
+                    }
                 }
-                else
+
+                if (dateRejectionCount > 0)
                 {
-                    validatedReleases.Add(release);
+                    _logger.LogInformation("[Automatic Search] {RejectedCount} releases rejected by date/event validation",
+                        dateRejectionCount);
                 }
+
+                if (!validatedReleases.Any())
+                {
+                    // Log rejection reasons for debugging
+                    var rejectionSummary = approvedReleases
+                        .Where(r => r.Rejections.Any())
+                        .SelectMany(r => r.Rejections)
+                        .GroupBy(r => r)
+                        .Select(g => $"{g.Key}: {g.Count()}")
+                        .Take(5);
+
+                    result.Success = false;
+                    result.Message = $"No valid releases found. {approvedReleases.Count} releases were rejected by date/event validation.";
+                    _logger.LogWarning("[Automatic Search] All releases rejected by date/event validation for: {Title}. Reasons: {Reasons}",
+                        evt.Title, string.Join(", ", rejectionSummary));
+                    return null;
+                }
+
+                _logger.LogInformation("[Automatic Search] {ValidCount}/{ApprovedCount} releases passed date/event validation",
+                    validatedReleases.Count, approvedReleases.Count);
+
+                return validatedReleases;
             }
 
-            if (dateRejectionCount > 0)
+            var matchedReleases = await ValidateCandidatesAsync();
+            if (matchedReleases == null && metadataProbe != null && allowMetadataProbe)
             {
-                _logger.LogInformation("[Automatic Search] {RejectedCount} releases rejected by date/event validation",
-                    dateRejectionCount);
+                // A separate raw entry records only a probe that was fetched.
+                var probeCacheKey = SearchResultCache.RequestKey(new[] { metadataProbe }, leagueTags, 100, true, sportarrId, sourceFingerprint);
+                List<ReleaseSearchResult> probeReleases;
+                using (await _searchResultCache.EnterFillAsync(probeCacheKey))
+                {
+                    var cachedProbe = _searchResultCache.TryGetCached(probeCacheKey, config.SearchCacheDuration);
+                    if (cachedProbe != null)
+                    {
+                        probeReleases = _searchResultCache.ToSearchResults(cachedProbe);
+                        result.SearchComplete &= cachedProbe.SearchComplete;
+                        result.SearchDiagnostics.AddRange(cachedProbe.SearchDiagnostics);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("[Automatic Search] Trying metadata fallback: '{Query}'", metadataProbe);
+                        var outcome = await _indexerSearchService.SearchAllIndexersDetailedAsync(metadataProbe,
+                            maxResultsPerIndexer: 100, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes,
+                            evt.Title, leagueTags, allowHighlights: evt.League?.AllowHighlights ?? false,
+                            sportarrId: sportarrId,
+                            interactiveSearch: isManualSearch,
+                            cacheSuccessfulSources: true);
+                        probeReleases = outcome.Releases;
+                        result.SearchComplete &= outcome.SatisfiesRequest;
+                        result.SearchDiagnostics.AddRange(outcome.Diagnostics);
+                        if (outcome.CanCache)
+                            _searchResultCache.Store(probeCacheKey, probeReleases, config.SearchCacheDuration,
+                                searchComplete: outcome.SatisfiesRequest, diagnostics: outcome.Diagnostics, expiresAt: outcome.CacheExpiresAt);
+                    }
+                }
+
+                foreach (var release in probeReleases)
+                {
+                    if (string.IsNullOrEmpty(release.Guid) || seenGuids.Add(release.Guid))
+                        allReleases.Add(release);
+                }
+
+                // Rebuild raw copies so the first validation cannot affect the retry.
+                allReleases = allReleases.Select(release => SearchResultCache.RawRelease.FromSearchResult(release).ToSearchResult()).ToList();
+                await ReEvaluateCachedReleasesAsync(allReleases, qualityProfileId, part, evt.Sport,
+                    config.EnableMultiPartEpisodes, evt.Title, leagueTags,
+                    allowHighlights: evt.League?.AllowHighlights ?? false);
+                matchedReleases = await ValidateCandidatesAsync();
             }
 
-            if (!validatedReleases.Any())
-            {
-                // Log rejection reasons for debugging
-                var rejectionSummary = approvedReleases
-                    .Where(r => r.Rejections.Any())
-                    .SelectMany(r => r.Rejections)
-                    .GroupBy(r => r)
-                    .Select(g => $"{g.Key}: {g.Count()}")
-                    .Take(5);
-
-                result.Success = false;
-                result.Message = $"No valid releases found. {approvedReleases.Count} releases were rejected by date/event validation.";
-                _logger.LogWarning("[Automatic Search] All releases rejected by date/event validation for: {Title}. Reasons: {Reasons}",
-                    evt.Title, string.Join(", ", rejectionSummary));
+            if (matchedReleases == null)
                 return result;
-            }
-
-            _logger.LogInformation("[Automatic Search] {ValidCount}/{ApprovedCount} releases passed date/event validation",
-                validatedReleases.Count, approvedReleases.Count);
-
-            // Use validated releases for further processing
-            var matchedReleases = validatedReleases;
 
             // MULTI-PART CONSISTENCY CHECK: For automatic searches, ensure new releases match existing parts
             // This prevents downloading mismatched quality/codec/source for multi-part episodes
@@ -814,9 +881,7 @@ public class AutomaticSearchService : IAutomaticSearchService
 
                         // Codec match - REQUIRED for Plex compatibility when reference has a codec
                         // Mismatched codecs (e.g., H.264 vs H.265) cause playback issues in Plex
-                        bool codecMatch = string.IsNullOrEmpty(referenceCodec) ||
-                            string.IsNullOrEmpty(r.Codec) ||
-                            string.Equals(r.Codec, referenceCodec, StringComparison.OrdinalIgnoreCase);
+                        bool codecMatch = Helpers.VideoCodecIdentity.Matches(referenceCodec, r.Codec);
 
                         if (!resolutionMatch)
                         {
@@ -978,6 +1043,42 @@ public class AutomaticSearchService : IAutomaticSearchService
                 return result;
             }
 
+            var acquiredIdentity = Helpers.PartIdentityResolver.Resolve(
+                part, bestRelease.Title, null, evt.Sport, evt.Title, evt.League?.Name,
+                config.EnableMultiPartEpisodes, bestRelease.IsPack);
+            var effectivePart = acquiredIdentity.Kind == Helpers.PartIdentityKind.CompleteEventLabel
+                ? EventPartDetector.FullEventSegmentName
+                : acquiredIdentity.Part?.SegmentName ?? part;
+            var isFullEventPart = EventPartDetector.IsFullEvent(effectivePart);
+
+            // A whole-event request can select a part already downloading.
+            using var eventDecision = await _downloadClientService.EnterEventDecisionAsync(eventId);
+            await _db.Entry(evt).ReloadAsync();
+            if (_db.Entry(evt).State == EntityState.Detached)
+            {
+                result.Success = false;
+                result.Message = "Event no longer exists";
+                return result;
+            }
+            if (!isManualSearch)
+            {
+                var activeSelectedPart = await _db.DownloadQueue.AsNoTracking()
+                    .Where(d => d.EventId == eventId && ActiveDownloadGate.InFlightStatuses.Contains(d.Status))
+                    .Where(d => isFullEventPart
+                        ? d.Part == null || d.Part == "" || d.Part.ToUpper() == fullEventUpper
+                        : d.Part == effectivePart)
+                    .OrderByDescending(d => d.LastUpdate)
+                    .FirstOrDefaultAsync();
+                if (activeSelectedPart != null)
+                {
+                    result.Success = false;
+                    result.Message = $"Already downloading '{activeSelectedPart.Title}' for this event ({activeSelectedPart.Status})";
+                    _logger.LogInformation("[Automatic Search] Selected part {Part} already has an active download for event {EventId}",
+                        effectivePart, eventId);
+                    return result;
+                }
+            }
+
             result.SelectedRelease = bestRelease.Title;
             result.SelectedIndexer = bestRelease.Indexer;
             result.Quality = bestRelease.Quality;
@@ -989,21 +1090,21 @@ public class AutomaticSearchService : IAutomaticSearchService
             // 1. A full event file exists (PartName is null) - full event covers all parts, skip download
             // 2. A file for THIS specific part exists - do quality comparison
             // 3. No file for this part exists - allow download (other parts may exist)
-            if (evt.HasFile)
+            if (evt.HasFile || acquiredIdentity.Part != null)
             {
                 // Get existing files for this event
-                var existingFiles = await _db.EventFiles
+                var existingFiles = await _db.EventFiles.AsNoTracking()
                     .Where(f => f.EventId == eventId && f.Exists)
                     .ToListAsync();
 
                 EventFile? relevantFile = null;
 
-                if (!string.IsNullOrEmpty(part))
+                if (!string.IsNullOrEmpty(effectivePart) && !isFullEventPart)
                 {
                     // Searching for a specific part - check for full event file OR matching part file
                     var fullEventFile = existingFiles.FirstOrDefault(f => f.PartName == null);
                     var partSpecificFile = existingFiles.FirstOrDefault(f =>
-                        string.Equals(f.PartName, part, StringComparison.OrdinalIgnoreCase));
+                        string.Equals(f.PartName, effectivePart, StringComparison.OrdinalIgnoreCase));
 
                     if (fullEventFile != null)
                     {
@@ -1020,12 +1121,12 @@ public class AutomaticSearchService : IAutomaticSearchService
                         // File for this specific part exists - use for quality comparison
                         relevantFile = partSpecificFile;
                         _logger.LogInformation("[Automatic Search] Found existing file for part '{Part}': {Quality}",
-                            part, partSpecificFile.Quality);
+                            effectivePart, partSpecificFile.Quality);
                     }
                     else
                     {
                         // No file for this part yet - allow download
-                        _logger.LogInformation("[Automatic Search] No existing file for part '{Part}' - proceeding with download", part);
+                        _logger.LogInformation("[Automatic Search] No existing file for part '{Part}' - proceeding with download", effectivePart);
                     }
                 }
                 else
@@ -1224,8 +1325,19 @@ public class AutomaticSearchService : IAutomaticSearchService
             // Look up the indexer record first - its assigned download client
             // (if any) takes precedence over priority/tag-based selection, and
             // its seed settings are passed along with the grab.
-            var indexerRecord = await _db.Indexers
-                .FirstOrDefaultAsync(i => i.Name == bestRelease.Indexer);
+            var enabledIndexers = _db.Indexers.Where(i => i.Enabled &&
+                (isManualSearch ? i.EnableInteractiveSearch : i.EnableAutomaticSearch));
+            var indexerRecord = bestRelease.IndexerId.HasValue
+                ? await enabledIndexers.FirstOrDefaultAsync(i => i.Id == bestRelease.IndexerId.Value)
+                : await enabledIndexers.FirstOrDefaultAsync(i => i.Name == bestRelease.Indexer);
+            if (indexerRecord == null)
+            {
+                result.Success = false;
+                result.Message = $"The source indexer for '{bestRelease.Title}' is no longer enabled for this search mode";
+                _logger.LogInformation("[{SearchType}] Skipping stale release because its source indexer is unavailable: {Title}",
+                    searchType, bestRelease.Title);
+                return result;
+            }
 
             // Get download client for this protocol (with league tag-based filtering)
             var downloadClientLeagueTags = evt.League?.Tags ?? new List<int>();
@@ -1260,6 +1372,7 @@ public class AutomaticSearchService : IAutomaticSearchService
             // Season/multi-event packs use the pack-specific seed time when
             // the indexer defines one (packs are typically expected to seed
             // longer than single events).
+            using var acquisition = await _downloadClientService.BeginAcquisitionAsync();
             var downloadId = await _downloadClientService.AddDownloadAsync(
                 downloadClient,
                 bestRelease.DownloadUrl,
@@ -1280,6 +1393,8 @@ public class AutomaticSearchService : IAutomaticSearchService
             }
 
             result.DownloadId = downloadId;
+            var torrentInfoHash = Helpers.TorrentHashHelper.ResolveTrackedInfoHash(
+                bestRelease.Protocol, bestRelease.TorrentInfoHash, downloadId);
             _logger.LogInformation("[Automatic Search] Added to download client: {Client} (ID: {DownloadId})",
                 downloadClient.Name, downloadId);
 
@@ -1327,12 +1442,13 @@ public class AutomaticSearchService : IAutomaticSearchService
                 Indexer = bestRelease.Indexer,
                 IndexerId = indexerRecord?.Id,
                 Protocol = bestRelease.Protocol,
-                TorrentInfoHash = bestRelease.TorrentInfoHash,
+                TorrentInfoHash = torrentInfoHash,
                 RetryCount = retryCount,
                 LastUpdate = DateTime.UtcNow,
                 QualityScore = bestRelease.QualityScore,
                 CustomFormatScore = bestRelease.CustomFormatScore,
-                Part = part, // Store the part (e.g., "Prelims", "Main Card") for multi-part imports
+                Part = effectivePart,
+                IsPack = bestRelease.IsPack,
                 IsManualSearch = isManualSearch
             };
 
@@ -1401,7 +1517,10 @@ public class AutomaticSearchService : IAutomaticSearchService
             // Mark any previous grabs for the same event+part as superseded
             // This prevents users from re-grabbing an old file that was replaced
             var previousGrabs = await _db.GrabHistory
-                .Where(g => g.EventId == eventId && g.PartName == part && !g.Superseded)
+                .Where(g => g.EventId == eventId && !g.Superseded)
+                .Where(g => isFullEventPart
+                    ? g.PartName == null || g.PartName == "" || g.PartName.ToUpper() == fullEventUpper
+                    : g.PartName == effectivePart)
                 .ToListAsync();
             foreach (var oldGrab in previousGrabs)
             {
@@ -1418,14 +1537,14 @@ public class AutomaticSearchService : IAutomaticSearchService
                 DownloadUrl = bestRelease.DownloadUrl,
                 Guid = bestRelease.Guid,
                 Protocol = bestRelease.Protocol,
-                TorrentInfoHash = bestRelease.TorrentInfoHash,
+                TorrentInfoHash = torrentInfoHash,
                 Size = bestRelease.Size,
                 Quality = bestRelease.Quality,
                 Codec = bestRelease.Codec,
                 Source = bestRelease.Source,
                 QualityScore = bestRelease.QualityScore,
                 CustomFormatScore = bestRelease.CustomFormatScore,
-                PartName = part,
+                PartName = effectivePart,
                 GrabbedAt = DateTime.UtcNow,
                 DownloadClientId = downloadClient.Id,
                 DownloadId = downloadId,
@@ -1474,6 +1593,8 @@ public class AutomaticSearchService : IAutomaticSearchService
                     return result;
                 }
             }
+
+            acquisition.Dispose();
 
             // Immediately check download status so it appears in the Activity
             // page with real-time status without waiting for the next poll.
@@ -1780,91 +1901,8 @@ public class AutomaticSearchService : IAutomaticSearchService
     {
         if (!releases.Any()) return;
 
-        // Load release profiles for keyword filtering
-        var releaseProfiles = await _releaseProfileService.LoadReleaseProfilesAsync();
-
-        // Load profile and custom formats
-        QualityProfile? profile = null;
-        List<CustomFormat>? customFormats = null;
-        List<QualityDefinition>? qualityDefinitions = null;
-
-        if (qualityProfileId.HasValue)
-        {
-            profile = await _db.QualityProfiles
-                .FirstOrDefaultAsync(p => p.Id == qualityProfileId.Value);
-            customFormats = await _db.CustomFormats.ToListAsync();
-        }
-
-        qualityDefinitions = await _db.QualityDefinitions.ToListAsync();
-
-        if (profile == null)
-        {
-            _logger.LogDebug("[Automatic Search] No quality profile for cached release evaluation");
-            return;
-        }
-
-        _logger.LogDebug("[Automatic Search] Re-evaluating {Count} cached releases against profile '{Profile}'",
-            releases.Count, profile.Name);
-
-        int rejectedCount = 0;
-        foreach (var release in releases)
-        {
-            var isPack = release.IsPack;
-
-            var evaluation = _releaseEvaluator.EvaluateRelease(
-                release,
-                profile,
-                customFormats,
-                qualityDefinitions,
-                requestedPart,
-                sport,
-                enableMultiPartEpisodes,
-                eventTitle,
-                null,
-                isPack,
-                allowHighlights);
-
-            // Update release with evaluation results
-            release.Score = evaluation.TotalScore;
-            release.QualityScore = evaluation.QualityScore;
-            release.CustomFormatScore = evaluation.CustomFormatScore;
-            release.SizeScore = evaluation.SizeScore;
-            release.Approved = evaluation.Approved;
-            release.Rejections = evaluation.Rejections;
-            release.MatchedFormats = evaluation.MatchedFormats;
-            release.Quality = evaluation.Quality;
-
-            // Apply release profile filtering (Required/Ignored keywords, Preferred score)
-            if (releaseProfiles.Any())
-            {
-                var profileEval = _releaseProfileService.EvaluateRelease(release, releaseProfiles, leagueTags);
-
-                // Add rejections from release profiles
-                if (profileEval.IsRejected)
-                {
-                    release.Approved = false;
-                    release.Rejections.AddRange(profileEval.Rejections);
-                }
-
-                // Add preferred score to custom format score (affects ranking)
-                if (profileEval.PreferredScore != 0)
-                {
-                    release.CustomFormatScore += profileEval.PreferredScore;
-                    release.Score += profileEval.PreferredScore;
-                }
-            }
-
-            if (release.Rejections.Any())
-            {
-                rejectedCount++;
-            }
-        }
-
-        if (rejectedCount > 0)
-        {
-            _logger.LogInformation("[Automatic Search] Re-evaluation rejected {Count}/{Total} cached releases (CF score, size, release profiles, etc.)",
-                rejectedCount, releases.Count);
-        }
+        await _indexerSearchService.EvaluateReleasesAsync(releases, qualityProfileId, requestedPart, sport,
+            enableMultiPartEpisodes, eventTitle, leagueTags, allowHighlights);
     }
 
     private async Task<DownloadClient?> GetPreferredDownloadClientAsync(string protocol, List<int>? leagueTags = null, int? indexerAssignedClientId = null)
@@ -2067,6 +2105,8 @@ public class AutomaticSearchService : IAutomaticSearchService
 /// </summary>
 public class AutomaticSearchResult
 {
+    public bool SearchComplete { get; set; }
+    public List<IndexerSearchDiagnostic> SearchDiagnostics { get; set; } = new();
     public int EventId { get; set; }
     public bool Success { get; set; }
     public string Message { get; set; } = "";

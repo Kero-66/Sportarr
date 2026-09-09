@@ -506,6 +506,10 @@ public class ReleaseSearchResult
     public string Protocol { get; set; } = "Unknown"; // "Usenet" or "Torrent"
     public long Size { get; set; }
     public string? Quality { get; set; }
+
+    // Keep source quality separate from profile evaluation.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? SourceQuality { get; set; }
     public string? Source { get; set; } // WEB-DL, BluRay, HDTV, etc.
     public string? Codec { get; set; } // H.264, HEVC, AV1, etc.
     public string? Language { get; set; } // Detected language from title (English, German, French, etc.)

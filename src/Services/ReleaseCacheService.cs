@@ -1,5 +1,6 @@
 using Sportarr.Api.Data;
 using Sportarr.Api.Models;
+using Sportarr.Api.Helpers;
 using Microsoft.EntityFrameworkCore;
 using System.Text.RegularExpressions;
 
@@ -80,6 +81,7 @@ public class ReleaseCacheService
                     existing.Seeders = release.Seeders;
                     existing.Leechers = release.Leechers;
                     existing.ExpiresAt = DateTime.UtcNow.Add(DefaultCacheTtl);
+                    existing.SportPrefix = BasketballLeagueIdentity.Detect(existing.Title) ?? existing.SportPrefix;
 
                     // Rows cached before the parser learned space-separated
                     // dates carry no month and day, and an indexer that keeps
@@ -189,6 +191,7 @@ public class ReleaseCacheService
         CancellationToken cancellationToken = default)
     {
         var results = new List<ReleaseSearchResult>();
+        var knownLeagues = await LeagueMatchContext.LoadAsync(_db, cancellationToken);
 
         // Build search terms from event
         var eventSearchTerms = BuildEventSearchTerms(evt);
@@ -218,7 +221,12 @@ public class ReleaseCacheService
         {
             // For known sports, REQUIRE the sport prefix to match exactly
             // Releases without a detected sport prefix won't match sports events
-            query = query.Where(r => r.SportPrefix == sportPrefix);
+            query = sportPrefix == "WNBA"
+                ? query.Where(r => r.SportPrefix == sportPrefix ||
+                    ((r.SportPrefix == "NBA" || r.SportPrefix == null) &&
+                     (r.Title.ToUpper().Contains("WNBA") ||
+                      (r.Title.ToUpper().Contains("WOMEN") && r.Title.ToUpper().Contains("BASKETBALL")))))
+                : query.Where(r => r.SportPrefix == sportPrefix);
         }
 
         // Load candidates and do full matching in memory
@@ -227,7 +235,6 @@ public class ReleaseCacheService
             .OrderByDescending(r => r.PublishDate)
             .Take(1000) // Limit to prevent memory issues
             .ToListAsync(cancellationToken);
-        var knownLeagues = await LeagueMatchContext.LoadAsync(_db, cancellationToken);
 
         _logger.LogDebug("[ReleaseCache] Found {Count} candidate releases for filtering", candidates.Count);
 
@@ -240,7 +247,7 @@ public class ReleaseCacheService
                 cached.Month,
                 cached.Day,
                 cached.RoundNumber,
-                cached.SportPrefix,
+                BasketballLeagueIdentity.Detect(cached.Title) ?? cached.SportPrefix,
                 evt,
                 knownLeagues);
 
@@ -472,8 +479,8 @@ public class ReleaseCacheService
         // Team sports
         if (normalized.Contains("NFL") && !normalized.Contains("UEFA"))
             return "NFL";
-        if (normalized.Contains("NBA"))
-            return "NBA";
+        if (BasketballLeagueIdentity.Detect(title) is { } basketballLeague)
+            return basketballLeague;
         if (normalized.Contains("NHL"))
             return "NHL";
         if (normalized.Contains("MLB"))

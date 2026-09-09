@@ -34,6 +34,12 @@ A copy that is equal to the file an event already holds is not swapped in. It is
 
 A completed download that fails the rule stays in the queue with the reason and an **Import Anyway** button. A file that appears in a league folder and fails the rule is left where it is and listed in Activity with the reason. **Library Import** also lists it and imports whatever you select. The Remove button on such a row deletes the file too, to the recycle bin when one is set, unless you untick that in the remove dialog. Ignore keeps the file and only stops the scans listing it. When a copy that already sits beside the file it replaces takes over, the replaced file stays on disk untracked. A copy from anywhere else replaces it through the recycle bin.
 
+## Retry a completed import
+
+Activity shows **Retry Import** when a completed download has failed to import or a pack member is held for correction. Resolve the displayed reason, then retry the import. Retrying uses the completed download and does not submit another download job. Bulk import uses the same eligibility as each row.
+
+Pack members are checked against their own events and parts. A completed member does not allow Sportarr to remove a shared download while another member still needs it.
+
 ## Per-indexer client assignment
 
 Under an indexer's advanced settings you can pin a specific download client, so grabs from that indexer always go to that client regardless of priority order. Useful when one tracker should hit a dedicated seedbox client.

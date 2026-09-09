@@ -1323,6 +1323,8 @@ public static class DatabaseInitializer
             Console.WriteLine($"[Sportarr] Warning: Could not verify PendingReleases table: {ex.Message}");
         }
 
+        EnsureColumn(db, "PendingReleases", "IsPack", "INTEGER NULL");
+
         // Ensure SeasonPosters table exists (per-season poster artwork).
         // Populated by LeagueEventSyncService from TheSportsDB's season art
         // archive and read by the metadata agent endpoints.

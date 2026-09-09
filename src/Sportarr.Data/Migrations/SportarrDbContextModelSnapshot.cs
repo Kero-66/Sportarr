@@ -2741,6 +2741,9 @@ namespace Sportarr.Api.Migrations
                     b.Property<string>("InfoUrl")
                         .HasColumnType("TEXT");
 
+                    b.Property<bool?>("IsPack")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("Language")
                         .HasColumnType("TEXT");
 

@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
+using Sportarr.Api.Helpers;
 
 namespace Sportarr.Api.Services;
 
@@ -276,6 +277,7 @@ public class ReleaseMatchScorer
     private static readonly Regex _moto2Regex = new(@"\bMOTO[\.\-\s]*2\b", RegexOptions.Compiled);
 
     // Motorsport session-type detection - per-event hot path inside GetSessionTypeMatchScore.
+    private static readonly Regex _f1ShowRegex = new(@"\b(?:the[\s\-_.]*)?f1[\s\-_.]+show\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _preRaceRegex = new(@"\b(pre[\s\-_.]*race|build[\s\-_.]*up|grid[\s\-_.]*walk)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _postRaceRegex = new(@"\b(post[\s\-_.]*race|race[\s\-_.]*analysis|podium)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _practiceRegex = new(@"\b(fp[123]|free\s*practice|practice\s*[123]?)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -437,6 +439,15 @@ public class ReleaseMatchScorer
         // e.g., Olympic Snowboard Qualifying should NOT match F1 Qualifying
         if (ContainsDifferentSport(releaseTitle, evt))
             return 0;
+
+        // A named team league is definitive even when team metadata is incomplete.
+        // Do not let a shared city or nickname bridge different competitions.
+        if (IsTeamSport(eventSportPrefix) && IsTeamSport(parsed.SportPrefix) &&
+            HasExplicitTeamLeagueToken(releaseTitle, parsed.SportPrefix!) &&
+            !string.Equals(eventSportPrefix, parsed.SportPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
 
         // === SCORING CRITERIA ===
 
@@ -760,8 +771,8 @@ public class ReleaseMatchScorer
         // Team sports
         if (normalized.Contains("NFL") && !normalized.Contains("UEFA"))
             return "NFL";
-        if (normalized.Contains("NBA"))
-            return "NBA";
+        if (BasketballLeagueIdentity.Detect(title) is { } basketballLeague)
+            return basketballLeague;
         if (normalized.Contains("NHL"))
             return "NHL";
         if (normalized.Contains("MLB"))
@@ -819,8 +830,8 @@ public class ReleaseMatchScorer
                 return "ONE";
             if (upper.Contains("NFL"))
                 return "NFL";
-            if (upper.Contains("NBA"))
-                return "NBA";
+            if (BasketballLeagueIdentity.Detect(leagueName) is { } basketballLeague)
+                return basketballLeague;
             if (upper.Contains("NHL"))
                 return "NHL";
             if (upper.Contains("MLB"))
@@ -1026,6 +1037,7 @@ public class ReleaseMatchScorer
     private enum MotorsportSessionType
     {
         Unknown,        // Can't determine, or generic event
+        Ancillary,      // Studio and race-weekend coverage
         Practice,       // FP1, FP2, FP3, Free Practice
         SprintQualifying, // Sprint Qualifying, Sprint Shootout
         Sprint,         // Sprint race (not qualifying)
@@ -1039,6 +1051,9 @@ public class ReleaseMatchScorer
     /// </summary>
     private MotorsportSessionType DetectSessionType(string normalizedTitle)
     {
+        if (_f1ShowRegex.IsMatch(normalizedTitle))
+            return MotorsportSessionType.Ancillary;
+
         // Check for PRE-RACE and POST-RACE shows FIRST (must come before Race check)
         // These are NOT the actual race - they're coverage/analysis shows
         // Patterns: "Pre-Race", "Pre Race Show", "Post-Race", "Post Race Analysis", "Grid Walk", "Build Up", "Podium"
@@ -1664,7 +1679,7 @@ public class ReleaseMatchScorer
     private bool IsDateBasedSport(string? sportPrefix)
     {
         if (string.IsNullOrEmpty(sportPrefix)) return false;
-        return sportPrefix is "NFL" or "NBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga";
+        return sportPrefix is "NFL" or "NBA" or "WNBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga";
     }
 
     private bool IsMotorsport(string? sportPrefix)
@@ -1675,10 +1690,15 @@ public class ReleaseMatchScorer
             or "IndyCar" or "NASCAR" or "WEC" or "WSBK" or "WRC";
     }
 
+    private static bool HasExplicitTeamLeagueToken(string title, string sportPrefix) =>
+        sportPrefix is "NBA" or "WNBA"
+            ? BasketballLeagueIdentity.Detect(title) == sportPrefix
+            : Regex.IsMatch(title, $@"(?<![A-Za-z0-9]){Regex.Escape(sportPrefix)}(?![A-Za-z0-9])", RegexOptions.IgnoreCase);
+
     private bool IsTeamSport(string? sportPrefix)
     {
         if (string.IsNullOrEmpty(sportPrefix)) return false;
-        return sportPrefix is "NFL" or "NBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga";
+        return sportPrefix is "NFL" or "NBA" or "WNBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga";
     }
 
     private bool IsFightingSport(string? sportPrefix)

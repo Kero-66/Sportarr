@@ -67,6 +67,7 @@ app.MapGet("/api/queue", async (SportarrDbContext db) =>
         dq.Size,
         dq.Downloaded,
         dq.Progress,
+        CanRetryImport = PackImportBoundary.CanRetryImport(dq),
         dq.TimeRemaining,
         dq.ErrorMessage,
         dq.StatusMessages,
@@ -158,6 +159,7 @@ app.MapGet("/api/queue/{id:int}", async (int id, SportarrDbContext db) =>
         dq.Size,
         dq.Downloaded,
         dq.Progress,
+        CanRetryImport = PackImportBoundary.CanRetryImport(dq),
         dq.TimeRemaining,
         dq.ErrorMessage,
         dq.StatusMessages,
@@ -282,7 +284,7 @@ app.MapPost("/api/queue/{id:int}/import", async (int id, SportarrDbContext db, F
 });
 
 // API: Queue Operations - Retry Import (for failed imports)
-app.MapPost("/api/queue/{id:int}/retry", async (int id, SportarrDbContext db, FileImportService fileImportService, ILogger<Program> logger) =>
+app.MapPost("/api/queue/{id:int}/retry", async (int id, SportarrDbContext db, FileImportService fileImportService, ILogger<Program> logger, IServiceProvider services, DownloadClientService downloadClientService) =>
 {
     var item = await db.DownloadQueue
         .Include(dq => dq.Event)
@@ -291,14 +293,14 @@ app.MapPost("/api/queue/{id:int}/retry", async (int id, SportarrDbContext db, Fi
 
     if (item is null) return Results.NotFound(new { error = "Queue item not found" });
 
-    // Only allow retry for failed items
-    if (item.Status != DownloadStatus.Failed)
+    var heldPackMember = PackImportBoundary.IsHeld(item);
+    if (item.Status != DownloadStatus.Failed && !heldPackMember)
     {
         return Results.BadRequest(new { error = $"Cannot retry import - item status is {item.Status}, not Failed" });
     }
 
     // Check if download is complete (has progress of 100%)
-    if (item.Progress < 100)
+    if (!PackImportBoundary.CanRetryImport(item))
     {
         return Results.BadRequest(new { error = "Cannot retry import - download is not complete" });
     }
@@ -307,15 +309,20 @@ app.MapPost("/api/queue/{id:int}/retry", async (int id, SportarrDbContext db, Fi
 
     try
     {
-        // Reset status to Importing
-        item.Status = DownloadStatus.Importing;
-        item.ErrorMessage = null;
-        item.RetryCount = (item.RetryCount ?? 0) + 1;
-        await db.SaveChangesAsync();
+        if (!heldPackMember)
+        {
+            item.Status = DownloadStatus.Importing;
+            item.ErrorMessage = null;
+            item.RetryCount = (item.RetryCount ?? 0) + 1;
+            await db.SaveChangesAsync();
+        }
 
         // Attempt import. The import service marks the terminal state,
         // including clearing the error this retry was started for.
-        var result = await fileImportService.ImportDownloadAsync(item);
+        var result = item.IsPack
+            ? await fileImportService.ImportCompletedPackAsync(item,
+                () => new CompletedDownloadCleanup(services, logger).RunAsync(item, downloadClientService, db), retryHeld: heldPackMember)
+            : await fileImportService.ImportDownloadAsync(item);
         await db.SaveChangesAsync();
 
         if (result == null)
@@ -414,7 +421,7 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
     Sportarr.Api.Endpoints.EventFileEditorEndpoints.EventFileEditRequest? overrides = null;
     // Auto unless the import screen asked for something specific.
     var importMode = PostImportMode.Auto;
-    if (req.ContentLength > 0)
+    if (req.ContentLength is null or > 0)
     {
         try
         {
@@ -458,6 +465,7 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
 
         // Check if this is a disk-discovered file (no download client)
         var isDiskDiscovered = import.DownloadId.StartsWith("disk-");
+        EventFile importedFile;
 
         if (isDiskDiscovered && File.Exists(import.FilePath))
         {
@@ -466,6 +474,10 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
             if (evt == null) throw new Exception($"Event {import.SuggestedEventId} not found");
 
             var fileInfo = new FileInfo(import.FilePath);
+            var selectedPart = EventPartDetector
+                .GetSegmentDefinitions(evt.Sport, evt.Title, evt.League?.Name)
+                .FirstOrDefault(part => string.Equals(
+                    part.Name, import.SuggestedPart, StringComparison.OrdinalIgnoreCase));
 
             // Extract release group from filename
             var rgMatch = System.Text.RegularExpressions.Regex.Match(
@@ -486,11 +498,14 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
                 Size = fileInfo.Length,
                 Quality = import.Quality ?? "Unknown",
                 ReleaseGroup = releaseGroup,
+                PartName = selectedPart?.Name ?? import.SuggestedPart,
+                PartNumber = selectedPart?.PartNumber,
                 Exists = true,
                 Added = DateTime.UtcNow,
                 LastVerified = DateTime.UtcNow
             };
             db.EventFiles.Add(eventFile);
+            importedFile = eventFile;
 
             // Update event status
             evt.HasFile = true;
@@ -506,6 +521,7 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
                 DestinationPath = import.FilePath,
                 Quality = import.Quality ?? "Unknown",
                 Size = fileInfo.Length,
+                Part = selectedPart?.Name ?? import.SuggestedPart,
                 Decision = ImportDecision.Approved,
                 ImportedAt = DateTime.UtcNow
             });
@@ -518,7 +534,13 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
             // Import the download using FileImportService
             // Pass the stored FilePath directly since we already have it from the pending import
             // This avoids re-querying the download client which may return incomplete path info
-            await fileImportService.ImportDownloadAsync(tempQueueItem, import.FilePath, importMode);
+            var imported = await fileImportService.ImportDownloadAsync(tempQueueItem, import.FilePath, importMode);
+            if (imported == null)
+                throw new InvalidOperationException(tempQueueItem.ErrorMessage ?? "The file was not imported.");
+
+            importedFile = await db.EventFiles.SingleOrDefaultAsync(f =>
+                f.EventId == import.SuggestedEventId.Value && f.FilePath == imported.DestinationPath)
+                ?? throw new InvalidOperationException("The imported file record was not found.");
         }
 
         // Mark as completed
@@ -526,22 +548,11 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
         import.ResolvedAt = DateTime.UtcNow;
         await db.SaveChangesAsync();
 
-        // Apply user-supplied metadata overrides (from the import-modal editor)
-        // to the EventFile that was just created. Done after SaveChanges so the
-        // disk-discovered branch's newly-added row has an Id we can find. For the
-        // FileImportService branch we look up the most-recent EventFile for the
-        // target event, which is reliable because we just created it.
+        // Apply edits only to the file returned by this import.
         if (overrides != null)
         {
-            var newFile = await db.EventFiles
-                .Where(f => f.EventId == import.SuggestedEventId.Value)
-                .OrderByDescending(f => f.Id)
-                .FirstOrDefaultAsync();
-            if (newFile != null)
-            {
-                Sportarr.Api.Endpoints.EventFileEditorEndpoints.ApplyEdits(newFile, overrides);
-                await db.SaveChangesAsync();
-            }
+            Sportarr.Api.Endpoints.EventFileEditorEndpoints.ApplyEdits(importedFile, overrides);
+            await db.SaveChangesAsync();
         }
 
         return Results.Ok(import);
@@ -549,6 +560,7 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
     catch (Exception ex)
     {
         import.Status = PendingImportStatus.Pending;
+        import.ResolvedAt = null;
         import.ErrorMessage = ex.Message;
         await db.SaveChangesAsync();
         return Results.BadRequest(new { error = ex.Message });
@@ -572,9 +584,11 @@ app.MapPost("/api/pending-imports/{id:int}/reject", async (
 
     db.Blocklist.Add(new BlocklistItem
     {
+        EventId = import.SuggestedEventId,
         Title = import.Title,
         TorrentInfoHash = import.TorrentInfoHash,
         Protocol = import.Protocol,
+        Part = import.SuggestedPart,
         FilePath = import.FilePath,
         Reason = BlocklistReason.ManualBlock,
         Message = "User rejected pending import",
@@ -670,9 +684,11 @@ app.MapPost("/api/pending-imports/{id:int}/remove-from-client", async (
     // infinite re-add loop where the user clicked Remove every 30 seconds.
     db.Blocklist.Add(new BlocklistItem
     {
+        EventId = import.SuggestedEventId,
         Title = import.Title,
         TorrentInfoHash = import.TorrentInfoHash,
         Protocol = import.Protocol,
+        Part = import.SuggestedPart,
         FilePath = import.FilePath,
         Reason = BlocklistReason.ManualBlock,
         Message = "User removed pending import and asked client to delete",
@@ -982,6 +998,7 @@ app.MapGet("/api/pending-imports/{id:int}/pack-matches", async (
         Protocol = !string.IsNullOrEmpty(import.Protocol)
             ? import.Protocol
             : (!string.IsNullOrEmpty(import.TorrentInfoHash) ? "Torrent" : "Unknown"),
-        TorrentInfoHash = import.TorrentInfoHash
+        TorrentInfoHash = import.TorrentInfoHash,
+        Part = import.SuggestedPart
     };
 }

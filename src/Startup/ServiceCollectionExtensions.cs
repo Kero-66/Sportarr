@@ -144,6 +144,7 @@ public static class ServiceCollectionExtensions
         // transient failure produced a burst of four requests at whatever
         // speed the network allowed, right past the request delay the user
         // configured for that indexer.
+        services.AddTransient<IndexerQueryQuotaHandler>();
         services.AddHttpClient("IndexerClient")
             .AddTransientHttpErrorPolicy(policyBuilder =>
                 policyBuilder.WaitAndRetryAsync(
@@ -153,7 +154,7 @@ public static class ServiceCollectionExtensions
                     {
                         Console.WriteLine($"[Indexer] Retry {retryCount} after {timespan.TotalSeconds}s due to {outcome.Exception?.Message ?? outcome.Result.StatusCode.ToString()}");
                     }))
-            .AddHttpMessageHandler<RateLimitHandler>()
+            .AddHttpMessageHandler<IndexerQueryQuotaHandler>()
             .ConfigureHttpClient((sp, client) =>
             {
                 // Config.IndexerHttpTimeoutSeconds, read fresh on every client
@@ -392,6 +393,7 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddSportarrIndexing(this IServiceCollection services)
     {
+        services.AddSingleton<DownloadOwnershipCoordinator>();
         services.AddScoped<DownloadClientService>();
         services.AddScoped<QueueRemovalService>();
         services.AddScoped<IndexerStatusService>();

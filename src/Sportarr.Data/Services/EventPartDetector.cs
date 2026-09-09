@@ -1258,8 +1258,9 @@ public class EventPartDetector
     /// This is used for release matching to ensure FP1 releases match FP1 events.
     /// </summary>
     /// <param name="filename">The release filename (e.g., "Formula1.2025.Abu.Dhabi.FP1.1080p-GROUP")</param>
+    /// <param name="leagueName">The league name when the caller knows it</param>
     /// <returns>The detected session type name, or null if not detected</returns>
-    public static string? DetectMotorsportSessionFromFilename(string filename)
+    public static string? DetectMotorsportSessionFromFilename(string filename, string? leagueName = null)
     {
         if (string.IsNullOrEmpty(filename))
             return null;
@@ -1273,10 +1274,29 @@ public class EventPartDetector
         if (IsMotorsportMatch(cleanFilename, @"\b(notebook|ted'?s|highlights|review|analysis|preview|magazine|morning|afternoon)\b", RegexOptions.IgnoreCase))
             return null;
 
-        // Try all known motorsport session patterns (currently F1, but extensible)
-        foreach (var kvp in MotorsportSessionsByLeague)
+        List<MotorsportSessionType>? leagueSessions = null;
+        if (!string.IsNullOrWhiteSpace(leagueName))
         {
-            foreach (var session in kvp.Value)
+            leagueSessions = MotorsportSessionsByLeague
+                .FirstOrDefault(kvp => leagueName.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase))
+                .Value;
+        }
+
+        var sessions = leagueSessions ?? MotorsportSessionsByLeague.SelectMany(kvp => kvp.Value);
+        foreach (var session in sessions)
+        {
+            foreach (var pattern in session.Patterns)
+            {
+                if (IsMotorsportMatch(cleanFilename, pattern, RegexOptions.IgnoreCase))
+                {
+                    return session.Name;
+                }
+            }
+        }
+
+        if (leagueSessions != null)
+        {
+            foreach (var session in MotorsportSessionsByLeague.SelectMany(kvp => kvp.Value))
             {
                 foreach (var pattern in session.Patterns)
                 {

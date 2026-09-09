@@ -55,4 +55,76 @@ public class EventQueryServiceTeamSportTests
         queries.Should().Contain("South Florida vs Old Dominion");
         queries.Should().Contain("Old Dominion vs South Florida");
     }
+
+    [Fact]
+    public void BuildEventQueries_NbaGame_UsesOneStableNicknamePair()
+    {
+        var service = CreateService();
+        var spursHome = new Event
+        {
+            Title = "San Antonio Spurs vs New York Knicks",
+            Sport = "Basketball",
+            EventDate = new DateTime(2026, 6, 13, 0, 0, 0, DateTimeKind.Utc),
+            League = new League { Name = "NBA", Sport = "Basketball" },
+            HomeTeamId = 10,
+            AwayTeamId = 20,
+            HomeTeamName = "San Antonio Spurs",
+            AwayTeamName = "New York Knicks"
+        };
+        var knicksHome = new Event
+        {
+            Title = "New York Knicks vs San Antonio Spurs",
+            Sport = "Basketball",
+            EventDate = new DateTime(2026, 6, 10, 0, 0, 0, DateTimeKind.Utc),
+            League = new League { Name = "NBA", Sport = "Basketball" },
+            HomeTeamId = 20,
+            AwayTeamId = 10,
+            HomeTeamName = "New York Knicks",
+            AwayTeamName = "San Antonio Spurs"
+        };
+
+        service.BuildEventQueries(spursHome).Should().Equal("NBA Spurs Knicks");
+        service.BuildEventQueries(knicksHome).Should().Equal("NBA Spurs Knicks");
+    }
+
+    [Fact]
+    public void BuildMetadataTitleProbe_NbaGame_UsesExactDateFallback()
+    {
+        var service = CreateService();
+        var evt = new Event
+        {
+            Title = "Oklahoma City Thunder vs Boston Celtics",
+            Sport = "Basketball",
+            EventDate = new DateTime(2026, 6, 14, 1, 0, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 6, 13),
+            League = new League { Name = "NBA", Sport = "Basketball" },
+            HomeTeamId = 30,
+            AwayTeamId = 40,
+            HomeTeamName = "Oklahoma City Thunder",
+            AwayTeamName = "Boston Celtics"
+        };
+        var queries = service.BuildEventQueries(evt);
+
+        queries.Should().Equal("NBA Thunder Celtics");
+        service.BuildMetadataTitleProbe(evt, queries).Should().Be("NBA 2026 06 13");
+    }
+
+    [Fact]
+    public void BuildEventQueries_EnglishPremierLeagueGame_UsesOneStableTeamPair()
+    {
+        var service = CreateService();
+        var evt = new Event
+        {
+            Title = "Arsenal vs Chelsea",
+            Sport = "Soccer",
+            EventDate = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc),
+            League = new League { Name = "English Premier League", Sport = "Soccer" },
+            HomeTeamId = 30,
+            AwayTeamId = 40,
+            HomeTeamName = "Arsenal",
+            AwayTeamName = "Chelsea"
+        };
+
+        service.BuildEventQueries(evt).Should().Equal("Arsenal Chelsea");
+    }
 }

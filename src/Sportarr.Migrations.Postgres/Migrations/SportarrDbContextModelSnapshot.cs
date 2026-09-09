@@ -2815,6 +2815,9 @@ namespace Sportarr.Api.Migrations.Postgres.Migrations
                     b.Property<string>("InfoUrl")
                         .HasColumnType("text");
 
+                    b.Property<bool?>("IsPack")
+                        .HasColumnType("boolean");
+
                     b.Property<string>("Language")
                         .HasColumnType("text");
 

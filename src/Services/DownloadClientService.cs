@@ -17,7 +17,20 @@ public class DownloadClientService : IDownloadClientService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IMemoryCache _clientCache;
     private readonly ConfigService _configService;
+    private readonly DownloadOwnershipCoordinator _ownership;
     private readonly Sportarr.Api.Services.Interfaces.IRemotePathMappingService _pathMappingService;
+
+    public Task<IDisposable> EnterEventDecisionAsync(int eventId, CancellationToken cancellationToken = default) =>
+        _ownership.EnterEventDecisionAsync(eventId, cancellationToken);
+
+    /// <summary>Keep this lease until the queue owner has been saved.</summary>
+    public async Task<IDisposable> BeginAcquisitionAsync(CancellationToken cancellationToken = default)
+    {
+        var lease = _ownership.EnterAcquisitionAsync(cancellationToken);
+        if (!lease.IsCompletedSuccessfully)
+            _logger.LogDebug("[Download Client] Waiting for an external import ownership decision before adding a download");
+        return await lease;
+    }
 
     // Cache expiration settings for download client instances
     private static readonly TimeSpan CacheSlidingExpiration = TimeSpan.FromMinutes(30);
@@ -33,8 +46,10 @@ public class DownloadClientService : IDownloadClientService
         ILogger<DownloadClientService> logger,
         IMemoryCache clientCache,
         ConfigService configService,
-        Sportarr.Api.Services.Interfaces.IRemotePathMappingService pathMappingService)
+        Sportarr.Api.Services.Interfaces.IRemotePathMappingService pathMappingService,
+        DownloadOwnershipCoordinator ownership)
     {
+        _ownership = ownership;
         _pathMappingService = pathMappingService;
         _httpClientFactory = httpClientFactory;
         _loggerFactory = loggerFactory;

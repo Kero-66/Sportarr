@@ -112,4 +112,16 @@ public static class ReleaseTypeDetector
 
         return ReleaseType.Unknown;
     }
+    public static ReleaseType DetectForImport(string? title, string? leagueId = null, string? eventId = null)
+    {
+        var detected = Detect(title, leagueId, eventId);
+        if (detected != ReleaseType.Pack || !string.IsNullOrEmpty(leagueId) || !string.IsNullOrEmpty(eventId))
+            return detected;
+
+        // COMPLETE also labels full copies of individual sessions.
+        return SingleSessionPattern.IsMatch(title!) && PackMarkerPattern.Matches(title!)
+            .All(marker => marker.Value.Equals("COMPLETE", StringComparison.OrdinalIgnoreCase))
+                ? ReleaseType.SingleEvent : detected;
+    }
+
 }

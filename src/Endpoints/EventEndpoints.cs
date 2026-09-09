@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Sportarr.Api.Data;
 using Sportarr.Api.Helpers;
@@ -372,7 +373,7 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
     SportarrDbContext db,
     ILogger<Program> logger,
     ConfigService configService,
-    AutomaticSearchService searchService,
+    IServiceScopeFactory scopeFactory,
     NotificationService notificationService,
     IMetadataWriterService metadataWriterService) =>
 {
@@ -430,6 +431,18 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
         logger.LogWarning("[FILES] File not found on disk (already deleted?): {FilePath}", file.FilePath);
     }
 
+    var ownedGrabs = new List<GrabHistory>();
+    if (!string.IsNullOrWhiteSpace(file.FilePath))
+    {
+        ownedGrabs = await db.GrabHistory
+            .Where(g => g.EventId == file.EventId && g.DestinationPath == file.FilePath)
+            .ToListAsync();
+        foreach (var grab in ownedGrabs)
+        {
+            grab.FileExists = false;
+        }
+    }
+
     // Remove from database
     db.Remove(file);
 
@@ -485,15 +498,24 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
     // Handle blocklist action if specified
     if (blocklistAction == "blocklistAndSearch" || blocklistAction == "blocklistOnly")
     {
-        // Add to blocklist using originalTitle if available, otherwise use filename
-        var releaseTitle = file.OriginalTitle ?? Path.GetFileNameWithoutExtension(file.FilePath);
+        var sourceGrab = ownedGrabs
+            .OrderBy(g => g.Superseded)
+            .ThenByDescending(g => g.GrabbedAt)
+            .FirstOrDefault();
+        var releaseTitle = sourceGrab?.Title
+            ?? file.ReleaseTitle
+            ?? file.OriginalTitle
+            ?? Path.GetFileNameWithoutExtension(file.FilePath);
         if (!string.IsNullOrEmpty(releaseTitle))
         {
             var blocklistEntry = new BlocklistItem
             {
                 EventId = eventId,
                 Title = releaseTitle,
-                TorrentInfoHash = $"manual-block-{DateTime.UtcNow.Ticks}", // Synthetic hash for non-torrent blocks
+                TorrentInfoHash = sourceGrab?.TorrentInfoHash,
+                Indexer = sourceGrab?.Indexer,
+                Protocol = sourceGrab?.Protocol,
+                Part = file.PartName,
                 Reason = BlocklistReason.ManualBlock,
                 Message = "Deleted from file management",
                 BlockedAt = DateTime.UtcNow
@@ -511,14 +533,17 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
             var partName = file.PartName;
             _ = Task.Run(async () =>
             {
+                using var scope = scopeFactory.CreateScope();
+                var scopedSearch = scope.ServiceProvider.GetRequiredService<AutomaticSearchService>();
+                var scopedLogger = scope.ServiceProvider.GetRequiredService<ILogger<AutomaticSearchService>>();
                 try
                 {
-                    logger.LogInformation("[FILES] Searching for replacement for event {EventId}, part: {Part}", eventId, partName ?? "all");
-                    await searchService.SearchAndDownloadEventAsync(eventId, qualityProfileId, partName, isManualSearch: true);
+                    scopedLogger.LogInformation("[FILES] Searching for replacement for event {EventId}, part: {Part}", eventId, partName ?? "all");
+                    await scopedSearch.SearchAndDownloadEventAsync(eventId, qualityProfileId, partName, isManualSearch: true);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", eventId);
+                    scopedLogger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", eventId);
                 }
             });
         }
@@ -577,7 +602,7 @@ app.MapDelete("/api/events/{id:int}/files", async (
     SportarrDbContext db,
     ILogger<Program> logger,
     ConfigService configService,
-    AutomaticSearchService searchService,
+    IServiceScopeFactory scopeFactory,
     NotificationService notificationService,
     IMetadataWriterService metadataWriterService) =>
 {
@@ -664,6 +689,23 @@ app.MapDelete("/api/events/{id:int}/files", async (
         }
     }
 
+    var removablePaths = removableFiles
+        .Select(file => file.FilePath)
+        .Where(path => !string.IsNullOrWhiteSpace(path))
+        .Distinct()
+        .ToList();
+    var ownedGrabs = removablePaths.Count == 0
+        ? new List<GrabHistory>()
+        : await db.GrabHistory
+            .Where(grab => grab.EventId == id &&
+                grab.DestinationPath != null &&
+                removablePaths.Contains(grab.DestinationPath))
+            .ToListAsync();
+    foreach (var grab in ownedGrabs)
+    {
+        grab.FileExists = false;
+    }
+
     db.RemoveRange(removableFiles);
 
     // Update event status. A file that would not delete is still the event's
@@ -708,18 +750,37 @@ app.MapDelete("/api/events/{id:int}/files", async (
         // while it sits there invited the replacement search to download a
         // second copy beside the one being kept.
         var releasesToBlocklist = removableFiles
-            .Select(f => f.OriginalTitle ?? Path.GetFileNameWithoutExtension(f.FilePath))
-            .Where(t => !string.IsNullOrEmpty(t))
-            .Distinct()
+            .Select(file =>
+            {
+                var grab = ownedGrabs
+                    .Where(candidate => candidate.DestinationPath == file.FilePath)
+                    .OrderBy(candidate => candidate.Superseded)
+                    .ThenByDescending(candidate => candidate.GrabbedAt)
+                    .FirstOrDefault();
+                var title = grab?.Title
+                    ?? file.ReleaseTitle
+                    ?? file.OriginalTitle
+                    ?? Path.GetFileNameWithoutExtension(file.FilePath);
+                return new { File = file, Grab = grab, Title = title };
+            })
+            .Where(candidate => !string.IsNullOrEmpty(candidate.Title))
+            .GroupBy(candidate => !string.IsNullOrEmpty(candidate.Grab?.TorrentInfoHash)
+                ? $"hash:{candidate.Grab.TorrentInfoHash}"
+                : $"title:{candidate.Title}|{candidate.Grab?.Indexer}|{candidate.Grab?.Protocol}",
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
             .ToList();
 
-        foreach (var releaseTitle in releasesToBlocklist)
+        foreach (var release in releasesToBlocklist)
         {
             var blocklistEntry = new BlocklistItem
             {
                 EventId = id,
-                Title = releaseTitle!,
-                TorrentInfoHash = $"manual-block-{DateTime.UtcNow.Ticks}-{releaseTitle!.GetHashCode()}", // Synthetic hash
+                Title = release.Title!,
+                TorrentInfoHash = release.Grab?.TorrentInfoHash,
+                Indexer = release.Grab?.Indexer,
+                Protocol = release.Grab?.Protocol,
+                Part = release.File.PartName,
                 Reason = BlocklistReason.ManualBlock,
                 Message = "Deleted from file management (delete all)",
                 BlockedAt = DateTime.UtcNow
@@ -738,14 +799,17 @@ app.MapDelete("/api/events/{id:int}/files", async (
             var qualityProfileId = evt.QualityProfileId ?? evt.League?.QualityProfileId;
             _ = Task.Run(async () =>
             {
+                using var scope = scopeFactory.CreateScope();
+                var scopedSearch = scope.ServiceProvider.GetRequiredService<AutomaticSearchService>();
+                var scopedLogger = scope.ServiceProvider.GetRequiredService<ILogger<AutomaticSearchService>>();
                 try
                 {
-                    logger.LogInformation("[FILES] Searching for replacement for event {EventId}", id);
-                    await searchService.SearchAndDownloadEventAsync(id, qualityProfileId, null, isManualSearch: true);
+                    scopedLogger.LogInformation("[FILES] Searching for replacement for event {EventId}", id);
+                    await scopedSearch.SearchAndDownloadEventAsync(id, qualityProfileId, null, isManualSearch: true);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", id);
+                    scopedLogger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", id);
                 }
             });
         }

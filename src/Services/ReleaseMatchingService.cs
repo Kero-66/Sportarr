@@ -20,6 +20,18 @@ public class ReleaseMatchingService
     private readonly SportsFileNameParser _sportsParser;
     private readonly EventPartDetector _partDetector;
 
+    private static readonly Regex TeamGameNumberPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])game[\s._-]*(?<number>0*[1-9][0-9]{0,2})(?![\p{L}\p{M}\p{N}])" +
+        @"(?:[\s._]*(?:[-/&+]|and)[\s._]*(?<number>0*[1-9][0-9]{0,2})(?![\p{L}\p{M}\p{N}]))*",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex TeamGameDateMonthPattern = new(
+        @"^[.\s_-](?<month>[0-9]{2})(?=[.\s_-]|$)", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex TeamGameGroupBoundaryPattern = new(
+        @"(?:^|[\s._-])(?:[xh][\s._-]?26[45]|hevc|av1|vp9|(?:720|1080|2160)[pi])[\s._-]*[-\[]$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     // Minimum confidence score to consider a release a valid match
     // Must have positive evidence (event number, team names, organization, etc.)
     // Starting at 0 means releases with no matching evidence won't pass
@@ -36,53 +48,70 @@ public class ReleaseMatchingService
         "ppv", "event", "full", "complete", "live"
     };
 
+    private static readonly Regex AthleticsFinalPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])final(?![\p{L}\p{M}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex PreviewContentPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])preview(?![\p{L}\p{M}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex PreviewReleaseGroupSuffixPattern = new(
+        @"(?:^|[\s._-])(?:[xh][._ -]?26[45]|hevc|av1|vp9)-[\p{L}\p{M}\p{N}][\p{L}\p{M}\p{N}._-]*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex PreviewRenewedTechnicalSuffixPattern = new(
+        @"(?=(?:^|[\s._-])(?:480|576|720|1080|2160)p[\s._-]+(?:web[\s._-]?dl|webrip|hdtv|bluray|bdrip|dvdrip)[\s._-]+(?:[xh][._ -]?26[45]|hevc|av1|vp9)-[\p{L}\p{M}\p{N}][\p{L}\p{M}\p{N}._-]*$)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     // Non-event content patterns to reject (press conferences, interviews, build-up
     // shows, etc.), plus shortened cuts of the event itself (condensed games,
     // All-22 coaches film). Neither may fill or upgrade a full-event want.
     // Pre-compiled so DetectNonEventContent doesn't re-parse them on every release.
     private static readonly Regex[] NonEventContentPatterns = new[]
     {
-        new Regex(@"\bpress[\s\.\-_]*conf", RegexOptions.Compiled | RegexOptions.IgnoreCase),           // press conference, press.conf, pressconf
-        new Regex(@"\binterview", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // interview, interviews
-        new Regex(@"\bbuild[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // build up, build-up, buildup
-        new Regex(@"\bpre[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // pre show, pre-show, preshow
-        new Regex(@"\bpost[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase),             // post show, post-show, postshow
-        new Regex(@"\bpre[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase), // pre-qualifying-show
-        new Regex(@"\bpost[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase),// post-sprint-show
-        new Regex(@"\bpost[\s\.\-_]*fight", RegexOptions.Compiled | RegexOptions.IgnoreCase),            // post fight, post-fight, postfight
-        new Regex(@"\bpost[\s\.\-_]*race", RegexOptions.Compiled | RegexOptions.IgnoreCase),             // post race, post-race, postrace
-        new Regex(@"\bpost[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase),            // post match, post-match, postmatch
-        new Regex(@"\bwarm[\s\.\-_]*up\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),             // warm up (F1 pre-show)
-        new Regex(@"\bweekend[\s\.\-_]*warm[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase), // weekend warm up (Sky F1)
-        new Regex(@"\bted'?s?[\s\.\-_]*\w*[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase), // Ted's Notebook
-        new Regex(@"\bted[\s\.\-_]*kravitz", RegexOptions.Compiled | RegexOptions.IgnoreCase),           // Ted Kravitz (Sky F1 presenter)
-        new Regex(@"\b\w+[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase),          // Any Notebook
-        new Regex(@"\bpaddock[\s\.\-_]*uncut", RegexOptions.Compiled | RegexOptions.IgnoreCase),         // Paddock Uncut
-        new Regex(@"\bchequered[\s\.\-_]*flag", RegexOptions.Compiled | RegexOptions.IgnoreCase),        // Chequered Flag
-        new Regex(@"\bfull[\s\.\-_]*weekend", RegexOptions.Compiled | RegexOptions.IgnoreCase),          // Full Weekend compilations
-        new Regex(@"\bweigh[\s\.\-_]*in", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // weigh in
-        new Regex(@"\bfaceoff", RegexOptions.Compiled | RegexOptions.IgnoreCase),                        // faceoff
-        new Regex(@"\bface[\s\.\-_]*off", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // face off
-        new Regex(@"\bembedded", RegexOptions.Compiled | RegexOptions.IgnoreCase),                       // UFC Embedded
-        new Regex(@"\bcountdown", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // countdown shows
-        new Regex(@"\bhighlights?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                  // highlights
-        new Regex(@"\breview\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                       // review
-        new Regex(@"\brecap\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                        // recap
-        new Regex(@"\banalysis\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                     // analysis
-        new Regex(@"\bbreakdown\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                    // breakdown
-        new Regex(@"\bpodcast\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // podcast
-        new Regex(@"\bdocumentary\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                  // documentary
-        new Regex(@"\bbehind[\s\.\-_]*the[\s\.\-_]*scenes", RegexOptions.Compiled | RegexOptions.IgnoreCase), // behind the scenes
-        new Regex(@"\bfeaturette\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                   // featurette
-        new Regex(@"\bpromo\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                        // promo
-        new Regex(@"\btrailer\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // trailer
-        new Regex(@"\blaunch\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                       // launch
+        new Regex(@"\bpress[\s\.\-_]*conf", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),           // press conference, press.conf, pressconf
+        new Regex(@"\binterview", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // interview, interviews
+        new Regex(@"\bbuild[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // build up, build-up, buildup
+        new Regex(@"\bpre[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // pre show, pre-show, preshow
+        new Regex(@"\bpost[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // post show, post-show, postshow
+        new Regex(@"\bpre[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // pre-qualifying-show
+        new Regex(@"\bpost[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),// post-sprint-show
+        new Regex(@"\bpost[\s\.\-_]*fight", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),            // post fight, post-fight, postfight
+        new Regex(@"\bpost[\s\.\-_]*race", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // post race, post-race, postrace
+        new Regex(@"\b(?:the[\s\.\-_]*)?f1[\s\.\-_]+show\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // The F1 Show
+        new Regex(@"\bpost[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),            // post match, post-match, postmatch
+        new Regex(@"\bwarm[\s\.\-_]*up\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // warm up (F1 pre-show)
+        new Regex(@"\bweekend[\s\.\-_]*warm[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // weekend warm up (Sky F1)
+        new Regex(@"\bted'?s?[\s\.\-_]*\w*[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // Ted's Notebook
+        new Regex(@"\bted[\s\.\-_]*kravitz", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),           // Ted Kravitz (Sky F1 presenter)
+        new Regex(@"\b\w+[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),          // Any Notebook
+        new Regex(@"\bpaddock[\s\.\-_]*uncut", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),         // Paddock Uncut
+        new Regex(@"\bchequered[\s\.\-_]*flag", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),        // Chequered Flag
+        new Regex(@"\bfull[\s\.\-_]*weekend", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),          // Full Weekend compilations
+        new Regex(@"\bweigh[\s\.\-_]*in", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // weigh in
+        new Regex(@"\bfaceoff", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                        // faceoff
+        new Regex(@"\bface[\s\.\-_]*off", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // face off
+        new Regex(@"\bembedded", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                       // UFC Embedded
+        new Regex(@"\bcountdown", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // countdown shows
+        new Regex(@"\bhighlights?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                  // highlights
+        new Regex(@"\breview\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                       // review
+        new Regex(@"\brecap\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                        // recap
+        new Regex(@"\banalysis\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                     // analysis
+        new Regex(@"\bbreakdown\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                    // breakdown
+        new Regex(@"\bpodcast\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // podcast
+        new Regex(@"\bdocumentary\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                  // documentary
+        new Regex(@"\bbehind[\s\.\-_]*the[\s\.\-_]*scenes", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // behind the scenes
+        new Regex(@"\bfeaturette\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                   // featurette
+        new Regex(@"\bpromo\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                        // promo
+        new Regex(@"\btrailer\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // trailer
+        new Regex(@"\blaunch\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                       // launch
         // Shortened cuts of the actual event. These ARE the event's content, but a
         // 40-minute condensed edit must never satisfy - or worse, quality-upgrade
         // and delete - a full-game want just because its resolution is higher.
-        new Regex(@"\bcondensed", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // condensed, condensed game
-        new Regex(@"\ball[\s\.\-_]*22\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // All-22, All.22 coaches film
-        new Regex(@"\bcoach(?:'?s|es)?[\s\.\-_]*(?:film|tape|cam)", RegexOptions.Compiled | RegexOptions.IgnoreCase), // coaches film/tape/cam
+        new Regex(@"\bcondensed", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // condensed, condensed game
+        new Regex(@"\ball[\s\.\-_]*22\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // All-22, All.22 coaches film
+        new Regex(@"\bcoach(?:'?s|es)?[\s\.\-_]*(?:film|tape|cam)", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // coaches film/tape/cam
     };
 
     // Pre-season test detection — fires inside per-event ValidateRelease loop.
@@ -103,6 +132,8 @@ public class ReleaseMatchingService
         new(@"\bRaces?\s*(\d{1,3})(?:\s*(?:and|&|\+|,)\s*(\d{1,3}))?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _releaseRoundTokenPattern =
         new(@"\b(?:round|rd)\s*\.?\s*\d{1,2}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _teamScheduleRoundPattern =
+        new(@"\b(?:week|wk|round|matchday)[\s\.\-]*(\d{1,3})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex[] _eventNumberPatterns = new[]
     {
         new Regex(@"UFC[\s\.\-]+(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase),
@@ -251,7 +282,9 @@ public class ReleaseMatchingService
         // opts in (League.AllowHighlights) — short-format sports like sumo
         // ship each day as a multi-hour Live cut and a short Highlights cut,
         // and some users specifically want the highlights.
-        var nonEventContent = DetectNonEventContent(release.Title);
+        var nonEventContent = IsPreviewContent(release.Title) && !PreviewContentPattern.IsMatch(evt.Title)
+            ? "Preview"
+            : DetectNonEventContent(release.Title);
         if (nonEventContent != null)
         {
             var highlightsAllowed =
@@ -390,6 +423,39 @@ public class ReleaseMatchingService
         // Determine if this is a team sport event using string fields (always available, unlike navigation properties)
         var isTeamSport = !string.IsNullOrEmpty(evt.HomeTeamName) && !string.IsNullOrEmpty(evt.AwayTeamName);
         var isFighting = EventPartDetector.IsFightingSport(evt.Sport ?? "");
+
+        if (isTeamSport && !PackImportBoundary.IsPackRelease(release.Title, release.IsPack,
+                release.SportarrLeagueId, release.SportarrEventId))
+        {
+            var releaseRoundMatch = _teamScheduleRoundPattern.Match(release.Title);
+            if (releaseRoundMatch.Success &&
+                int.TryParse(releaseRoundMatch.Groups[1].Value, out var releaseRound) &&
+                int.TryParse(evt.Round, out var eventRound) &&
+                releaseRound != eventRound)
+            {
+                result.Confidence = 0;
+                result.IsHardRejection = true;
+                result.Rejections.Add($"Round mismatch: release is round {releaseRound}, event is round {eventRound}");
+                return result;
+            }
+
+            var releaseGames = ExtractTeamGameNumbers(release.Title, stripReleaseGroup: true, parseResult.EventDate);
+            if (releaseGames.Count > 0)
+            {
+                var eventGames = ExtractTeamGameNumbers(evt.Title, stripReleaseGroup: false);
+                var conflictingGame = eventGames.Count == 1 && !releaseGames.SetEquals(eventGames);
+                var unidentifiedGame = !parseResult.EventDate.HasValue && !releaseGames.SetEquals(eventGames);
+                if (releaseGames.Count > 1 || conflictingGame || unidentifiedGame)
+                {
+                    result.Confidence = 0;
+                    result.IsHardRejection = true;
+                    result.Rejections.Add(conflictingGame
+                        ? "Game number conflicts with the event title"
+                        : "Game identity is ambiguous: release needs a date or matching game number in the event title");
+                    return result;
+                }
+            }
+        }
 
         // Location variation matching is ONLY useful for non-team sports (F1, UFC, etc.)
         // where the event title contains location names (e.g., "Mexico Grand Prix" vs "Mexican Grand Prix")
@@ -583,6 +649,9 @@ public class ReleaseMatchingService
             // e.g. 2026-01-01T01:00Z (UTC) is compared against a release titled "AEW.2025.12.31"
             // by its true broadcast date (2025-12-31), not the UTC-rolled-over Jan 1.
             var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
+            var isAthleticsFinal = !release.IsPack &&
+                string.Equals(evt.Sport, "Athletics", StringComparison.OrdinalIgnoreCase) &&
+                AthleticsFinalPattern.IsMatch(evt.Title ?? "");
             var daysDiff = Math.Abs((eventDate - parseResult.EventDate.Value.Date).TotalDays);
             _logger.LogTrace("[Release Matching] Date comparison: release={ReleaseDate}, event={EventDate}, diff={Days} days",
                 parseResult.EventDate.Value.ToString("yyyy-MM-dd"), eventDate.ToString("yyyy-MM-dd"), daysDiff);
@@ -613,7 +682,7 @@ public class ReleaseMatchingService
                     result.MatchReasons.Add("Date within 1 day (timezone rollover)");
                 }
             }
-            else if (!isTeamSport && daysDiff <= 3)
+            else if (!isTeamSport && !isAthleticsFinal && daysDiff <= 3)
             {
                 // The 3-day grace only applies to non-team events (weekly
                 // shows, cards whose broadcast date drifts from the listed
@@ -820,7 +889,8 @@ public class ReleaseMatchingService
         {
             // Detect session type from both event title and release filename
             var eventSession = EventPartDetector.DetectMotorsportSessionType(evt.Title, evt.League?.Name ?? "");
-            var releaseSession = EventPartDetector.DetectMotorsportSessionFromFilename(release.Title);
+            var releaseSession = EventPartDetector.DetectMotorsportSessionFromFilename(
+                release.Title, evt.League?.Name);
 
             _logger.LogTrace("[Release Matching] Motorsport session validation: event='{EventSession}', release='{ReleaseSession}'",
                 eventSession ?? "unknown", releaseSession ?? "unknown");
@@ -1238,6 +1308,42 @@ public class ReleaseMatchingService
             .OrderByDescending(x => x.Item2.Confidence)
             .ThenByDescending(x => x.Item1.Score)
             .ToList();
+    }
+
+    private static HashSet<int> ExtractTeamGameNumbers(string title, bool stripReleaseGroup, DateTime? parsedDate = null)
+    {
+        if (stripReleaseGroup && ReleaseGroupParser.Parse(title) is { } group)
+        {
+            // A release group cannot identify a scheduled game.
+            var groupStart = title.LastIndexOf(group, StringComparison.OrdinalIgnoreCase);
+            if (groupStart >= 0 && TeamGameGroupBoundaryPattern.IsMatch(title[..groupStart]))
+                title = title[..groupStart];
+        }
+
+        var numbers = new HashSet<int>();
+        foreach (Match match in TeamGameNumberPattern.Matches(title))
+        {
+            var captures = match.Groups["number"].Captures;
+            var dateEnd = -1;
+            for (var index = 0; index < captures.Count; index++)
+            {
+                var capture = captures[index];
+                if (capture.Index < dateEnd) continue;
+                var number = int.Parse(capture.Value);
+                if (index > 0 && parsedDate.HasValue && capture.Length == 2 && number == parsedDate.Value.Day)
+                {
+                    // A parsed day-month date can follow the game number with a dash.
+                    var month = TeamGameDateMonthPattern.Match(title[(capture.Index + capture.Length)..]);
+                    if (month.Success && int.Parse(month.Groups["month"].Value) == parsedDate.Value.Month)
+                    {
+                        dateEnd = capture.Index + capture.Length + month.Length;
+                        continue;
+                    }
+                }
+                numbers.Add(number);
+            }
+        }
+        return numbers;
     }
 
     /// <summary>
@@ -1869,6 +1975,25 @@ public class ReleaseMatchingService
         return text;
     }
 
+    private static bool IsPreviewContent(string releaseTitle)
+    {
+        // A group after a codec must not declare the program type.
+        // Keep earlier title tokens even when the reported group says Preview.
+        var groupSuffix = PreviewReleaseGroupSuffixPattern.Match(releaseTitle);
+        var contentEnd = groupSuffix.Success ? groupSuffix.Index : releaseTitle.Length;
+        if (groupSuffix.Success)
+        {
+            // A new technical segment separates title content from the final group.
+            // A codec token alone can still belong to the first group.
+            foreach (Match technicalSuffix in PreviewRenewedTechnicalSuffixPattern.Matches(releaseTitle))
+            {
+                if (technicalSuffix.Index > contentEnd)
+                    contentEnd = technicalSuffix.Index;
+            }
+        }
+        return PreviewContentPattern.IsMatch(releaseTitle[..contentEnd]);
+    }
+
     /// <summary>
     /// Detect if a release is non-event content (press conference, interview, etc.)
     /// Returns the type of non-event content detected, or null if it appears to be actual event content.
@@ -1894,6 +2019,8 @@ public class ReleaseMatchingService
                     return "Pre-show";
                 if (detected.Contains("post"))
                     return "Post-event Show";
+                if (detected.Contains("f1") && detected.Contains("show"))
+                    return "F1 Show";
                 if (detected.Contains("weigh") && detected.Contains("in"))
                     return "Weigh-in";
                 if (detected.Contains("face") && detected.Contains("off"))

@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Sportarr.Api.Data;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services;
 using System.Text.Json;
@@ -24,7 +25,6 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     ReleaseMatchingService releaseMatchingService,
     ReleaseMatchScorer releaseMatchScorer,
     SearchResultCache searchResultCache,
-    ReleaseEvaluator releaseEvaluator,
     EventPartDetector partDetector,
     ILogger<Program> logger) =>
 {
@@ -178,7 +178,7 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     // Cache stores RAW indexer results (before matching). When cache hit, we re-run matching against THIS event.
     // This dramatically reduces API calls for:
     // - Multi-part events (UFC 300 Prelims + Main Card share "UFC.300" cache)
-    // - Same-year events (all NFL 2025 games share "NFL.2025" cache)
+    // - Repeated searches for the same event and source request
     // Every query variant is cached under its own key.
     //
     // Only the primary query used to be cached, so a repeat search served the
@@ -192,19 +192,26 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     // here silently skipped the remaining variants whenever a broad query
     // already held 100+ releases, which is exactly how the Belgian GP race
     // releases went missing from manual search while qualifying showed up
-    // fine (#168). The work is bounded: at most six query variants, each
-    // capped by the indexers themselves, deduplicated by GUID below.
+    // fine (#168). Each source search is bounded.
     bool usedCache = false;
+    bool searchComplete = true;
+    var searchDiagnostics = new List<IndexerSearchDiagnostic>();
     var queriesAttempted = 0;
+    var sportarrId = Sportarr.Api.Helpers.SportarrIdToken.Normalize(evt.ExternalId);
+    var sourceFingerprint = await indexerSearchService.GetSearchSourceFingerprintAsync(true, evt.League?.Tags);
+    var metadataProbe = usingCustomQuery ||
+        !string.Equals(evt.Sport, "Basketball", StringComparison.OrdinalIgnoreCase) ||
+        SearchTemplateList.Parse(evt.League?.SearchQueryTemplate).Count > 0
+        ? null
+        : eventQueryService.BuildMetadataTitleProbe(evt, queries);
 
-    foreach (var query in queries)
+    async Task<List<ReleaseSearchResult>> SearchQueryAsync(string query, int totalQueries)
     {
         queriesAttempted++;
         List<ReleaseSearchResult>? results = null;
 
-        // The cached answer belongs to the indexers this league can reach, not
-        // to the query text alone.
-        var cacheKey = SearchResultCache.ScopeKey(query, evt.League?.Tags);
+        var cacheKey = SearchResultCache.RequestKey(new[] { query }, evt.League?.Tags,
+            10000, false, sportarrId, sourceFingerprint);
 
         if (forceRefresh)
         {
@@ -218,6 +225,8 @@ app.MapPost("/api/event/{eventId:int}/search", async (
                 // Cache HIT - convert raw releases back to fresh results. Every
                 // event-specific field is recalculated below.
                 results = searchResultCache.ToSearchResults(cached);
+                searchComplete &= cached.SearchComplete;
+                searchDiagnostics.AddRange(cached.SearchDiagnostics);
                 usedCache = true;
                 logger.LogInformation("[SEARCH] Using {Count} cached raw releases for '{Query}' - will re-match against event '{EventTitle}'",
                     results.Count, query, evt.Title);
@@ -226,35 +235,52 @@ app.MapPost("/api/event/{eventId:int}/search", async (
 
         if (results == null)
         {
-            logger.LogInformation("[SEARCH] Trying query {Attempt}/{Total}: '{Query}'",
-                queriesAttempted, queries.Count, query);
+            using var fillSlot = await searchResultCache.EnterFillAsync(cacheKey);
 
-            // Pass enableMultiPartEpisodes to ensure proper part filtering
-            // When disabled for fighting sports, this rejects releases with detected parts (Main Card, Prelims, etc.)
-            // Pass event title for Fight Night detection (base name = Main Card for Fight Nights)
-            results = await indexerSearchService.SearchAllIndexersAsync(query, 10000, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes, evt.Title, evt.League?.Tags, skippedIndexers,
-                allowHighlights: evt.League?.AllowHighlights ?? false,
-                sportarrId: Sportarr.Api.Helpers.SportarrIdToken.Normalize(evt.ExternalId),
-                // The user asked for this event by hand, so show everything the
-                // indexer has and let scoring decide. Automatic search and RSS
-                // keep their category filter.
-                useCategoryFilter: false);
-
-            // Cache the raw results before any event-specific validation.
-            // Store refuses an empty set, so a transient outage cannot shadow
-            // real results for the rest of the window.
-            searchResultCache.Store(cacheKey, results);
-
-            if (results.Count > 0)
+            if (!forceRefresh)
             {
-                logger.LogInformation("[SEARCH] Found {Count} results from query '{Query}'", results.Count, query);
+                var cached = searchResultCache.TryGetCached(cacheKey, config.SearchCacheDuration);
+                if (cached != null)
+                {
+                    results = searchResultCache.ToSearchResults(cached);
+                    searchComplete &= cached.SearchComplete;
+                    searchDiagnostics.AddRange(cached.SearchDiagnostics);
+                    usedCache = true;
+                }
             }
-            else
+
+            if (results == null)
             {
-                logger.LogWarning("[SEARCH] No results for query '{Query}' - trying next fallback", query);
+                logger.LogInformation("[SEARCH] Trying query {Attempt}/{Total}: '{Query}'",
+                    queriesAttempted, totalQueries, query);
+
+                var outcome = await indexerSearchService.SearchAllIndexersDetailedAsync(query, 10000, qualityProfileId, part, evt.Sport, config.EnableMultiPartEpisodes, evt.Title, evt.League?.Tags, skippedIndexers,
+                    allowHighlights: evt.League?.AllowHighlights ?? false,
+                    sportarrId: sportarrId,
+                    useCategoryFilter: false,
+                    forceRefresh: forceRefresh,
+                    cacheSuccessfulSources: true);
+
+                results = outcome.Releases;
+                searchDiagnostics.AddRange(outcome.Diagnostics);
+                searchComplete &= outcome.SatisfiesRequest;
+                if (outcome.CanCache)
+                    searchResultCache.Store(cacheKey, results, config.SearchCacheDuration, searchComplete: outcome.SatisfiesRequest,
+                        diagnostics: outcome.Diagnostics, expiresAt: outcome.CacheExpiresAt);
+
+                if (results.Count > 0)
+                    logger.LogInformation("[SEARCH] Found {Count} results from query '{Query}'", results.Count, query);
+                else
+                    logger.LogWarning("[SEARCH] No results for query '{Query}' - trying next fallback", query);
             }
         }
 
+        return results;
+    }
+
+    foreach (var query in queries)
+    {
+        var results = await SearchQueryAsync(query, queries.Count);
         // Add results with GUID deduplication (fallback queries may overlap)
         foreach (var result in results)
         {
@@ -272,58 +298,9 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     {
         if (usedCache)
         {
-            // Cached results need full re-evaluation to calculate CF scores
-            // Cache stores raw indexer data; quality/CF scoring must be recalculated
-            if (qualityProfile != null)
-            {
-                logger.LogInformation("[SEARCH] Re-evaluating {Count} cached releases for quality/CF scoring", allResults.Count);
-
-                // Load custom formats and quality definitions for evaluation
-                var customFormats = await db.CustomFormats.ToListAsync();
-                var qualityDefinitions = await db.QualityDefinitions.ToListAsync();
-
-                foreach (var release in allResults)
-                {
-                    var evaluation = releaseEvaluator.EvaluateRelease(
-                        release,
-                        qualityProfile,
-                        customFormats,
-                        qualityDefinitions,
-                        part,
-                        evt.Sport,
-                        config.EnableMultiPartEpisodes,
-                        evt.Title,
-                        allowHighlights: evt.League?.AllowHighlights ?? false);
-
-                    // Update release with evaluation results
-                    release.Score = evaluation.TotalScore;
-                    release.QualityScore = evaluation.QualityScore;
-                    release.CustomFormatScore = evaluation.CustomFormatScore;
-                    release.SizeScore = evaluation.SizeScore;
-                    release.Approved = evaluation.Approved;
-                    release.Rejections = evaluation.Rejections;
-                    release.MatchedFormats = evaluation.MatchedFormats;
-                    release.Quality = evaluation.Quality;
-                    release.Part = part;
-                }
-
-                // Log sample to verify scores are calculated
-                var sampleRelease = allResults.FirstOrDefault();
-                if (sampleRelease != null)
-                {
-                    logger.LogInformation("[SEARCH] Cached releases evaluated. Sample: '{Title}' CF={CfScore}, Quality={Quality}",
-                        sampleRelease.Title, sampleRelease.CustomFormatScore, sampleRelease.Quality);
-                }
-            }
-            else
-            {
-                // No quality profile - just set the part for tracking
-                logger.LogWarning("[SEARCH] No quality profile found - cached results will not have CF scores");
-                foreach (var release in allResults)
-                {
-                    release.Part = part;
-                }
-            }
+            await indexerSearchService.EvaluateReleasesAsync(allResults, qualityProfileId, part, evt.Sport,
+                config.EnableMultiPartEpisodes, evt.Title, evt.League?.Tags,
+                allowHighlights: evt.League?.AllowHighlights ?? false);
         }
         else
         {
@@ -346,6 +323,7 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     var knownLeagues = await LeagueMatchContext.LoadAsync(db);
 
     var dateRejectionCount = 0;
+    var identityRejectedResults = new HashSet<ReleaseSearchResult>(ReferenceEqualityComparer.Instance);
     foreach (var result in allResults)
     {
         var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(result, earlyReleaseLimits);
@@ -357,6 +335,7 @@ app.MapPost("/api/event/{eventId:int}/search", async (
             // Add rejection reasons but keep in results (user can still manually grab if they want)
             result.Rejections.AddRange(matchResult.Rejections);
             result.Approved = false;
+            identityRejectedResults.Add(result);
             dateRejectionCount++;
         }
         else if (matchResult.Rejections.Any())
@@ -385,6 +364,60 @@ app.MapPost("/api/event/{eventId:int}/search", async (
         }
     }
 
+    // Mark blocklisted rows before deciding whether the default query found a
+    // usable candidate. A blocked result must not suppress the bounded probe.
+    await MarkBlocklistedAsync(db, allResults);
+
+    if (metadataProbe != null && !allResults.Any(result =>
+            !identityRejectedResults.Contains(result) && !result.IsBlocklisted &&
+            result.MatchScore >= ReleaseMatchScorer.MinimumMatchScore))
+    {
+        logger.LogInformation("[SEARCH] Trying bounded metadata fallback: '{Query}'", metadataProbe);
+        var probeResults = await SearchQueryAsync(metadataProbe, queries.Count + 1);
+        var uniqueProbeResults = new List<ReleaseSearchResult>();
+        foreach (var release in probeResults)
+        {
+            if (string.IsNullOrEmpty(release.Guid) || seenGuids.Add(release.Guid))
+            {
+                uniqueProbeResults.Add(release);
+            }
+        }
+
+        if (uniqueProbeResults.Count > 0)
+        {
+            await indexerSearchService.EvaluateReleasesAsync(uniqueProbeResults, qualityProfileId, part, evt.Sport,
+                config.EnableMultiPartEpisodes, evt.Title, evt.League?.Tags,
+                allowHighlights: evt.League?.AllowHighlights ?? false);
+
+            foreach (var release in uniqueProbeResults)
+            {
+                var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(release, earlyReleaseLimits);
+                var matchResult = releaseMatchingService.ValidateRelease(release, evt, part,
+                    config.EnableMultiPartEpisodes, earlyReleaseLimitDays: earlyLimit);
+                if (matchResult.IsHardRejection)
+                {
+                    release.Rejections.AddRange(matchResult.Rejections);
+                    release.Approved = false;
+                    dateRejectionCount++;
+                }
+                else if (matchResult.Rejections.Any())
+                {
+                    release.Rejections.AddRange(matchResult.Rejections);
+                }
+
+                release.MatchScore = releaseMatchScorer.CalculateMatchScore(release.Title, evt);
+                if (release.MatchScore < ReleaseMatchScorer.MinimumMatchScore)
+                {
+                    release.Approved = false;
+                    release.Rejections.Add($"Release doesn't match event (score: {release.MatchScore})");
+                }
+            }
+
+            await MarkBlocklistedAsync(db, uniqueProbeResults);
+            allResults.AddRange(uniqueProbeResults);
+        }
+    }
+
     var matchingCount = allResults.Count(r => r.MatchScore >= ReleaseMatchScorer.MinimumMatchScore);
     var nonMatchingCount = allResults.Count - matchingCount;
     if (nonMatchingCount > 0)
@@ -402,10 +435,6 @@ app.MapPost("/api/event/{eventId:int}/search", async (
         logger.LogInformation("[SEARCH] Match scores: {Count} matching releases, avg={Avg:F0}, max={Max}",
             matchingCount, avgScore, maxScore);
     }
-
-    // Check blocklist status for each result: show blocked items but mark them.
-    // Supports both torrent (by hash) and Usenet (by title+indexer).
-    await MarkBlocklistedAsync(db, allResults);
 
     // Sort results: by match score (best matches first), then quality score
     // Non-matching releases appear at the very bottom (visible when "Hide Rejected" is off)
@@ -430,7 +459,9 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     return Results.Ok(new
     {
         results = sortedResults,
-        skipped = dedupedSkipped
+        skipped = dedupedSkipped,
+        searchComplete,
+        searchDiagnostics
     });
 });
 
@@ -598,20 +629,14 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
         if (results.Count == 0) return;
 
         var blocklistItems = await db.Blocklist
-            .Select(b => new { b.TorrentInfoHash, b.Title, b.Indexer, b.Protocol, b.Message })
+            .AsNoTracking()
             .ToListAsync();
 
-        // Build hash lookup for torrents (use GroupBy to handle duplicate hashes gracefully)
         var torrentBlocklistLookup = blocklistItems
             .Where(b => !string.IsNullOrEmpty(b.TorrentInfoHash))
-            .GroupBy(b => b.TorrentInfoHash!)
-            .ToDictionary(g => g.Key, g => g.First().Message);
-
-        // Build title+indexer lookup for Usenet (use GroupBy to handle duplicate title+indexer combinations)
-        var usenetBlocklistLookup = blocklistItems
-            .Where(b => b.Protocol == "Usenet" || string.IsNullOrEmpty(b.TorrentInfoHash))
-            .GroupBy(b => $"{b.Title}|{b.Indexer}".ToLowerInvariant())
-            .ToDictionary(g => g.Key, g => g.First().Message, StringComparer.OrdinalIgnoreCase);
+            .GroupBy(b => b.TorrentInfoHash!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        var blocklistMatcher = new BlocklistMatcher(blocklistItems);
 
         foreach (var result in results)
         {
@@ -619,19 +644,20 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
             string? blockReason = null;
 
             // Check torrent hash blocklist
-            if (!string.IsNullOrEmpty(result.TorrentInfoHash) && torrentBlocklistLookup.TryGetValue(result.TorrentInfoHash, out var torrentReason))
+            if (!string.IsNullOrEmpty(result.TorrentInfoHash) &&
+                torrentBlocklistLookup.TryGetValue(result.TorrentInfoHash, out var torrentBlock))
             {
                 isBlocked = true;
-                blockReason = torrentReason;
+                blockReason = torrentBlock.Message;
             }
-            // Check Usenet blocklist (by title+indexer)
-            else if (result.Protocol == "Usenet" || string.IsNullOrEmpty(result.TorrentInfoHash))
+            else
             {
-                var usenetKey = $"{result.Title}|{result.Indexer}".ToLowerInvariant();
-                if (usenetBlocklistLookup.TryGetValue(usenetKey, out var usenetReason))
+                var titleBlock = blocklistMatcher.MatchTitleIdentity(
+                    result.Title, result.Indexer, result.Protocol);
+                if (titleBlock != null)
                 {
                     isBlocked = true;
-                    blockReason = usenetReason;
+                    blockReason = titleBlock.Message;
                 }
             }
 

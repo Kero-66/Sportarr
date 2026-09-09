@@ -59,6 +59,7 @@ interface QueueItem {
   size: number;
   downloaded: number;
   progress: number;
+  canRetryImport: boolean;
   timeRemaining?: string;
   errorMessage?: string;
   statusMessages?: string[]; // Status messages (warnings, errors)
@@ -693,10 +694,6 @@ export default function ActivityPage() {
     setDeleteDiskFile(true);
   };
 
-  // Bulk Import: walk the selection and call the appropriate per-item import
-  // endpoint (force-import for unmonitored rows, retry-import for failed-but-
-  // downloaded rows). Disabled when the selection contains pending imports
-  // or queue rows whose status doesn't expose an Import action.
   const handleBulkImport = async () => {
     if (!canBulkImport) return;
     const items = selectedQueueItems;
@@ -1226,20 +1223,12 @@ export default function ActivityPage() {
   const isAllQueueSelected = totalSelectable > 0 && totalSelected === totalSelectable;
   const isSomeQueueSelected = totalSelected > 0 && totalSelected < totalSelectable;
 
-  // Bulk Import is only valid for queue items where a per-item Import action
-  // is already exposed (force-import on unmonitored Warning/Completed rows
-  // and retry-import on failed-but-downloaded rows). Pending imports require
-  // per-item event mapping via the manual import dialog so they can't ride
-  // along on a bulk import.
+  // Pending imports need individual event mapping before import.
   const isQueueRowImportable = (item: QueueItem): boolean => {
     const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored')) ?? false;
     const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
-    const canRetryImport = item.status === 4 && item.progress >= 100;
-    // An import warning holds a downloaded file that lost the upgrade test. The
-    // monitor no longer retries it, so the user needs this route back to import
-    // after the library file changes.
-    const canImportWarning = item.status === 9;
-    return canImport || canRetryImport || canImportWarning;
+    const canRetryImport = item.canRetryImport === true;
+    return canImport || canRetryImport;
   };
 
   const selectedQueueItems = queueRows.filter(item => selectedQueueIds.has(item.id));
@@ -1376,12 +1365,10 @@ export default function ActivityPage() {
         const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored'));
         // Show import button for Warning (5) or Completed (3) status when unmonitored
         const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
-        // Show retry import button for Failed (4) items that have completed download (100% progress)
-        const canRetryImport = item.status === 4 && item.progress >= 100;
+        const canRetryImport = item.canRetryImport === true;
         return (
           <td key="actions" className="px-2 py-1.5">
             <div className="flex items-center justify-end gap-1">
-              {/* Show Retry Import button for failed imports (download complete but import failed) */}
               {canRetryImport && (
                 <button
                   onClick={() => handleRetryImport(item)}
@@ -1994,14 +1981,14 @@ export default function ActivityPage() {
                   {queueRows.map((item) => {
                     const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored'));
                     const canImportCard = isUnmonitored && (item.status === 5 || item.status === 3);
-                    const canRetryImportCard = item.status === 4 && item.progress >= 100;
+                    const canRetryImportCard = item.canRetryImport === true;
                     return (
                       <div
                         key={item.id}
                         className={`bg-gray-800 border rounded-lg p-4 hover:bg-gray-750 transition-colors ${selectedQueueIds.has(item.id) ? 'border-red-600' : 'border-gray-700'}`}
                       >
-                        <div className="flex flex-wrap items-start justify-between gap-y-3">
-                          <div className="flex items-start gap-3 flex-1 min-w-0">
+                        <div className="flex flex-col sm:flex-row flex-wrap items-start justify-between gap-y-3">
+                          <div className="flex items-start gap-3 flex-1 min-w-0 w-full sm:w-auto">
                             <input
                               type="checkbox"
                               checked={selectedQueueIds.has(item.id)}

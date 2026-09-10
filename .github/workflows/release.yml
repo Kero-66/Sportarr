@@ -29,6 +29,15 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
 
+      # A release squashes dev into one commit on main, so dev's own commits
+      # never become ancestors of main and dev has to be reset to it after.
+      # Record where dev is now. The reset later in this job uses it as a
+      # lease and refuses to run if anyone moves dev while the build works.
+      - name: Record the dev branch tip
+        run: |
+          git fetch origin dev --quiet
+          echo "DEV_TIP_AT_START=$(git rev-parse origin/dev)" >> "$GITHUB_ENV"
+
       - name: Auto-bump version
         id: bump_version
         run: |
@@ -436,6 +445,24 @@ jobs:
           git push origin main
           git push origin "${{ steps.bump_version.outputs.base_version_tag }}"
           git push origin "${{ steps.bump_version.outputs.version }}"
+
+      # Put dev back in line with main, the AppVersion bumped above included.
+      # The dev build reads that constant, so a dev left behind keeps stamping
+      # the previous version. The dev update channel then offers users the new
+      # stable release while the dev artifacts stay on the old number, and no
+      # amount of updating reaches it (4.1.7 shipped while dev still built
+      # 4.1.6, 2026-09-10). This used to be a manual step after CI finished,
+      # which is easy to miss.
+      - name: Reset dev to main
+        run: |
+          # The lease is dev as it stood when this job started. A push to dev
+          # during the build fails this instead of discarding the work. The
+          # release itself is already done, so a refusal warns and moves on.
+          if git push origin HEAD:refs/heads/dev --force-with-lease=refs/heads/dev:"$DEV_TIP_AT_START"; then
+            echo "dev reset to $(git rev-parse --short HEAD)"
+          else
+            echo "::warning::dev moved during the release and was left alone. Reset it by hand once its commits are on main."
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

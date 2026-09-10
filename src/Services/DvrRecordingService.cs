@@ -29,15 +29,21 @@ public class DvrRecordingService
     // writing the same output file.
     private static readonly ConcurrentDictionary<int, byte> _startsInFlight = new();
 
-    // Overtime guard state. Total minutes each recording has been extended
-    // past its original end (caps runaway extension), and a short-lived
-    // per-league livescore cache so a scheduler tick with several
-    // recordings ending doesn't hammer the hub. Static: the service is
-    // scoped, the scheduler ticks in fresh scopes. Reset on app restart -
-    // worst case a restart mid-overtime grants a fresh extension budget.
+    // Scoped scheduler calls share the extension budget. Restarting resets it.
     private static readonly ConcurrentDictionary<int, int> _overtimeExtensions = new();
-    private static readonly ConcurrentDictionary<string, (DateTime FetchedAt, List<Event> Events)> _livescoreCache = new();
     private const int OvertimeStepMinutes = 10;
+
+    // A recorder that stops (naturally or via the watchdog's stall
+    // detection) within this fraction of the scheduled duration of the
+    // scheduled end is treated as a normal completion rather than a
+    // failure. Sports events routinely finish ahead of their scheduled
+    // window - a lopsided match called early, a weather delay that
+    // shortens play - and the upstream IPTV feed drops the channel the
+    // moment the broadcast ends, which looks identical to a dead stream
+    // from the byte-growth check alone. Relative rather than a flat grace
+    // period so a 5-minute highlights recording and a 4-hour cricket
+    // match get proportionate leeway.
+    private const double EarlyEndGraceFraction = 0.20;
 
     private readonly ILogger<DvrRecordingService> _logger;
     private readonly SportarrDbContext _db;
@@ -48,6 +54,7 @@ public class DvrRecordingService
     private readonly DiskSpaceService _diskSpaceService;
     private readonly NotificationService _notificationService;
     private readonly SportarrApiClient _sportarrApiClient;
+    private readonly DvrEarlyFinishGuard _earlyFinishGuard;
 
     public DvrRecordingService(
         ILogger<DvrRecordingService> logger,
@@ -58,7 +65,8 @@ public class DvrRecordingService
         FileNamingService namingService,
         DiskSpaceService diskSpaceService,
         NotificationService notificationService,
-        SportarrApiClient sportarrApiClient)
+        SportarrApiClient sportarrApiClient,
+        DvrEarlyFinishGuard earlyFinishGuard)
     {
         _logger = logger;
         _db = db;
@@ -69,6 +77,7 @@ public class DvrRecordingService
         _diskSpaceService = diskSpaceService;
         _notificationService = notificationService;
         _sportarrApiClient = sportarrApiClient;
+        _earlyFinishGuard = earlyFinishGuard;
     }
 
     /// <summary>
@@ -747,12 +756,35 @@ public class DvrRecordingService
     /// <summary>
     /// Called by the recorder's monitor task when an ffmpeg process
     /// exited without a stop request (stream death, provider drop,
-    /// crash). Fails the row and rotates to a fallback channel while
-    /// the scheduled window is still open; when the exit landed at the
-    /// natural end of the window with data on disk, finalizes it as
-    /// Completed instead so a stream that ends exactly on time isn't
-    /// reported as a failure.
+    /// crash), and by the watchdog when it kills a stalled recorder.
+    /// Fails the row and rotates to a fallback channel while the
+    /// scheduled window is still open; when the exit landed at the
+    /// natural end of the window, or within EarlyEndGraceFraction of the
+    /// scheduled duration before the scheduled end, with data on disk,
+    /// finalizes it as Completed instead - covers both a stream that
+    /// ends exactly on time and a live event that wraps up early and
+    /// drops the feed.
     /// </summary>
+    /// <summary>
+    /// Whether a recorder exit reads as the end of the broadcast rather than
+    /// a failure. True at the natural end of the window, and true once the
+    /// last EarlyEndGraceFraction of the scheduled duration has been reached,
+    /// which is where a live event that finished early drops its feed. Always
+    /// false with nothing on disk, so an empty capture never finalizes as a
+    /// completed recording.
+    /// </summary>
+    internal static bool ExitLooksLikeANormalEnd(
+        DateTime now, DateTime scheduledStart, DateTime scheduledEnd, int postPaddingMinutes, long fileSize)
+    {
+        if (fileSize <= 0) return false;
+
+        var windowEnd = scheduledEnd.AddMinutes(postPaddingMinutes);
+        if (now >= windowEnd.AddSeconds(-30)) return true;
+
+        var earlyEndThreshold = scheduledEnd - ((scheduledEnd - scheduledStart) * EarlyEndGraceFraction);
+        return now >= earlyEndThreshold;
+    }
+
     public async Task HandleRecorderExitAsync(int recordingId, int exitCode, string? errorSummary)
     {
         var recording = await _db.DvrRecordings
@@ -769,27 +801,45 @@ public class DvrRecordingService
         var now = DateTime.UtcNow;
         var windowEnd = recording.ScheduledEnd.AddMinutes(recording.PostPadding);
         _overtimeExtensions.TryRemove(recordingId, out _);
+        _earlyFinishGuard.Forget(recordingId);
 
-        long fileSize = 0;
-        if (!string.IsNullOrEmpty(recording.OutputPath) && File.Exists(recording.OutputPath))
+        // Null means "couldn't read it" (missing, or a transient
+        // IOException from the file still flushing/closing) rather than
+        // "empty" - callers decide whether that means zero or "keep
+        // whatever we read last".
+        long? TryReadFileSize()
         {
-            try { fileSize = new FileInfo(recording.OutputPath).Length; }
-            catch (IOException) { /* transient - treated as no data */ }
+            if (string.IsNullOrEmpty(recording.OutputPath) || !File.Exists(recording.OutputPath))
+                return null;
+            try { return new FileInfo(recording.OutputPath).Length; }
+            catch (IOException) { return null; }
         }
+
+        var fileSize = TryReadFileSize() ?? 0;
 
         recording.ActualEnd = now;
         recording.LastUpdated = now;
 
-        // Exited within 30s of the natural end with data on disk:
-        // the stream simply ended on time, so this is a completed run.
-        if (fileSize > 0 && now >= windowEnd.AddSeconds(-30))
+        // Discard a worthless partial before deciding Completed vs
+        // Failed - otherwise a near-instant drop that happens to land
+        // close to the scheduled end (e.g. a very short scheduled
+        // window) could finalize as a "completed" recording of an
+        // effectively empty file. CleanupWorthlessPartial only deletes
+        // when the file is under its size floor, so a real partial
+        // capture is untouched here; re-read the size afterward since
+        // it may now be gone.
+        CleanupWorthlessPartial(recording);
+        fileSize = TryReadFileSize() ?? 0;
+
+        // Exited at or after the natural end (30s grace), or after
+        // EarlyEndGraceFraction of the scheduled duration has already
+        // elapsed, with data on disk: either the stream ran to its
+        // scheduled finish, or the live event wrapped up early and the
+        // feed dropped - both are completed runs, not failures.
+        if (ExitLooksLikeANormalEnd(now, recording.ScheduledStart, recording.ScheduledEnd, recording.PostPadding, fileSize))
         {
             await FinalizeCaptureContainerAsync(recording);
-            if (!string.IsNullOrEmpty(recording.OutputPath) && File.Exists(recording.OutputPath))
-            {
-                try { fileSize = new FileInfo(recording.OutputPath).Length; }
-                catch (IOException) { /* keep the pre-remux size */ }
-            }
+            fileSize = TryReadFileSize() ?? fileSize; // keep the pre-remux size if the re-read fails
 
             recording.Status = DvrRecordingStatus.Completed;
             recording.FileSize = fileSize;
@@ -799,8 +849,8 @@ public class DvrRecordingService
             recording.AverageBitrate = (fileSize * 8) / duration;
             await PersistRecordingStatusAsync(recording, "completed");
 
-            _logger.LogInformation("[DVR] Recording {Id}: recorder exited at the end of its window; finalized as completed ({Size} bytes)",
-                recordingId, fileSize);
+            _logger.LogInformation("[DVR] Recording {Id}: recorder exited {When} (scheduled end {End}); finalized as completed ({Size} bytes)",
+                recordingId, now >= windowEnd.AddSeconds(-30) ? "at the end of its window" : "within the early-end grace window", recording.ScheduledEnd, fileSize);
             FirePostRecordingCommand(recording);
 
             await NotifyRecordingAsync(NotificationTrigger.OnRecordingCompleted,
@@ -816,7 +866,6 @@ public class DvrRecordingService
         await PersistRecordingStatusAsync(recording, "failed");
 
         _logger.LogWarning("[DVR] Recording {Id}: recorder exited mid-window (code {Code}); marked Failed", recordingId, exitCode);
-        CleanupWorthlessPartial(recording);
 
         int? rotatedId = null;
         if (now < windowEnd)
@@ -940,11 +989,14 @@ public class DvrRecordingService
         // process is alive. Revealing and remuxing a large capture runs for
         // minutes with no process behind it, which is the state the watchdog
         // treats as a crashed recorder.
-        using var finalizing = _ffmpegRecorder.BeginFinalizing(recordingId);
+        using var finalizing = _ffmpegRecorder.TryBeginFinalizing(recordingId);
+        if (finalizing == null)
+            return new RecordingResult { Success = false, Error = "Recording is already being finalized." };
 
         var result = await _ffmpegRecorder.StopRecordingAsync(recordingId);
 
         _overtimeExtensions.TryRemove(recordingId, out _);
+        _earlyFinishGuard.Forget(recordingId);
 
         // The watchdog or the recorder's exit callback may have finalized
         // (and possibly fallback-rotated) this row while we waited for the
@@ -1166,20 +1218,129 @@ public class DvrRecordingService
     }
 
     /// <summary>
-    /// Get recordings that should stop (past their scheduled end + post-padding)
+    /// Get live recordings due to stop by schedule or confirmed final status
     /// </summary>
-    public async Task<List<DvrRecording>> GetRecordingsToStopAsync()
+    public async Task<List<DvrRecording>> GetRecordingsToStopAsync(CancellationToken cancellationToken = default)
     {
         var now = DateTime.UtcNow;
-
-        return await _db.DvrRecordings
+        var config = await _configService.GetConfigAsync();
+        var recordings = await _db.DvrRecordings
+            .Include(r => r.Event).ThenInclude(e => e!.League)
             .Where(r => r.Status == DvrRecordingStatus.Recording)
             // Catchup downloads are in Recording state while pulling from
             // the archive, with a window that's in the past by design -
             // the wall-clock stop rule only applies to live captures.
             .Where(r => r.Method == DvrRecordingMethod.Live)
-            .Where(r => r.ScheduledEnd.AddMinutes(r.PostPadding) <= now)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
+
+        _earlyFinishGuard.RetainOnly(config.DvrEarlyFinishGuardEnabled
+            ? recordings.Select(r => r.Id) : Array.Empty<int>());
+        var ready = recordings.Where(r => r.ScheduledEnd.AddMinutes(r.PostPadding) <= now).ToList();
+        if (!config.DvrEarlyFinishGuardEnabled)
+            return ready;
+
+        // Optional status checks must not hold the scheduler through an outage.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(TimeSpan.FromSeconds(10));
+        foreach (var recording in recordings.Except(ready))
+        {
+            if (_ffmpegRecorder.IsFinalizing(recording.Id))
+            {
+                _earlyFinishGuard.Forget(recording.Id);
+                continue;
+            }
+            try
+            {
+                if (await ShouldStopEarlyAsync(recording, budget.Token))
+                    ready.Add(recording);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                _earlyFinishGuard.RetainOnly(Array.Empty<int>());
+                break;
+            }
+        }
+        return ready;
+    }
+
+    public async Task<bool> IsReadyToStopAsync(DvrRecording recording, CancellationToken cancellationToken = default)
+    {
+        // Finalizing another recording can take minutes. Recheck this row before stopping it.
+        await _db.Entry(recording).ReloadAsync(cancellationToken);
+        if (_ffmpegRecorder.IsFinalizing(recording.Id) || _db.Entry(recording).State == EntityState.Detached ||
+            recording.Status != DvrRecordingStatus.Recording || recording.Method != DvrRecordingMethod.Live)
+            return false;
+        if (recording.ScheduledEnd.AddMinutes(recording.PostPadding) <= DateTime.UtcNow)
+        {
+            if (await ShouldExtendForOvertimeAsync(recording, cancellationToken))
+                return false;
+            await _db.Entry(recording).ReloadAsync(cancellationToken);
+            return !_ffmpegRecorder.IsFinalizing(recording.Id) && _db.Entry(recording).State != EntityState.Detached &&
+                recording.Status == DvrRecordingStatus.Recording && recording.Method == DvrRecordingMethod.Live &&
+                recording.ScheduledEnd.AddMinutes(recording.PostPadding) <= DateTime.UtcNow;
+        }
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(TimeSpan.FromSeconds(10));
+        try
+        {
+            return await ShouldStopEarlyAsync(recording, budget.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _earlyFinishGuard.Forget(recording.Id);
+            return false;
+        }
+    }
+
+    private async Task<bool> ShouldStopEarlyAsync(DvrRecording recording, CancellationToken cancellationToken)
+    {
+        var config = await _configService.GetConfigAsync();
+        if (!config.DvrEarlyFinishGuardEnabled || !recording.EventId.HasValue)
+        {
+            _earlyFinishGuard.Forget(recording.Id);
+            return false;
+        }
+
+        var evt = await _db.Events.AsNoTracking().Include(e => e.League)
+            .FirstOrDefaultAsync(e => e.Id == recording.EventId.Value, cancellationToken);
+        var leagueId = evt?.League?.ExternalId;
+        if (string.IsNullOrWhiteSpace(evt?.ExternalId) || string.IsNullOrWhiteSpace(leagueId))
+        {
+            _earlyFinishGuard.Forget(recording.Id);
+            return false;
+        }
+
+        var eventId = recording.EventId;
+        var actualStart = recording.ActualStart;
+        var scores = await _sportarrApiClient.GetDvrLivescoreByLeagueAsync(leagueId, cancellationToken);
+        config = await _configService.GetConfigAsync();
+        await _db.Entry(recording).ReloadAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!config.DvrEarlyFinishGuardEnabled || _ffmpegRecorder.IsFinalizing(recording.Id) ||
+            _db.Entry(recording).State == EntityState.Detached ||
+            recording.EventId != eventId || recording.ActualStart != actualStart)
+        {
+            _earlyFinishGuard.Forget(recording.Id);
+            return false;
+        }
+        var currentIdentity = await _db.Events.AsNoTracking()
+            .Where(e => e.Id == eventId)
+            .Select(e => new { e.ExternalId, e.LeagueId, e.EventDate,
+                LeagueExternalId = e.League != null ? e.League.ExternalId : null })
+            .SingleOrDefaultAsync(cancellationToken);
+        if (currentIdentity == null || currentIdentity.ExternalId != evt.ExternalId ||
+            currentIdentity.LeagueId != evt.LeagueId || currentIdentity.LeagueExternalId != leagueId ||
+            currentIdentity.EventDate > DateTime.UtcNow)
+        {
+            _earlyFinishGuard.Forget(recording.Id);
+            return false;
+        }
+        var matches = scores?.Where(score => score.EventId == evt.ExternalId && score.LeagueId == leagueId).ToList();
+        var score = matches?.Count == 1 ? matches[0] : null;
+        if (score?.RequestOrigin != _sportarrApiClient.DvrLiveSourceOrigin)
+            score = null;
+        return _earlyFinishGuard.Observe(recording, score, evt.ExternalId, leagueId,
+            DateTimeOffset.UtcNow, config.DvrEarlyFinishBufferMinutes);
     }
 
     /// <summary>
@@ -1194,7 +1355,7 @@ public class DvrRecordingService
     /// or the cap reached all mean "stop as scheduled", so the guard can
     /// never keep a recording alive on ambiguity.
     /// </summary>
-    public async Task<bool> ShouldExtendForOvertimeAsync(DvrRecording recording)
+    public async Task<bool> ShouldExtendForOvertimeAsync(DvrRecording recording, CancellationToken cancellationToken = default)
     {
         if (recording.EventId == null || recording.Method != DvrRecordingMethod.Live)
             return false;
@@ -1216,18 +1377,29 @@ public class DvrRecordingService
 
             var evt = await _db.Events
                 .Include(e => e.League)
-                .FirstOrDefaultAsync(e => e.Id == recording.EventId.Value);
+                .FirstOrDefaultAsync(e => e.Id == recording.EventId.Value, cancellationToken);
             if (evt?.ExternalId == null || evt.League?.ExternalId == null)
                 return false;
 
-            var livescore = await GetLivescoreCachedAsync(evt.League.ExternalId);
-            var liveEntry = livescore?.FirstOrDefault(l => l.ExternalId == evt.ExternalId);
-            if (liveEntry == null || !IndicatesInProgress(liveEntry.Status))
+            var eventId = recording.EventId;
+            var livescore = await _sportarrApiClient.GetDvrLivescoreByLeagueAsync(evt.League.ExternalId, cancellationToken);
+            config = await _configService.GetConfigAsync();
+            await _db.Entry(recording).ReloadAsync(cancellationToken);
+            if (_db.Entry(recording).State == EntityState.Detached ||
+                recording.Status != DvrRecordingStatus.Recording || recording.Method != DvrRecordingMethod.Live ||
+                recording.EventId != eventId || recording.ScheduledEnd.AddMinutes(recording.PostPadding) > DateTime.UtcNow)
+                return true;
+            if (!config.DvrOvertimeGuardEnabled)
+                return false;
+            var matches = livescore?.Where(l => l.EventId == evt.ExternalId && l.LeagueId == evt.League.ExternalId).ToList();
+            var liveEntry = matches?.Count == 1 ? matches[0] : null;
+            if (liveEntry == null || liveEntry.RequestOrigin != _sportarrApiClient.DvrLiveSourceOrigin ||
+                !liveEntry.IsFresh(DateTimeOffset.UtcNow) || !liveEntry.IsInProgress)
                 return false;
 
             recording.ScheduledEnd = recording.ScheduledEnd.AddMinutes(OvertimeStepMinutes);
             recording.LastUpdated = DateTime.UtcNow;
-            await _db.SaveChangesAsync();
+            await _db.SaveChangesAsync(cancellationToken);
             _overtimeExtensions[recording.Id] = extendedSoFar + OvertimeStepMinutes;
 
             _logger.LogInformation(
@@ -1235,6 +1407,10 @@ public class DvrRecordingService
                 evt.Title, liveEntry.Status, recording.Id, OvertimeStepMinutes,
                 extendedSoFar + OvertimeStepMinutes, config.DvrOvertimeMaxExtensionMinutes);
             return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -1269,22 +1445,6 @@ public class DvrRecordingService
         // Everything else on a live feed ("live", "1st half", "q3", "ht",
         // period/lap/round descriptors...) counts as in progress.
         return true;
-    }
-
-    private async Task<List<Event>?> GetLivescoreCachedAsync(string leagueExternalId)
-    {
-        if (_livescoreCache.TryGetValue(leagueExternalId, out var cached) &&
-            DateTime.UtcNow - cached.FetchedAt < TimeSpan.FromSeconds(60))
-        {
-            return cached.Events;
-        }
-
-        var events = await _sportarrApiClient.GetLivescoreByLeagueAsync(leagueExternalId);
-        if (events != null)
-        {
-            _livescoreCache[leagueExternalId] = (DateTime.UtcNow, events);
-        }
-        return events;
     }
 
     /// <summary>

@@ -1189,6 +1189,9 @@ namespace Sportarr.Api.Migrations
                         .HasColumnType("TEXT")
                         .HasAnnotation("Relational:JsonPropertyName", "broadcastDate");
 
+                    b.Property<bool>("BroadcastDateVerified")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("Description")
                         .HasColumnType("TEXT")
                         .HasAnnotation("Relational:JsonPropertyName", "strDescriptionEN");
@@ -1212,6 +1215,9 @@ namespace Sportarr.Api.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<bool>("HasFile")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool?>("HasLaterSeasonFinal")
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("HomeScore")
@@ -2300,6 +2306,10 @@ namespace Sportarr.Api.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("TEXT")
                         .HasAnnotation("Relational:JsonPropertyName", "strSport");
+
+                    b.Property<string>("SportFormat")
+                        .HasColumnType("TEXT")
+                        .HasAnnotation("Relational:JsonPropertyName", "strSportFormat");
 
                     b.Property<string>("Tags")
                         .IsRequired()

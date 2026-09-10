@@ -15,6 +15,16 @@ namespace Sportarr.Api.Tests.Services;
 /// </summary>
 public class DvrFinalizingGuardTests
 {
+    [Fact]
+    public void A_second_stop_cannot_claim_the_same_recording_during_finalization()
+    {
+        var recorder = CreateRecorder();
+        using var first = recorder.BeginFinalizing(7);
+        Action second = () => recorder.BeginFinalizing(7);
+        second.Should().Throw<InvalidOperationException>();
+        recorder.IsFinalizing(7).Should().BeTrue();
+    }
+
     private static FFmpegRecorderService CreateRecorder() =>
         new(NullLogger<FFmpegRecorderService>.Instance, null!, null!);
 

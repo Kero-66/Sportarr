@@ -146,7 +146,7 @@ interface GrabHistoryItem {
 
 interface PendingImport {
   id: number;
-  downloadClientId: number;
+  downloadClientId: number | null;
   downloadId: string;
   downloadClient?: DownloadClient;
   title: string;
@@ -159,6 +159,7 @@ interface PendingImport {
   suggestedPart?: string;
   suggestionConfidence: number;
   detected: string;
+  errorMessage?: string;
   protocol?: string;
   isPack?: boolean;
   fileCount?: number;
@@ -188,7 +189,7 @@ interface RemoveQueueDialog {
   // Pending imports picked in the same selection. They run on their own
   // endpoints, but the dialog has to name them because confirming removes
   // them too.
-  pendingItems: { id: number; title: string }[];
+  pendingItems: { id: number; title: string; downloadClientId?: number | null }[];
 }
 
 interface RemoveHistoryDialog {
@@ -205,7 +206,10 @@ interface RemoveBlocklistDialog {
   title: string;
 }
 
-const statusNames = ['Queued', 'Downloading', 'Paused', 'Completed', 'Failed', 'Warning', 'Importing', 'Imported'];
+const statusNames = [
+  'Queued', 'Downloading', 'Paused', 'Completed', 'Failed',
+  'Warning', 'Importing', 'Imported', 'Import Pending', 'Import Warning'
+];
 const statusColors = [
   'text-gray-400',      // Queued
   'text-blue-400',      // Downloading
@@ -214,7 +218,9 @@ const statusColors = [
   'text-red-400',       // Failed
   'text-orange-400',    // Warning
   'text-purple-400',    // Importing
-  'text-green-500'      // Imported
+  'text-green-500',     // Imported
+  'text-yellow-400',    // Import Pending
+  'text-orange-400'     // Import Warning
 ];
 
 const decisionNames = ['Approved', 'Rejected', 'Already Imported', 'Upgraded'];
@@ -277,6 +283,10 @@ export default function ActivityPage() {
   const [clearAllBlocklistOpen, setClearAllBlocklistOpen] = useState(false);
   const [removalMethod, setRemovalMethod] = useState<RemovalMethod>('removeFromClient');
   const [blocklistAction, setBlocklistAction] = useState<BlocklistAction>('none');
+  // A pending import the scan made from a file on disk has no download
+  // client to clear; removing the row takes the file with it unless the
+  // user unticks this, the way a client removal takes the download's files.
+  const [deleteDiskFile, setDeleteDiskFile] = useState(true);
   const [historyBlocklistAction, setHistoryBlocklistAction] = useState<BlocklistAction>('none');
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
@@ -653,6 +663,7 @@ export default function ActivityPage() {
     });
     setRemovalMethod('removeFromClient'); // Reset to default
     setBlocklistAction('none'); // Reset to default
+    setDeleteDiskFile(true);
   };
 
   // Open the remove dialog for the current selection. Pending imports have
@@ -675,10 +686,11 @@ export default function ActivityPage() {
     setRemoveQueueDialog({
       type: 'queue',
       items: selectedItems,
-      pendingItems: selectedPendings.map(p => ({ id: p.id, title: p.title }))
+      pendingItems: selectedPendings.map(p => ({ id: p.id, title: p.title, downloadClientId: p.downloadClientId }))
     });
     setRemovalMethod('removeFromClient'); // Reset to default
     setBlocklistAction('none'); // Reset to default
+    setDeleteDiskFile(true);
   };
 
   // Bulk Import: walk the selection and call the appropriate per-item import
@@ -712,24 +724,43 @@ export default function ActivityPage() {
   // detector recreated the row on its next pass.
   const pendingImportsSupported = removalMethod === 'removeFromClient';
 
+  // A row the scan made from a file on disk has no client, so the removal
+  // method above does not apply to it; it is removed whatever the method says.
+  type PendingRemovalItem = { id: number; downloadClientId?: number | null };
+  const isDiskFound = (p: PendingRemovalItem) => !p.downloadClientId;
+  const diskFoundInDialog = (removeQueueDialog?.pendingItems ?? []).some(isDiskFound);
+  // Only files the library found: no download client is involved, so the
+  // dialog speaks of files, not downloads, and skips the removal method.
+  const onlyDiskRows = !!removeQueueDialog
+    && removeQueueDialog.items.length === 0
+    && removeQueueDialog.pendingItems.length > 0
+    && removeQueueDialog.pendingItems.every(isDiskFound);
+
   // A pending import has two removal endpoints. Pick the one that matches what
   // the dialog offered. Removing from the client always blocklists, because the
   // detectors would otherwise re-add the download on the next poll.
-  const pendingImportRemoval = (id: number) => {
+  const pendingImportRemoval = (p: PendingRemovalItem) => {
     const search = blocklistAction === 'blocklistAndSearch';
 
+    if (isDiskFound(p)) {
+      const file = `deleteFile=${deleteDiskFile}`;
+      return blocklistAction === 'none'
+        ? { method: 'delete' as const, url: `/pending-imports/${p.id}?${file}` }
+        : { method: 'post' as const, url: `/pending-imports/${p.id}/reject?search=${search}&${file}` };
+    }
+
     if (removalMethod === 'removeFromClient') {
-      return { method: 'post' as const, url: `/pending-imports/${id}/remove-from-client?search=${search}` };
+      return { method: 'post' as const, url: `/pending-imports/${p.id}/remove-from-client?search=${search}` };
     }
 
     if (blocklistAction === 'none') {
-      return { method: 'delete' as const, url: `/pending-imports/${id}` };
+      return { method: 'delete' as const, url: `/pending-imports/${p.id}` };
     }
 
     // Carry the search half of the choice through. Rejecting always
     // blocklists, so without this flag "blocklist and search" and "blocklist
     // only" did exactly the same thing for a pending import.
-    return { method: 'post' as const, url: `/pending-imports/${id}/reject?search=${search}` };
+    return { method: 'post' as const, url: `/pending-imports/${p.id}/reject?search=${search}` };
   };
 
   const handleRemoveQueue = async () => {
@@ -752,9 +783,10 @@ export default function ActivityPage() {
       // Pending imports the user picked in the same selection. They have their
       // own endpoints, so map the dialog choices onto the matching one instead
       // of always deleting their files.
-      if (pendingItems.length > 0 && pendingImportsSupported) {
-        await Promise.all(pendingItems.map(p =>
-          apiClient.request(pendingImportRemoval(p.id)).catch(err => {
+      const actionable = pendingItems.filter(p => isDiskFound(p) || pendingImportsSupported);
+      if (actionable.length > 0) {
+        await Promise.all(actionable.map(p =>
+          apiClient.request(pendingImportRemoval(p)).catch(err => {
             console.error('Failed to remove pending import:', err);
           })
         ));
@@ -870,11 +902,37 @@ export default function ActivityPage() {
     );
   };
 
+  // One remove path for both layouts. A file the library found has no
+  // client to clear, so the remove dialog asks about the file itself; a
+  // row from a download client is cleared through the client.
+  const handleRemovePendingImport = async (pendingImport: PendingImport) => {
+    if (isDiskFound(pendingImport)) {
+      setRemoveQueueDialog({
+        type: 'queue',
+        items: [],
+        pendingItems: [{ id: pendingImport.id, title: pendingImport.title, downloadClientId: pendingImport.downloadClientId }]
+      });
+      setRemovalMethod('removeFromClient');
+      setBlocklistAction('none');
+      setDeleteDiskFile(true);
+      return;
+    }
+    try {
+      // Remove from download client AND pending imports list
+      await apiClient.post(`/pending-imports/${pendingImport.id}/remove-from-client`);
+      loadQueue();
+    } catch (error) {
+      console.error('Failed to remove pending import from client:', error);
+    }
+  };
+
   const handleIgnorePendingImport = async (id: number) => {
     try {
       // Rejects the pending import: the row is removed and the file's path
       // is blocklisted, so scans and the file watcher stop rediscovering it.
-      await apiClient.post(`/pending-imports/${id}/reject`);
+      // Ignore keeps the file, as its tooltip says; removing the row is
+      // what takes a disk-found file with it.
+      await apiClient.post(`/pending-imports/${id}/reject?deleteFile=false`);
       loadQueue();
     } catch (error) {
       console.error('Failed to ignore pending import:', error);
@@ -1177,7 +1235,11 @@ export default function ActivityPage() {
     const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored')) ?? false;
     const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
     const canRetryImport = item.status === 4 && item.progress >= 100;
-    return canImport || canRetryImport;
+    // An import warning holds a downloaded file that lost the upgrade test. The
+    // monitor no longer retries it, so the user needs this route back to import
+    // after the library file changes.
+    const canImportWarning = item.status === 9;
+    return canImport || canRetryImport || canImportWarning;
   };
 
   const selectedQueueItems = queueRows.filter(item => selectedQueueIds.has(item.id));
@@ -1376,6 +1438,8 @@ export default function ActivityPage() {
       case 5: return <ExclamationTriangleIcon className="w-4 h-4" />;
       case 6: return <DocumentCheckIcon className="w-4 h-4 animate-pulse" />;
       case 7: return <CheckCircleIcon className="w-4 h-4" />;
+      case 8: return <ClockIcon className="w-4 h-4" />;
+      case 9: return <ExclamationTriangleIcon className="w-4 h-4" />;
       default: return <ClockIcon className="w-4 h-4" />;
     }
   };
@@ -1511,6 +1575,9 @@ export default function ActivityPage() {
                       return (
                         <td key="title" className="px-3 py-1.5 overflow-hidden">
                           <div className="text-gray-300 text-xs truncate" title={pendingImport.title}>{pendingImport.title}</div>
+                          {pendingImport.errorMessage && (
+                            <div className="text-yellow-400 text-xs">{pendingImport.errorMessage}</div>
+                          )}
                         </td>
                       );
                     case 'quality':
@@ -1617,17 +1684,11 @@ export default function ActivityPage() {
                               <NoSymbolIcon className="w-4 h-4" />
                             </button>
                             <button
-                              onClick={async () => {
-                                try {
-                                  // Remove from download client AND pending imports list
-                                  await apiClient.post(`/pending-imports/${pendingImport.id}/remove-from-client`);
-                                  loadQueue();
-                                } catch (error) {
-                                  console.error('Failed to remove pending import from client:', error);
-                                }
-                              }}
+                              onClick={() => handleRemovePendingImport(pendingImport)}
                               className={BUTTON_ICON_DESTRUCTIVE}
-                              title="Remove download from client and delete files"
+                              title={isDiskFound(pendingImport)
+                                ? 'Remove this file from the list and from disk'
+                                : 'Remove download from client and delete files'}
                             >
                               <TrashIcon className="w-4 h-4" />
                             </button>
@@ -1867,6 +1928,9 @@ export default function ActivityPage() {
                             {pendingImport.protocol && <span className="px-2 py-1 bg-blue-900/30 text-blue-400 text-xs rounded uppercase">{pendingImport.protocol}</span>}
                           </div>
                           <p className="text-sm text-gray-400 truncate mb-1">{pendingImport.title}</p>
+                          {pendingImport.errorMessage && (
+                            <p className="text-sm text-yellow-400 mb-1">{pendingImport.errorMessage}</p>
+                          )}
                           <div className="flex items-center gap-4 text-sm text-gray-500 flex-wrap">
                             {pendingImport.size > 0 && <span>{formatBytes(pendingImport.size)}</span>}
                             {pendingImport.downloadClient?.name && <><span className="text-gray-600">•</span><span>{pendingImport.downloadClient.name}</span></>}
@@ -1912,15 +1976,11 @@ export default function ActivityPage() {
                             Ignore
                           </button>
                           <button
-                            onClick={async () => {
-                              try {
-                                await apiClient.post(`/pending-imports/${pendingImport.id}/remove-from-client`);
-                                loadQueue();
-                              } catch (error) {
-                                console.error('Failed to remove pending import from client:', error);
-                              }
-                            }}
+                            onClick={() => handleRemovePendingImport(pendingImport)}
                             className={BUTTON_DESTRUCTIVE}
+                            title={isDiskFound(pendingImport)
+                              ? 'Remove this file from the list and from disk'
+                              : 'Remove download from client and delete files'}
                           >
                             <TrashIcon className="w-4 h-4" />
                             Remove
@@ -2618,7 +2678,7 @@ export default function ActivityPage() {
                 <h3 className="text-xl font-bold text-white">
                   {removeDialogTotal === 1 && removeQueueDialog.items.length === 1
                     ? `Remove - ${removeQueueDialog.items[0].title.length > 60 ? removeQueueDialog.items[0].title.substring(0, 60) + '...' : removeQueueDialog.items[0].title}`
-                    : `Remove ${removeDialogTotal} Selected Downloads`
+                    : `Remove ${removeDialogTotal} Selected ${onlyDiskRows ? (removeDialogTotal === 1 ? 'File' : 'Files') : 'Downloads'}`
                   }
                 </h3>
                 <button
@@ -2636,7 +2696,9 @@ export default function ActivityPage() {
               ) : (
                 <div className="mb-6">
                   <p className="text-gray-300 mb-3">
-                    Are you sure you want to remove the following {removeDialogTotal} downloads from the queue?
+                    {onlyDiskRows
+                      ? `Are you sure you want to remove the following ${removeDialogTotal === 1 ? 'file' : `${removeDialogTotal} files`} from the list?`
+                      : `Are you sure you want to remove the following ${removeDialogTotal} downloads from the queue?`}
                   </p>
                   <div className="max-h-40 overflow-y-auto bg-gray-800/50 rounded-lg p-3 space-y-1">
                     {removeQueueDialog.items.map(item => (
@@ -2654,6 +2716,7 @@ export default function ActivityPage() {
               )}
 
               {/* Removal Method */}
+              {!onlyDiskRows && (
               <div className="mb-6">
                 <label className="block text-gray-300 font-medium mb-2">Removal Method</label>
                 <select
@@ -2670,14 +2733,33 @@ export default function ActivityPage() {
                   {removalMethod === 'changeCategory' && 'Changes download to the \'Post-Import Category\' from Download Client'}
                   {removalMethod === 'ignoreDownload' && 'Stops Sportarr from processing this download further'}
                 </p>
-                {removeQueueDialog.pendingItems.length > 0 && (
+                {removeQueueDialog.pendingItems.some(p => !isDiskFound(p)) && (
                   <p className="text-sm text-gray-400 mt-2">
                     {pendingImportsSupported
                       ? 'Pending imports are always blocklisted when removed this way, or the scanner finds them again on its next pass.'
-                      : `This method does not apply to pending imports, so the ${removeQueueDialog.pendingItems.length} listed above will be left alone. Choose Remove from Download Client to act on them.`}
+                      : `This method does not apply to pending imports from a download client, so those listed above will be left alone. Choose Remove from Download Client to act on them.`}
                   </p>
                 )}
               </div>
+              )}
+              {diskFoundInDialog && (
+                <div className="mb-6">
+                  <label className="flex items-start gap-3 text-sm text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={deleteDiskFile}
+                      onChange={(e) => setDeleteDiskFile(e.target.checked)}
+                      className="mt-0.5 w-4 h-4 rounded border-gray-600 bg-gray-700 text-red-600"
+                    />
+                    <span>
+                      Delete the file from disk
+                      <span className="block text-gray-500">
+                        The file goes to the recycle bin when one is set, otherwise it is deleted. Only a file inside a root folder is touched. A kept file is found again on the next scan unless you blocklist it.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
 
               {/* Blocklist Release */}
               <div className="mb-6">
@@ -2709,7 +2791,7 @@ export default function ActivityPage() {
                   onClick={handleRemoveQueue}
                   className="px-6 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors"
                 >
-                  Remove{removeDialogTotal > 1 ? ` ${removeDialogTotal} Downloads` : ''}
+                  Remove{removeDialogTotal > 1 ? ` ${removeDialogTotal} ${onlyDiskRows ? 'Files' : 'Downloads'}` : ''}
                 </button>
               </div>
             </div>

@@ -1,4 +1,3 @@
-using System.Reflection;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services;
 using FluentAssertions;
@@ -17,11 +16,10 @@ public class LeagueEventSyncServiceMonitorTypeTests
     private static bool InvokeShouldMonitorEvent(
         MonitorType monitorType, DateTime eventDate, string? eventSeason, string currentSeason, string latestSeasonWithData)
     {
-        var method = typeof(LeagueEventSyncService).GetMethod("ShouldMonitorEvent", BindingFlags.NonPublic | BindingFlags.Static)!;
         var league = new League { Name = "Test League", Sport = "Football", MonitorType = monitorType };
         var cupStageSizes = new HashSet<int>();
 
-        return (bool)method.Invoke(null, new object?[] { league, eventDate, eventSeason, currentSeason, latestSeasonWithData, null, null, cupStageSizes })!;
+        return LeagueEventSyncService.ShouldMonitorEvent(league, eventDate, eventSeason, currentSeason, latestSeasonWithData, null, null, cupStageSizes);
     }
 
     [Fact]

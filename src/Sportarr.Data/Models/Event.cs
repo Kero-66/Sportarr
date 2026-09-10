@@ -212,6 +212,10 @@ public class Event
     [JsonPropertyName("intRound")]
     public string? Round { get; set; }
 
+    // Keep full-season evidence when team filtering omits the final.
+    [JsonIgnore]
+    public bool? HasLaterSeasonFinal { get; set; }
+
     /// <summary>
     /// Event date and time in UTC. Mapped from strTimestamp (preferred, includes time)
     /// or dateEvent (fallback, date only). strTimestamp provides accurate UTC times
@@ -248,6 +252,26 @@ public class Event
     [JsonPropertyName("broadcastDate")]
     [JsonConverter(typeof(NullableEventDateConverter))]
     public DateTime? BroadcastDate { get; set; }
+
+    /// <summary>
+    /// True when BroadcastDate was filled by a client-side fallback
+    /// (dateEvent or the UTC instant) rather than served by the API.
+    /// A fallback is an approximation that can sit one day off for
+    /// late-Eastern events, so matching must not treat it as the
+    /// authoritative broadcast-local date. Transient; never serialized.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public bool BroadcastDateIsFallback { get; set; }
+
+    /// <summary>
+    /// True when BroadcastDate came off the wire as an authoritative
+    /// broadcast-local date. False for client-side approximations and
+    /// the legacy boot-time backfill, whose value is UTC-derived and
+    /// can sit one day off. Matching only enforces the exact-day rule
+    /// for team sports when this is true.
+    /// </summary>
+    public bool BroadcastDateVerified { get; set; }
 
     /// <summary>
     /// IANA broadcast timezone (e.g. "America/New_York") resolved by
@@ -560,6 +584,7 @@ public class EventResponse
     /// canonical UTC instant for ordering and live status.
     /// </summary>
     public DateTime? BroadcastDate { get; set; }
+
     /// <summary>
     /// IANA broadcast timezone (e.g. "America/New_York"). UI may use it
     /// to localize EventDate for display. Null when the upstream API

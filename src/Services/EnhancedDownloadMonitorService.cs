@@ -3,6 +3,7 @@ using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
+using System.Diagnostics;
 
 namespace Sportarr.Api.Services;
 
@@ -19,6 +20,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<EnhancedDownloadMonitorService> _logger;
+    private readonly DownloadMonitorWakeSignal _wakeSignal;
     private readonly TimeSpan _stalledTimeout = TimeSpan.FromMinutes(10); // Default stalled timeout
 
     // Hard cap on import retries. After this many failed import attempts the
@@ -28,7 +30,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
     // Failed→Completed, and HandleCompletedDownload will keep retrying the
     // same broken import forever. Without this cap we've seen ImportRetryCount
     // climb past 1000 in production.
-    private const int MaxImportRetries = 3;
+    private const int MaxImportRetries = DownloadMonitorEligibility.MaxImportRetries;
 
     // How long to keep retrying a completed download whose files are still packed
     // archives before giving up. An external extractor (unpackerr) or the usenet
@@ -38,10 +40,12 @@ public class EnhancedDownloadMonitorService : BackgroundService
 
     public EnhancedDownloadMonitorService(
         IServiceProvider serviceProvider,
-        ILogger<EnhancedDownloadMonitorService> logger)
+        ILogger<EnhancedDownloadMonitorService> logger,
+        DownloadMonitorWakeSignal wakeSignal)
     {
         _serviceProvider = serviceProvider;
         _logger = logger;
+        _wakeSignal = wakeSignal;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -84,9 +88,16 @@ public class EnhancedDownloadMonitorService : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // This pass covers pending notifications. Keep any that arrive during it.
+            _wakeSignal.ClearPending();
+            var cycleStarted = Stopwatch.GetTimestamp();
             try
             {
                 await MonitorDownloadsAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {
@@ -97,6 +108,10 @@ public class EnhancedDownloadMonitorService : BackgroundService
             try
             {
                 await DetectExternalDownloadsAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {
@@ -119,7 +134,12 @@ public class EnhancedDownloadMonitorService : BackgroundService
                 _logger.LogWarning(ex, "[Enhanced Download Monitor] Failed to read poll interval from config, using default");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(pollSeconds), stoppingToken);
+            await _wakeSignal.WaitAsync(TimeSpan.FromSeconds(pollSeconds), stoppingToken);
+
+            // Callback bursts must respect the existing five-second polling floor.
+            var remaining = TimeSpan.FromSeconds(5) - Stopwatch.GetElapsedTime(cycleStarted);
+            if (remaining > TimeSpan.Zero)
+                await Task.Delay(remaining, stoppingToken);
         }
 
         _logger.LogInformation("[Enhanced Download Monitor] Service stopped");
@@ -177,9 +197,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
         var activeDownloads = await db.DownloadQueue
             .Include(d => d.DownloadClient)
             .Include(d => d.Event)
-            .Where(d => d.Status != DownloadStatus.Imported &&
-                       (d.Status != DownloadStatus.Failed
-                            || (d.RetryCount < 3 && (d.ImportRetryCount ?? 0) < MaxImportRetries)))
+            .Where(DownloadMonitorEligibility.ActiveDownloads)
             .ToListAsync(cancellationToken);
 
         if (activeDownloads.Count == 0)
@@ -419,7 +437,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                     // mean five minutes of timeouts from an overloaded client
                     // (a SABnzbd instance chewing through a big batch, say), and
                     // removing on that evidence wiped whole healthy queues.
-                    var (reachable, _) = await downloadClientService.TestConnectionAsync(download.DownloadClient);
+                    var (reachable, _) = await downloadClientService.TestConnectionAsync(download.DownloadClient, writeProbe: false);
                     if (!reachable)
                     {
                         _logger.LogWarning("[Enhanced Download Monitor] Download missing for {Count} checks but client {Client} is unreachable; deferring removal: {Title}",
@@ -474,6 +492,11 @@ public class EnhancedDownloadMonitorService : BackgroundService
         // Special handling for Decypharr: "paused" with 100% progress means completed
         // Decypharr pauses torrents when complete since debrid services don't seed
         var isDecypharrCompleted = status.Status == "paused" && status.Progress >= 99.9;
+
+        if (ShouldPreserveImportWarning(download.Status, status.Status))
+        {
+            return;
+        }
 
         download.Status = status.Status switch
         {
@@ -586,6 +609,17 @@ public class EnhancedDownloadMonitorService : BackgroundService
         }
     }
 
+    // The status remap above compares the client status with ordinal case rules.
+    // This check uses the same rules on purpose. A looser rule here lets a
+    // failure escape the hold, but the remap still does not make the row failed,
+    // so the row keeps the import warning and gains the client error text.
+    internal static bool ShouldPreserveImportWarning(DownloadStatus currentStatus, string clientStatus)
+    {
+        return currentStatus == DownloadStatus.ImportWarning &&
+               !string.Equals(clientStatus, "failed", StringComparison.Ordinal) &&
+               !string.Equals(clientStatus, "error", StringComparison.Ordinal);
+    }
+
     // Last observed progress and when it last MOVED, per queue item. The
     // old check compared against the download's Added time, which flagged
     // any slow-but-moving torrent older than the threshold; this tracks
@@ -646,36 +680,56 @@ public class EnhancedDownloadMonitorService : BackgroundService
     }
 
     /// <summary>
-    /// Delete the job folder the download client left behind, but only when it
-    /// holds no files at all.
+    /// Delete the job folder the download client left behind, together with
+    /// whatever the import did not take (nfo, samples, leftover archives).
+    /// Users expect the whole folder to be gone once the import is in the
+    /// library. The folder is the job's own by resolution, and the policy
+    /// still refuses a configured path or anything that contains one.
     ///
-    /// Import moves the video out, then the client deletes what it still tracks
-    /// and leaves the directory. Sonarr leaves these too, so this goes a step
-    /// further than the app we are compared to. It deletes ONLY an empty
-    /// directory, never a library root, and it refuses anything it cannot
-    /// prove is empty, because the cost of being wrong here is a user's media.
+    /// The caller resolves the client-reported path to the owned folder
+    /// before it removes the job from the client, while the directory can
+    /// still be seen.
     /// </summary>
-    private async Task TryRemoveEmptyCompletedFolderAsync(string? folder, string title, SportarrDbContext? db)
+    private async Task TryRemoveCompletedFolderAsync(string? folder, string title, SportarrDbContext? db)
     {
         if (string.IsNullOrWhiteSpace(folder))
             return;
 
         try
         {
-            var rootFolders = db != null
-                ? await db.RootFolders.Select(r => r.Path).ToListAsync()
-                : new List<string>();
+            var rootFolders = new List<string>();
+            var clientFolders = new List<string>();
+            var categoryNames = new List<string>();
+            if (db != null)
+            {
+                rootFolders.AddRange(await db.RootFolders.Select(r => r.Path).ToListAsync());
+                foreach (var client in await db.DownloadClients
+                    .Select(c => new { c.Directory, c.BlackholeFolder, c.WatchFolder, c.Category, c.PostImportCategory })
+                    .ToListAsync())
+                {
+                    clientFolders.Add(client.Directory ?? "");
+                    clientFolders.Add(client.BlackholeFolder ?? "");
+                    clientFolders.Add(client.WatchFolder ?? "");
+                    categoryNames.Add(client.Category ?? "");
+                    categoryNames.Add(client.PostImportCategory ?? "");
+                    if (!string.IsNullOrWhiteSpace(client.Directory))
+                    {
+                        if (!string.IsNullOrWhiteSpace(client.Category))
+                            clientFolders.Add(Path.Combine(client.Directory, client.Category));
+                        if (!string.IsNullOrWhiteSpace(client.PostImportCategory))
+                            clientFolders.Add(Path.Combine(client.Directory, client.PostImportCategory));
+                    }
+                }
+            }
 
-            if (!LeftoverFolderPolicy.MayRemove(folder, rootFolders, out var full) || full == null)
+            if (!LeftoverFolderPolicy.IsSafeTarget(folder, rootFolders, clientFolders, categoryNames, out var full) || full == null)
             {
                 _logger.LogDebug("[Enhanced Download Monitor] Leaving the leftover folder alone for {Title}: {Folder}", title, folder);
                 return;
             }
 
-            // Recursive only clears empty subdirectories; the policy above
-            // proved there is nothing else left.
             Directory.Delete(full, recursive: true);
-            _logger.LogInformation("[Enhanced Download Monitor] Removed the empty folder left behind for {Title}: {Folder}", title, full);
+            _logger.LogInformation("[Enhanced Download Monitor] Removed the leftover download folder for {Title}: {Folder}", title, full);
         }
         catch (Exception ex)
         {
@@ -809,26 +863,56 @@ public class EnhancedDownloadMonitorService : BackgroundService
                     var statusForPath = await downloadClientService.GetDownloadStatusAsync(
                         download.DownloadClient, download.DownloadId, download.GrabCategory);
                     completedFolder = statusForPath?.SavePath;
+
+                    // The client reports its own view of the path. Behind a
+                    // remote path mapping the local view differs, and only a
+                    // local path can be resolved and removed.
+                    if (!string.IsNullOrWhiteSpace(completedFolder))
+                    {
+                        using var mapScope = _serviceProvider.CreateScope();
+                        var pathMapping = mapScope.ServiceProvider.GetRequiredService<IRemotePathMappingService>();
+                        completedFolder = await pathMapping.RemapRemoteToLocalAsync(
+                            download.DownloadClient.Host, completedFolder);
+                    }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "[Enhanced Download Monitor] Could not read the completed path for {Title}", download.Title);
                 }
 
+                // SABnzbd reports a single-file job as the file itself, which
+                // the move-mode import has already taken away. Resolve to the
+                // job folder that owns it now, while the directory still
+                // exists. The removal below can delete the directory, and a
+                // path that stopped existing reads as a vanished file, whose
+                // parent would then be judged in its place.
+                completedFolder = LeftoverFolderPolicy.ResolveOwnedFolder(completedFolder, download.Title);
+
                 try
                 {
-                    await downloadClientService.RemoveDownloadAsync(
+                    var removed = await downloadClientService.RemoveDownloadAsync(
                         download.DownloadClient,
                         download.DownloadId,
                         deleteFiles: true);
+
+                    if (!removed)
+                    {
+                        _logger.LogWarning("[Enhanced Download Monitor] Import succeeded, but {Client} did not confirm removal of {Title}; skipping remaining download folder cleanup",
+                            download.DownloadClient.Name, download.Title);
+                        return;
+                    }
 
                     // Info, not Debug: whether the download-dir folder was
                     // cleaned up is the question every "empty folders left
                     // behind" support thread turns on, and at Debug the
                     // default log couldn't answer it in either direction.
-                    _logger.LogInformation("[Enhanced Download Monitor] Removed completed download and its files from client: {Title}", download.Title);
+                    // SABnzbd only deletes files for FAILED history entries;
+                    // del_files on a completed job removes the history row
+                    // and nothing else. The folder tidy-up below is what
+                    // actually cleans the disk for usenet.
+                    _logger.LogInformation("[Enhanced Download Monitor] Removed completed download from client: {Title}", download.Title);
 
-                    await TryRemoveEmptyCompletedFolderAsync(completedFolder, download.Title, db);
+                    await TryRemoveCompletedFolderAsync(completedFolder, download.Title, db);
                 }
                 catch (Exception ex)
                 {
@@ -1389,6 +1473,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                     int? suggestedEventId = null;
                     int confidence = 0;
                     var imported = false;
+                    string? rejectedReason = null;
 
                     // Only completed downloads get engine analysis: a
                     // still-downloading torrent's folder holds partial
@@ -1429,10 +1514,18 @@ public class EnhancedDownloadMonitorService : BackgroundService
                                         {
                                             FilePath = best.FilePath,
                                             EventId = best.MatchedEventId,
-                                            Quality = best.Quality
+                                            Quality = best.Quality,
+                                            // Not grabbed by Sportarr: it replaces what the
+                                            // event holds only as an upgrade, else it waits
+                                            // in Pending Imports with the reason.
+                                            OnlyIfUpgrade = true
                                         }
                                     });
                                     imported = importResult.Imported.Count + importResult.Created.Count > 0;
+                                    if (!imported && importResult.Rejected.Count > 0)
+                                    {
+                                        rejectedReason = importResult.Rejected[0].Reason;
+                                    }
                                 }
                             }
                         }
@@ -1483,6 +1576,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                         SuggestedEventId = suggestedEventId,
                         SuggestionConfidence = confidence,
                         Detected = DateTime.UtcNow,
+                        ErrorMessage = rejectedReason,
                         Status = imported ? PendingImportStatus.Completed : PendingImportStatus.Pending
                     };
 

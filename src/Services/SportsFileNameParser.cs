@@ -188,8 +188,17 @@ public class SportsFileNameParser
         {
             Sport = "Baseball",
             Organization = "MLB",
-            Pattern = new Regex(@"MLB[\.\-\s]+(?<year>\d{4})[\.\-\s]+(?<month>\d{2})[\.\-\s]+(?<day>\d{2})[\.\-\s]+(?<team1>[A-Za-z]+(?:[\.\-\s]+[A-Za-z]+)?)[\.\-\s]+(?:vs?|@)[\.\-\s]+(?<team2>[A-Za-z]+(?:[\.\-\s]+[A-Za-z]+)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled, PatternTimeout),
-            TitleBuilder = (match) => $"MLB {match.Groups["year"].Value}-{match.Groups["month"].Value}-{match.Groups["day"].Value}: {match.Groups["team1"].Value.Replace(".", " ")} vs {match.Groups["team2"].Value.Replace(".", " ")}"
+            // A club name runs to three words (Boston Red Sox, Toronto Blue
+            // Jays). Capped at two, those names failed this pattern and the
+            // file fell to the generic parser, whose title carried the raw
+            // dotted name and matched nothing. The second club has no "vs"
+            // to end it, so it ends at one of the thirty club nicknames. A
+            // name outside that list grows a word at a time until a quality,
+            // source, broadcaster or event id token follows, the boundary
+            // the NBA and NHL patterns use, and takes up to three words when
+            // none is in reach.
+            Pattern = new Regex(@"MLB[\.\-\s]+(?<year>\d{4})[\.\-\s]+(?<month>\d{2})[\.\-\s]+(?<day>\d{2})[\.\-\s]+(?<team1>[A-Za-z]+(?:[\.\-\s]+(?!(?:vs?|@)\b)[A-Za-z]+){0,2})[\.\-\s]+(?:vs?|@)[\.\-\s]+(?:(?<team2>(?:[A-Za-z]+[\.\-\s]+){0,2}?(?:Angels|Astros|Athletics|Jays|Braves|Brewers|Cardinals|Cubs|Diamondbacks|Dbacks|Dodgers|Giants|Guardians|Mariners|Marlins|Mets|Nationals|Nats|Orioles|Padres|Phillies|Pirates|Rangers|Rays|Reds|Sox|Rockies|Royals|Tigers|Twins|Yankees))\b|(?<team2>(?:[A-Za-z]+[\.\-\s]*){1,3}?)(?=[\.\-\s]*(?:\d{3,4}p|WEB|HDTV|BluRay|ESPN|FOX|FS1|MASN|NESN|SNY|TSN|MLBTV|MLB|TV|PROPER|REPACK|iNTERNAL|ev-\d)|$)|(?<team2>(?:[A-Za-z]+[\.\-\s]*){1,3}))", RegexOptions.IgnoreCase | RegexOptions.Compiled, PatternTimeout),
+            TitleBuilder = (match) => $"MLB {match.Groups["year"].Value}-{match.Groups["month"].Value}-{match.Groups["day"].Value}: {CleanTeamName(match.Groups["team1"].Value)} vs {CleanTeamName(match.Groups["team2"].Value)}"
         },
 
         // Soccer/Football patterns
@@ -525,6 +534,14 @@ public class SportsFileNameParser
     //
     // Requiring separator consistency makes that match impossible, and the
     // DayFirstDatePattern fallback below then reads "05.08.2026" correctly.
+    /// <summary>
+    /// Whether a four-digit number can be the year of a sports release. Guards
+    /// against event names that carry a number of their own, such as the
+    /// Bathurst 1000 or the Daytona 500.
+    /// </summary>
+    private static bool IsPlausibleReleaseYear(int year) =>
+        year >= 1950 && year <= DateTime.UtcNow.Year + 2;
+
     private static readonly Regex DatePattern = new(@"(?<!\d)(?<year>\d{4})(?<sep>[\.\-\s]+)(?<month>\d{2})\k<sep>(?<day>\d{2})(?!\d)", RegexOptions.Compiled);
     // European day-first dating ("Spain vs Argentina 19.07.2026"). Only
     // consulted when the year-first pattern found nothing; the lookarounds
@@ -597,7 +614,7 @@ public class SportsFileNameParser
             OriginalFilename = filename ?? string.Empty
         };
 
-        // Sportarr id tokens ({sportarr-ev-2336155}, see docs/RELEASE_NAMING.md)
+        // Sportarr id tokens (sportarr-ev-2336155, see docs/RELEASE_NAMING.md)
         // are the authoritative match signal when present. Extract them first,
         // then strip them so the token digits can never confuse the date,
         // year, or round extraction below.
@@ -658,13 +675,24 @@ public class SportsFileNameParser
             }
         }
 
-        // Extract date from filename
-        var dateMatch = DatePattern.Match(cleanName);
-        if (dateMatch.Success)
+        // Extract date from filename. Every candidate is tried, not just the
+        // first: an event or club name can hold a four-digit number of its own
+        // ("Bathurst 1000 12 10", "CSKA 1948"), and the real date often sits
+        // further along the name. The first candidate that reads as a real
+        // date wins.
+        foreach (Match dateMatch in DatePattern.Matches(cleanName))
         {
             if (int.TryParse(dateMatch.Groups["year"].Value, out var year) &&
                 int.TryParse(dateMatch.Groups["month"].Value, out var month) &&
-                int.TryParse(dateMatch.Groups["day"].Value, out var day))
+                int.TryParse(dateMatch.Groups["day"].Value, out var day) &&
+                // An event name can hold a four-digit number that is not a year.
+                // "Supercars 2024 Race 20 Bathurst 1000 13 10" read 1000 as the
+                // year, failed on month 13, retried swapped as 1000-10-13, and
+                // hard-rejected every Bathurst release as 374,009 days out. A
+                // number that cannot be a year leaves the date to the patterns
+                // below, which read the trailing pair and take the year from
+                // elsewhere in the name.
+                IsPlausibleReleaseYear(year))
             {
                 try
                 {
@@ -704,8 +732,11 @@ public class SportsFileNameParser
                     }
                 }
             }
+
+            if (result.EventDate != null) break;
         }
-        else
+
+        if (result.EventDate == null)
         {
             // Try season span extraction first (e.g., "2025-2026" or "2025-26").
             // Span detection MUST run before the day-first date attempt: a
@@ -1083,7 +1114,7 @@ public class SportsParseResult
     public string? Session { get; set; }
     /// <summary>
     /// Canonical event id ("ev-2336155") extracted from a release naming
-    /// standard token ({sportarr-ev-2336155}). Authoritative when present -
+    /// standard token (sportarr-ev-2336155). Authoritative when present -
     /// matchers compare it against Event.ExternalId and skip fuzzy logic.
     /// </summary>
     public string? SportarrEventId { get; set; }

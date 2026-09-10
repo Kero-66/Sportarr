@@ -39,6 +39,77 @@ Sportarr includes experimental support for recording live sports events directly
 !!! tip "Keeping a league off DVR"
     Each league has an **Automatic DVR scheduling** toggle, available as an **Enable IPTV DVR** checkbox when adding the league and as its own toggle on the league detail page (DVR section) afterward. Turn it off to keep a league on indexer downloads only; the auto-scheduler will never resolve a channel or schedule recordings for it, including through EPG/broadcaster matching with no channel manually mapped, while manual recordings still work. This is what lets you run, say, Formula 1 through indexers only while recording football over IPTV.
 
+## Live event timing
+
+**Settings > DVR Recordings** has two controls for event-linked live captures.
+They use fresh source livescores for the exact event and league. They do not
+infer a final result from EPG times, a missing scoreboard, or a disconnected stream.
+
+- **Overtime Guard** extends a recording in ten-minute steps when the scheduled
+  end plus padding arrives and the source still reports play in progress.
+- **Early Finish Guard** is off by default. When enabled, it stops a recording
+  before its scheduled end only after two separate source fetches confirm a
+  final result at least one minute apart.
+- **Post-Event Buffer (Minutes)** keeps recording after the first final
+  observation. The default is five minutes, with a range of zero through 60.
+  Zero still requires the second fresh confirmation. This buffer replaces the
+  remaining scheduled padding only when the early-finish check succeeds.
+
+Repeated reads of the same cached snapshot do not count as another confirmation.
+Source observations older than two minutes, missing observations, conflicting
+status fields, and results for another event or league cannot stop a recording
+early. New live or inconclusive evidence resets the confirmation period.
+Restarting Sportarr also starts confirmation again.
+
+If the source does not cover an event, Sportarr keeps the normal schedule and
+padding. Scheduled stops still respect Overtime Guard when fresh in-progress
+evidence is available. Unlinked manual recordings and catchup downloads are
+excluded from Early Finish Guard. A confirmed early finish uses the normal
+finalization and import process.
+
+Live status requires the metadata API's league livescore support. Older or custom
+API servers that return no source observations leave the normal schedule in place.
+The source's retrieval timestamp records when data was fetched; it cannot
+guarantee that the provider's result is correct or that an IPTV stream has no delay.
+Choose a buffer that allows for your stream's delay and desired postgame coverage.
+
+Channel selection still uses your preferences, EPG matches, broadcaster names,
+and league mappings. Live scores establish event progress, not what is visible
+on the selected channel.
+
+Event TV listings supply all known broadcasters for an event. Sportarr combines
+their network, channel, and streaming-service names when matching your IPTV
+lineup. Duplicate names are removed. An empty or unavailable event lookup keeps
+the existing broadcast information. A successful event lookup takes precedence
+over the broader daily listings during that sync.
+
+TheSportsDB channel IDs identify broadcasters in its catalog. They are not the
+channel numbers or stream IDs assigned by your IPTV provider. Your channel
+preferences and EPG matches still apply, and a broadcast listing cannot confirm
+what is currently playing on a stream.
+
+**Auto Map** and **Sync Now** also use these event broadcasters when suggesting
+channels for a league. The mapper checks events from the previous seven days
+through the next fourteen days. A matching broadcaster can create a suggestion
+without a known network association or EPG match. Repeated events strengthen
+the evidence, while duplicate listings for one event count only once.
+
+Matching uses channel names and guide names, with common region prefixes and
+quality labels removed. Channel numbers and `+` remain significant, so a
+listing for one numbered or premium channel does not identify another. Manual
+mappings and exclusions remain in place. The mapping explanation identifies
+the event-broadcast evidence. Run Auto Map or Sync Now after the TV schedule
+sync to refresh these suggestions; broadcaster data does not trigger a separate
+remapping job or prove what is currently on the channel.
+
+## Stream reconnection
+
+The **Stream Reconnection** section of **Settings > DVR Recordings** controls how a recording rides out a dropped or slow stream.
+
+- **Enable auto-reconnect** tells ffmpeg to retry when the stream drops. Retrying a failure during connection setup needs an ffmpeg build of 4.4 or newer. Older builds still retry once the stream has started.
+- **Max Retry Wait** (5 to 300 seconds) caps the wait between retries. Waits grow from one second up to this cap, and retries stop once the next wait would pass it. Raise it for sources that refuse a cold stream for the first few seconds.
+- **Read Timeout** (0 to 120 seconds) bounds how long ffmpeg waits for stream data, to catch a dead source faster than the recording watchdog's two minutes. 0 sets no limit and is the default. If your sources start cold streams slowly, keep it at 0 or above the slowest start you see, or the recording aborts during that wait.
+
 ## TV Guide
 
 The TV Guide provides an EPG-style grid of your IPTV channels and their programming:
@@ -101,7 +172,7 @@ Sportarr implements the three endpoints the HDHomeRun HTTP API requires (`/disco
 ## Known limitations
 
 - Recording quality depends entirely on your IPTV source
-- Stream reconnection may not work reliably with all providers
+- Stream reconnection depends on the provider and on your ffmpeg build (see Stream reconnection above)
 - Limited error handling for stream failures
 - No hardware acceleration support yet
 - File size estimation is approximate

@@ -1,6 +1,6 @@
 # Decypharr
 
-Debrid download client bridging Real-Debrid, Torbox, and similar services into a qBittorrent-compatible API. Sportarr supports it for torrents, and experimentally for usenet through the separate **DecypharrUsenet** entry (requires the Decypharr usenet branch).
+Debrid download client bridging Real-Debrid, Torbox, and similar services into a qBittorrent-compatible API. Sportarr supports it for torrents, and experimentally for usenet through the separate **DecypharrUsenet** entry. Decypharr 2.5 includes the required usenet API.
 
 | | |
 |---|---|
@@ -16,3 +16,7 @@ Debrid download client bridging Real-Debrid, Torbox, and similar services into a
 4. **Test**, then **Save**
 
 Post-import modes, per-indexer client pinning, and remote path mappings are shared across all clients and documented under [Download Clients](../features/download-clients.md).
+
+## Usenet download removal
+
+Decypharr removes downloaded files along with a download entry, even when asked to keep them. Sportarr therefore refuses **DecypharrUsenet** removal requests that must keep files. It leaves the download and files in place and logs a warning. Removal with file deletion enabled remains supported.

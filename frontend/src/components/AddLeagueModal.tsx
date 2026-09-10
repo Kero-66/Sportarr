@@ -1,19 +1,15 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from 'react';
 import { toast } from 'sonner';
 import { Dialog, Transition } from '@headlessui/react';
-import { MagnifyingGlassIcon, XMarkIcon, CheckIcon, InformationCircleIcon } from '@heroicons/react/24/outline';
+import { MagnifyingGlassIcon, XMarkIcon, CheckIcon, InformationCircleIcon, ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiDelete, apiGet, apiPost } from '../utils/api';
 import { BUTTON_PRIMARY, BUTTON_SECONDARY } from '../utils/designTokens';
+import { PortalTooltip } from './PortalTooltip';
 import {
   isFightingSport,
   isMotorsport,
-  isGolf,
-  isDarts,
-  isClimbing,
-  isGambling,
-  isIndividualRacketOrCueSport,
-  isIndividualTennis,
+  isTeamlessSport,
   usesFightingEventTypes,
   getPartOptions,
 } from '../utils/leagueSportRules';
@@ -31,6 +27,7 @@ interface League {
   idLeague: string;
   strLeague: string;
   strSport: string;
+  strSportFormat?: string | null;
   strCountry?: string;
   strLeagueAlternate?: string;
   strDescriptionEN?: string;
@@ -170,7 +167,7 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
       if (!response.ok) throw new Error('Failed to fetch teams');
       return response.json();
     },
-    enabled: isOpen && !!league && !isMotorsport(league.strSport) && !isGolf(league.strSport) && !isDarts(league.strSport) && !isClimbing(league.strSport) && !isGambling(league.strSport) && !isIndividualRacketOrCueSport(league.strSport) && !isIndividualTennis(league.strSport, league.strLeague),
+    enabled: isOpen && !!league && !isTeamlessSport(league.strSport, league.strLeague, league.strSportFormat),
     staleTime: 5 * 60 * 1000,
   });
 
@@ -880,7 +877,7 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
   const selectedEventTypesCount = monitoredEventTypes.size;
   // Show team selection for leagues with meaningful team data
   // Skip for: Motorsport (no home/away teams), Darts (individual players), Climbing (individual climbers), Gambling (individual poker players), Badminton/Table Tennis/Snooker (individual racket/cue players), individual Tennis (ATP, WTA), and UFC-style fighting leagues (use event types instead)
-  const showTeamSelection = league ? !isMotorsport(league.strSport) && !isGolf(league.strSport) && !isDarts(league.strSport) && !isClimbing(league.strSport) && !isGambling(league.strSport) && !isIndividualRacketOrCueSport(league.strSport) && !isIndividualTennis(league.strSport, league.strLeague) && !usesFightingEventTypes(league.strSport, league.strLeague) : false;
+  const showTeamSelection = league ? !isTeamlessSport(league.strSport, league.strLeague, league.strSportFormat) && !usesFightingEventTypes(league.strSport, league.strLeague) : false;
   // Only fighting sports use multi-part episodes
   const showPartsSelection = config?.enableMultiPartEpisodes && league && isFightingSport(league.strSport);
   // Show session type selection for motorsports
@@ -1142,18 +1139,30 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
                               </select>
                             </div>
                           )}
-                          <label className="flex items-start gap-3 p-3 rounded-lg bg-gray-800 hover:bg-gray-750 cursor-pointer">
+                          <label className="flex items-center gap-3 p-3 rounded-lg bg-gray-800 hover:bg-gray-750 cursor-pointer">
                             <input
                               type="checkbox"
                               checked={keepAllEvents}
                               onChange={(e) => setKeepAllEvents(e.target.checked)}
                               className="w-5 h-5 bg-black border-2 border-gray-600 rounded text-red-600 focus:ring-red-600 focus:ring-offset-0 focus:ring-2"
                             />
-                            <div>
-                              <div className="text-sm font-medium text-white">Keep every game in the library</div>
-                              <div className="text-xs text-gray-400">
-                                Games without one of your teams are normally not stored at all. Keep them, unmonitored, so you can find a one-off game and monitor it yourself. Uses more disk.
-                              </div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-sm font-medium text-white">Show all events</span>
+                              <PortalTooltip
+                                className="w-72 p-2 text-left"
+                                content={
+                                  <>
+                                    <p className="text-gray-300 text-[11px]">
+                                      Only events for the teams and session types you follow are shown.
+                                    </p>
+                                    <p className="text-gray-400 text-[11px] mt-1">
+                                      Turn this on to show every event the league has. They arrive unmonitored, and the extra events use more disk.
+                                    </p>
+                                  </>
+                                }
+                              >
+                                <ExclamationTriangleIcon className="w-4 h-4 text-yellow-400 cursor-help" />
+                              </PortalTooltip>
                             </div>
                           </label>
                           {/* Turning the setting off stops new games being

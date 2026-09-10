@@ -57,12 +57,15 @@ interface DvrSettings {
   postRecordingCommand: string;
   overtimeGuardEnabled: boolean;
   overtimeMaxExtensionMinutes: number;
+  earlyFinishGuardEnabled: boolean;
+  earlyFinishBufferMinutes: number;
   reresolveChannelsEnabled: boolean;
   reresolveLockMinutes: number;
   reresolveMinImprovement: number;
   enableReconnect: boolean;
   maxReconnectAttempts: number;
   reconnectDelaySeconds: number;
+  readTimeoutSeconds: number;
   // Catchup: download finished events from the provider's timeshift
   // archive (channels with tv_archive) instead of recording live.
   useCatchupWhenAvailable: boolean;
@@ -171,12 +174,15 @@ const defaultDvrSettings: DvrSettings = {
   postRecordingCommand: '',
   overtimeGuardEnabled: true,
   overtimeMaxExtensionMinutes: 120,
+  earlyFinishGuardEnabled: false,
+  earlyFinishBufferMinutes: 5,
   reresolveChannelsEnabled: true,
   reresolveLockMinutes: 45,
   reresolveMinImprovement: 10,
   enableReconnect: true,
   maxReconnectAttempts: 5,
   reconnectDelaySeconds: 5,
+  readTimeoutSeconds: 0,
   // Catchup
   useCatchupWhenAvailable: true,
   catchupReadyGraceMinutes: 15,
@@ -451,7 +457,27 @@ export default function DvrSettingsPage() {
     try {
       setIsSavingSettings(true);
       await apiClient.put('/dvr/settings', payload);
-      setOriginalSettings(payload);
+      // Keep saved values consistent with the recorder.
+      const clamped = {
+        ...payload,
+        reconnectDelaySeconds: Math.min(300, Math.max(5, payload.reconnectDelaySeconds)),
+        readTimeoutSeconds: Math.min(120, Math.max(0, payload.readTimeoutSeconds)),
+        earlyFinishBufferMinutes: Math.min(60, Math.max(0, payload.earlyFinishBufferMinutes)),
+      };
+      setOriginalSettings(clamped);
+      // Preserve edits made during the save request.
+      setDvrSettings((current) => ({
+        ...current,
+        reconnectDelaySeconds: current.reconnectDelaySeconds === payload.reconnectDelaySeconds
+          ? clamped.reconnectDelaySeconds
+          : current.reconnectDelaySeconds,
+        readTimeoutSeconds: current.readTimeoutSeconds === payload.readTimeoutSeconds
+          ? clamped.readTimeoutSeconds
+          : current.readTimeoutSeconds,
+        earlyFinishBufferMinutes: current.earlyFinishBufferMinutes === payload.earlyFinishBufferMinutes
+          ? clamped.earlyFinishBufferMinutes
+          : current.earlyFinishBufferMinutes,
+      }));
       toast.success('DVR Settings Saved', { description: 'Your DVR settings have been saved' });
 
       // Where recordings land is derived from the path that was just saved.
@@ -947,6 +973,49 @@ export default function DvrSettingsPage() {
                     <label className="flex items-start space-x-3 cursor-pointer">
                       <input
                         type="checkbox"
+                        checked={dvrSettings.earlyFinishGuardEnabled}
+                        onChange={(e) => handleSettingsChange('earlyFinishGuardEnabled', e.target.checked)}
+                        className="mt-1 w-5 h-5 rounded border-gray-700 bg-gray-800 text-red-600 focus:ring-red-600"
+                      />
+                      <div>
+                        <span className="text-white font-medium">Early Finish Guard</span>
+                        <p className="text-sm text-gray-400 mt-1">
+                          Stop event-linked LIVE recordings early when fresh event status confirms a final result twice,
+                          at least one minute apart. Missing or inconclusive data keeps the normal schedule.
+                          Event status does not confirm what the channel is showing.
+                        </p>
+                      </div>
+                    </label>
+                  </div>
+                  {dvrSettings.earlyFinishGuardEnabled && (
+                    <div>
+                      <label htmlFor="early-finish-buffer" className="block text-sm font-medium text-gray-300 mb-2">
+                        Post-Event Buffer (Minutes)
+                      </label>
+                      <input
+                        id="early-finish-buffer"
+                        type="number"
+                        inputMode="numeric"
+                        min={0}
+                        max={60}
+                        step={1}
+                        value={dvrSettings.earlyFinishBufferMinutes}
+                        onChange={(e) => {
+                          const value = e.target.valueAsNumber;
+                          handleSettingsChange('earlyFinishBufferMinutes', Number.isNaN(value) ? 0 : Math.min(60, Math.max(0, Math.trunc(value))));
+                        }}
+                        aria-describedby="early-finish-buffer-help"
+                        className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-white focus:border-red-600 focus:outline-none focus:ring-1 focus:ring-red-500"
+                      />
+                      <p id="early-finish-buffer-help" className="text-xs text-gray-500 mt-1">
+                        Time to keep recording after the first final confirmation. Zero still requires a second fresh confirmation.
+                      </p>
+                    </div>
+                  )}
+                  <div className="md:col-span-2">
+                    <label className="flex items-start space-x-3 cursor-pointer">
+                      <input
+                        type="checkbox"
                         checked={dvrSettings.reresolveChannelsEnabled}
                         onChange={(e) => handleSettingsChange('reresolveChannelsEnabled', e.target.checked)}
                         className="mt-1 w-5 h-5 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
@@ -1299,7 +1368,7 @@ export default function DvrSettingsPage() {
               {/* Reconnection Settings */}
               <div className="mb-6">
                 <h4 className="text-lg font-semibold text-white mb-4">Stream Reconnection</h4>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   <div className="flex items-center">
                     <label className="flex items-center cursor-pointer">
                       <input
@@ -1324,16 +1393,38 @@ export default function DvrSettingsPage() {
                     />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Reconnect Delay (seconds)</label>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Max Retry Wait (seconds)</label>
                     <input
                       type="number"
                       value={dvrSettings.reconnectDelaySeconds}
-                      onChange={(e) => handleSettingsChange('reconnectDelaySeconds', parseInt(e.target.value) || 1)}
-                      min="1"
-                      max="60"
+                      onChange={(e) => handleSettingsChange('reconnectDelaySeconds', parseInt(e.target.value) || 5)}
+                      min="5"
+                      max="300"
                       disabled={!dvrSettings.enableReconnect}
                       className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600 disabled:opacity-50"
                     />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Caps the wait between retries after a stream drops. Waits grow
+                      from one second up to this cap, and retries stop once the next
+                      wait would pass it.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Read Timeout (seconds)</label>
+                    <input
+                      type="number"
+                      value={dvrSettings.readTimeoutSeconds}
+                      onChange={(e) => handleSettingsChange('readTimeoutSeconds', parseInt(e.target.value) || 0)}
+                      min="0"
+                      max="120"
+                      className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Bounds how long ffmpeg waits for stream data, to catch a dead
+                      source faster than the recording watchdog's two minutes. 0 sets
+                      no limit. If your sources start cold streams slowly, keep this
+                      at 0 or above the slowest start you see.
+                    </p>
                   </div>
                 </div>
               </div>

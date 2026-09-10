@@ -27,6 +27,10 @@ Go to **Settings > Media Management** and add a root folder. This is where Sport
 
 Use the search to find leagues or events. Add them to your library and Sportarr starts monitoring.
 
+Sportarr uses the league's competition format from the API to decide whether to show team selection. Team competitions let you choose which teams to follow. Individual event leagues, such as Diamond League athletics, use your event monitoring settings without a team filter, even when the source lists countries or federations as teams.
+
+If an existing individual league is missing events because of saved team selections, use **More > Sync > Deep Sync** on its league page after updating. This refreshes its competition format and imports the missing historical events.
+
 ![Search for Leagues](../images/search-league.png)
 
 ![Team Selection](../images/search-league-teams.png)

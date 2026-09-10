@@ -323,6 +323,15 @@ public class AutomaticSearchService : IAutomaticSearchService
             // event reuses the other's merged releases.
             var cacheKey = SearchResultCache.ScopeKey(string.Join("\u001f", queries), evt.League?.Tags);
 
+            // Only one caller fills a given key. A fighting event searches
+            // once per part and the part is not in the query, so all of its
+            // parts asked for the same thing at the same moment, all missed,
+            // and each ran the whole search against every indexer. The parts
+            // behind the first one now find the answer waiting.
+            using var fillSlot = string.IsNullOrEmpty(primaryQuery)
+                ? null
+                : await _searchResultCache.EnterFillAsync(cacheKey);
+
             if (!string.IsNullOrEmpty(primaryQuery))
             {
                 var cachedResults = _searchResultCache.TryGetCached(cacheKey, config.SearchCacheDuration);
@@ -350,7 +359,10 @@ public class AutomaticSearchService : IAutomaticSearchService
             // Supplementary queries (Skip(1)) target alternative naming conventions (e.g. BILLIE-style
             // F1 location releases) that the primary query may not reach. They must run even when the
             // primary query hit the cache or returned enough results.
-            var queriesToRun = usedCache ? queries.Skip(1).ToList() : queries.ToList();
+            // What is stored is the merge of every query, so a hit already
+            // holds the supplementary results. Re-running them sent the same
+            // queries back to the indexers on every cache hit.
+            var queriesToRun = usedCache ? new List<string>() : queries.ToList();
 
             if (queriesToRun.Any())
             {
@@ -412,6 +424,13 @@ public class AutomaticSearchService : IAutomaticSearchService
                         allReleases.Count, primaryQuery);
                 }
             }
+
+            // The gate only has to cover the fetch and the store. Held past
+            // this point it would also serialise scoring, selection and the
+            // download client call, so a slow grab on one part would stall
+            // the parts waiting behind it for no reason. Disposing twice is
+            // safe, so the using declaration stays as the failure backstop.
+            fillSlot?.Dispose();
 
             if (!allReleases.Any())
             {
@@ -671,11 +690,32 @@ public class AutomaticSearchService : IAutomaticSearchService
             var validatedReleases = new List<ReleaseSearchResult>();
             var dateRejectionCount = 0;
 
+            // A release that counts races inside its round ("Round09 ... Race 3")
+            // means nothing without the races that round holds. The library
+            // knows them, so read them once for this event and let the matcher
+            // resolve the number.
+            List<int>? roundRaceNumbers = null;
+            if (!string.IsNullOrEmpty(evt.Round) && EventPartDetector.IsMotorsport(evt.Sport ?? ""))
+            {
+                roundRaceNumbers = await _db.Events
+                    .AsNoTracking()
+                    .Where(e => e.LeagueId == evt.LeagueId && e.Season == evt.Season && e.Round == evt.Round)
+                    .Select(e => e.Title)
+                    .ToListAsync()
+                    .ContinueWith(t => t.Result
+                        .Select(ReleaseMatchingService.RaceNumberInTitle)
+                        .Where(n => n.HasValue)
+                        .Select(n => n!.Value)
+                        .Distinct()
+                        .OrderBy(n => n)
+                        .ToList());
+            }
+
             foreach (var release in approvedReleases)
             {
                 var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(release, earlyReleaseLimits);
                 var matchResult = _releaseMatchingService.ValidateRelease(release, evt, part, config.EnableMultiPartEpisodes,
-                    earlyReleaseLimitDays: earlyLimit);
+                    earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers);
 
                 if (matchResult.IsHardRejection)
                 {
@@ -1102,6 +1142,7 @@ public class AutomaticSearchService : IAutomaticSearchService
 
                     // If quality cutoff not met, allow quality upgrades
                     // If quality cutoff met but format cutoff not met, only allow format upgrades
+                    var propersSetting = (await _configService.GetConfigAsync()).DownloadPropersAndRepacks;
                     bool shouldUpgrade;
                     string upgradeReason;
 
@@ -1115,13 +1156,13 @@ public class AutomaticSearchService : IAutomaticSearchService
                         shouldUpgrade = true;
                         upgradeReason = $"format score upgrade ({existingFormatScore} -> {newReleaseFormatScore})";
                     }
-                    else if (!qualityCutoffMet && !isQualityUpgrade && isFormatUpgrade)
+                    else if (!qualityCutoffMet && newReleaseQualityScore == existingQualityScore && isFormatUpgrade)
                     {
                         // Same quality but better format score
                         shouldUpgrade = true;
                         upgradeReason = $"format score upgrade at same quality ({existingFormatScore} -> {newReleaseFormatScore})";
                     }
-                    else if ((await _configService.GetConfigAsync()).DownloadPropersAndRepacks == "preferAndUpgrade" &&
+                    else if (propersSetting == "preferAndUpgrade" &&
                              newReleaseQualityScore == existingQualityScore &&
                              newReleaseFormatScore == existingFormatScore &&
                              Helpers.ReleaseRevision.Parse(bestRelease.Title) >
@@ -1138,25 +1179,24 @@ public class AutomaticSearchService : IAutomaticSearchService
                         upgradeReason = "not better than existing";
                     }
 
-                    // NET-UPGRADE GUARD (automatic grabs only): the import step compares the
-                    // TOTAL score (quality + custom format) and refuses anything that is not
-                    // strictly higher than the existing file (FileImportService), and RSS sync
-                    // already does the same. The quality-only isQualityUpgrade check above can
-                    // approve a higher-resolution release whose total still sits below an
-                    // existing file boosted by a custom format (e.g. a +2000 release group),
-                    // so Sportarr would grab and download it only for the importer to throw it
-                    // away as "not an upgrade." Mirror the import's total-score rule here so we
-                    // never waste a download. Manual searches keep the user's explicit choice.
-                    if (shouldUpgrade && !isManualSearch &&
-                        upgradeReason != "proper/repack revision of the same quality")
+                    // QUALITY-FIRST GUARD (automatic grabs only): the import judges
+                    // quality first (ImportUpgradeRule), so a lower quality never
+                    // replaces the existing file whatever its custom format score,
+                    // and a higher quality always may. A grab the importer would
+                    // refuse is a wasted download. Manual searches keep the user's
+                    // explicit choice.
+                    if (shouldUpgrade && !isManualSearch && newReleaseQualityScore < existingQualityScore)
                     {
-                        var existingTotalScore = existingQualityScore + existingFormatScore;
-                        var newReleaseTotalScore = newReleaseQualityScore + newReleaseFormatScore;
-                        if (newReleaseTotalScore <= existingTotalScore)
-                        {
-                            shouldUpgrade = false;
-                            upgradeReason = $"not a net upgrade (existing total {existingTotalScore} >= new total {newReleaseTotalScore})";
-                        }
+                        shouldUpgrade = false;
+                        upgradeReason = $"lower quality than the existing file ({existingQualityScore} > {newReleaseQualityScore})";
+                    }
+                    else if (shouldUpgrade && !isManualSearch && newReleaseQualityScore == existingQualityScore
+                             && propersSetting != "doNotPrefer"
+                             && Helpers.ReleaseRevision.Parse(bestRelease.Title) < Helpers.ReleaseRevision.Parse(relevantFile.OriginalTitle ?? relevantFile.Quality))
+                    {
+                        // An older revision of the same quality: the importer refuses it.
+                        shouldUpgrade = false;
+                        upgradeReason = "an older revision of the existing file";
                     }
 
                     if (!shouldUpgrade)

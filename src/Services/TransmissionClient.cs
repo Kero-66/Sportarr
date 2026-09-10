@@ -285,7 +285,7 @@ public class TransmissionClient
                 fields = new[] { "id", "hashString", "name", "totalSize", "percentDone",
                                 "downloadedEver", "uploadedEver", "status", "eta",
                                 "rateDownload", "rateUpload", "downloadDir", "addedDate",
-                                "doneDate" }
+                                "doneDate", "error", "errorString" }
             };
 
             var response = await SendRpcRequestAsync(config, "torrent-get", arguments);
@@ -324,7 +324,7 @@ public class TransmissionClient
                 fields = new[] { "id", "hashString", "name", "totalSize", "percentDone",
                                 "downloadedEver", "uploadedEver", "status", "eta",
                                 "rateDownload", "rateUpload", "downloadDir", "addedDate",
-                                "doneDate" }
+                                "doneDate", "error", "errorString" }
             };
 
             var requestJson = JsonSerializer.Serialize(new { method = "torrent-get", arguments });
@@ -519,8 +519,18 @@ public class TransmissionClient
             // in the queue for ever and was never imported. Completion is
             // decided on the data being there first, and the state only
             // describes what the client is doing with it afterwards.
+            // tr_stat_errtype 3 is a local error, which Transmission documents as
+            // "local trouble, such as disk full or permissions error". Only that
+            // value is a real failure. Values 1 and 2 are tracker warnings and
+            // tracker errors, which are often short-lived, so failing on them
+            // would blocklist a good release. A finished torrent keeps its
+            // completed state, because the data is already on disk.
+            var hasLocalError = torrent.Error == 3;
+
             var status = torrent.PercentDone >= 1.0
                 ? "completed"
+                : hasLocalError
+                ? "failed"
                 : torrent.Status switch
                 {
                     0 => "paused",  // stopped
@@ -555,6 +565,9 @@ public class TransmissionClient
                     : 0,
                 CompletedAt = torrent.DoneDate > 0
                     ? DateTimeOffset.FromUnixTimeSeconds(torrent.DoneDate).UtcDateTime
+                    : null,
+                ErrorMessage = hasLocalError && !string.IsNullOrWhiteSpace(torrent.ErrorString)
+                    ? torrent.ErrorString
                     : null
             };
         }
@@ -748,4 +761,6 @@ public class TransmissionTorrent
     public string DownloadDir { get; set; } = "";
     public long AddedDate { get; set; } // Unix timestamp
     public long DoneDate { get; set; } // Unix timestamp
+    public int Error { get; set; } // tr_stat_errtype: 0 ok, 1 tracker warning, 2 tracker error, 3 local error
+    public string ErrorString { get; set; } = "";
 }

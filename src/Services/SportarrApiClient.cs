@@ -322,10 +322,21 @@ public class SportarrApiClient
     {
         if (evt == null) return;
         if (evt.BroadcastDate.HasValue) return;
+        // Both tiers are approximations: legacy dateEvent is a UTC
+        // calendar date, and the UTC instant obviously is. The flag keeps
+        // the matchers from treating either as the authoritative
+        // broadcast-local date, so display and query building keep their
+        // fallback while the exact-day matching rule stays disarmed.
         if (evt.DateEventFallback != DateTime.MinValue)
+        {
             evt.BroadcastDate = evt.DateEventFallback.Date;
+            evt.BroadcastDateIsFallback = true;
+        }
         else if (evt.EventDate != DateTime.MinValue)
+        {
             evt.BroadcastDate = evt.EventDate.Date;
+            evt.BroadcastDateIsFallback = true;
+        }
     }
 
     /// <summary>
@@ -721,6 +732,7 @@ public class SportarrApiClient
                     if (!evt.BroadcastDate.HasValue && evt.DateEventFallback != DateTime.MinValue)
                     {
                         evt.BroadcastDate = evt.DateEventFallback.Date;
+                        evt.BroadcastDateIsFallback = true;
                     }
                 }
             }
@@ -743,7 +755,7 @@ public class SportarrApiClient
     /// CRITICAL: Used to determine when to trigger automatic searches
     /// Uses Sportarr API's ACTUAL endpoint: /lookup/event_tv/{eventId}
     /// </summary>
-    public async Task<TVSchedule?> GetEventTVScheduleAsync(string eventId)
+    public async Task<List<TVSchedule>?> GetEventTVScheduleAsync(string eventId)
     {
         try
         {
@@ -761,7 +773,12 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiTVScheduleResponse>(json, _jsonOptions);
-            return result?.Data?.TVSchedule?.FirstOrDefault();
+            return result?.Data?.TVSchedule?
+                .Where(schedule => schedule != null &&
+                    (string.Equals(schedule.EventId, eventId, StringComparison.Ordinal) ||
+                     (eventId.Length > 0 && eventId.All(char.IsAsciiDigit) &&
+                      string.Equals(schedule.TsdbEventId, eventId, StringComparison.Ordinal))))
+                .ToList();
         }
         catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
         {
@@ -891,6 +908,45 @@ public class SportarrApiClient
         catch (Exception ex)
         {
             _logger.LogError(ex, "[SportarrAPI] Failed to get livescores for league: {LeagueId}", leagueId);
+            return null;
+        }
+    }
+
+    public string DvrLiveSourceOrigin => _apiBaseUrl;
+
+    public async Task<List<DvrLiveScore>?> GetDvrLivescoreByLeagueAsync(
+        string leagueId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var origin = _apiBaseUrl;
+        var url = $"{origin}/livescore/league/{Uri.EscapeDataString(leagueId)}";
+        var cacheKey = $"dvr-livescore:{url}";
+        if (_cache.TryGetValue(cacheKey, out List<DvrLiveScore>? cached))
+            return cached;
+
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            using var response = await _httpClient.GetAsync(url, timeout.Token);
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync(timeout.Token);
+            if (_apiBaseUrl != origin)
+                return null;
+            var scores = JsonSerializer.Deserialize<SportarrApiResponse<DvrLiveScore>>(json, _jsonOptions)?.Data
+                ?.Select(score => score with { RequestOrigin = origin }).ToList();
+            if (scores != null)
+                _cache.Set(cacheKey, scores, TimeSpan.FromSeconds(30));
+            return scores;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[DVR] Live event status is unavailable for league {LeagueId}", leagueId);
+            _cache.Set<List<DvrLiveScore>?>(cacheKey, null, TimeSpan.FromSeconds(10));
             return null;
         }
     }
@@ -1555,10 +1611,12 @@ public class ScheduleData
 public class TVSchedule
 {
     public string? EventId { get; set; }
+    public string? TsdbEventId { get; set; }
     public string? EventName { get; set; }
     public DateTime? BroadcastTime { get; set; }
     public string? Network { get; set; }
     public string? Channel { get; set; }
+    public string? ChannelId { get; set; }
     public string? StreamingService { get; set; }
     public string? Country { get; set; }
 }

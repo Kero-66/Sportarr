@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 
@@ -20,6 +22,16 @@ namespace Sportarr.Api.Services;
 public class EventPartDetector
 {
     private readonly ILogger<EventPartDetector> _logger;
+
+    private static readonly ConcurrentDictionary<(string Pattern, RegexOptions Options, string Culture), Regex>
+        MotorsportRegexCache = new();
+
+    private static bool IsMotorsportMatch(string input, string pattern, RegexOptions options = RegexOptions.None)
+    {
+        var key = (pattern, options, CultureInfo.CurrentCulture.Name);
+        return MotorsportRegexCache.GetOrAdd(key,
+            static entry => new Regex(entry.Pattern, entry.Options)).IsMatch(input);
+    }
 
     /// <summary>
     /// UFC event types with different part structures
@@ -1172,7 +1184,7 @@ public class EventPartDetector
         {
             foreach (var pattern in session.Patterns)
             {
-                if (Regex.IsMatch(cleanTitle, pattern, RegexOptions.IgnoreCase))
+                if (IsMotorsportMatch(cleanTitle, pattern, RegexOptions.IgnoreCase))
                 {
                     return session.Name;
                 }
@@ -1258,7 +1270,7 @@ public class EventPartDetector
         // Exclude bonus/recap content and partial-day splits from session detection
         // e.g., "Ted's Sprint Race Notebook" contains "Sprint" but is NOT a Sprint session
         // e.g., "Test Two Day Two Morning" is a partial file — prefer full-day releases
-        if (Regex.IsMatch(cleanFilename, @"\b(notebook|ted'?s|highlights|review|analysis|preview|magazine|morning|afternoon)\b", RegexOptions.IgnoreCase))
+        if (IsMotorsportMatch(cleanFilename, @"\b(notebook|ted'?s|highlights|review|analysis|preview|magazine|morning|afternoon)\b", RegexOptions.IgnoreCase))
             return null;
 
         // Try all known motorsport session patterns (currently F1, but extensible)
@@ -1268,7 +1280,7 @@ public class EventPartDetector
             {
                 foreach (var pattern in session.Patterns)
                 {
-                    if (Regex.IsMatch(cleanFilename, pattern, RegexOptions.IgnoreCase))
+                    if (IsMotorsportMatch(cleanFilename, pattern, RegexOptions.IgnoreCase))
                     {
                         return session.Name;
                     }
@@ -1292,22 +1304,22 @@ public class EventPartDetector
         var lower = sessionName.ToLowerInvariant().Trim();
 
         // F1 Pre-season testing (most specific first) — matches "Testing 2 Day 3", "Test Two Day Three", etc.
-        if (Regex.IsMatch(lower, @"test(ing)?\s*(2|two).*(day\s*)?(3|three)")) return "Testing 2 Day 3";
-        if (Regex.IsMatch(lower, @"test(ing)?\s*(2|two).*(day\s*)?(2|two)")) return "Testing 2 Day 2";
-        if (Regex.IsMatch(lower, @"test(ing)?\s*(2|two).*(day\s*)?(1|one)")) return "Testing 2 Day 1";
-        if (Regex.IsMatch(lower, @"test(ing)?\s*(1|one).*(day\s*)?(3|three)")) return "Testing 1 Day 3";
-        if (Regex.IsMatch(lower, @"test(ing)?\s*(1|one).*(day\s*)?(2|two)")) return "Testing 1 Day 2";
-        if (Regex.IsMatch(lower, @"test(ing)?\s*(1|one).*(day\s*)?(1|one)")) return "Testing 1 Day 1";
+        if (IsMotorsportMatch(lower, @"test(ing)?\s*(2|two).*(day\s*)?(3|three)")) return "Testing 2 Day 3";
+        if (IsMotorsportMatch(lower, @"test(ing)?\s*(2|two).*(day\s*)?(2|two)")) return "Testing 2 Day 2";
+        if (IsMotorsportMatch(lower, @"test(ing)?\s*(2|two).*(day\s*)?(1|one)")) return "Testing 2 Day 1";
+        if (IsMotorsportMatch(lower, @"test(ing)?\s*(1|one).*(day\s*)?(3|three)")) return "Testing 1 Day 3";
+        if (IsMotorsportMatch(lower, @"test(ing)?\s*(1|one).*(day\s*)?(2|two)")) return "Testing 1 Day 2";
+        if (IsMotorsportMatch(lower, @"test(ing)?\s*(1|one).*(day\s*)?(1|one)")) return "Testing 1 Day 1";
 
         // MotoGP Shakedown tests (before generic tests)
-        if (lower.Contains("shakedown") && Regex.IsMatch(lower, @"(test|day)\s*(3|three)")) return "Shakedown Test 3";
-        if (lower.Contains("shakedown") && Regex.IsMatch(lower, @"(test|day)\s*(2|two)")) return "Shakedown Test 2";
-        if (lower.Contains("shakedown") && Regex.IsMatch(lower, @"(test|day)\s*(1|one)")) return "Shakedown Test 1";
+        if (lower.Contains("shakedown") && IsMotorsportMatch(lower, @"(test|day)\s*(3|three)")) return "Shakedown Test 3";
+        if (lower.Contains("shakedown") && IsMotorsportMatch(lower, @"(test|day)\s*(2|two)")) return "Shakedown Test 2";
+        if (lower.Contains("shakedown") && IsMotorsportMatch(lower, @"(test|day)\s*(1|one)")) return "Shakedown Test 1";
 
         // Generic tests
-        if (!lower.Contains("shakedown") && Regex.IsMatch(lower, @"\btest\s*(3|three)\b")) return "Test 3";
-        if (!lower.Contains("shakedown") && Regex.IsMatch(lower, @"\btest\s*(2|two)\b")) return "Test 2";
-        if (!lower.Contains("shakedown") && Regex.IsMatch(lower, @"\btest\s*(1|one)\b")) return "Test 1";
+        if (!lower.Contains("shakedown") && IsMotorsportMatch(lower, @"\btest\s*(3|three)\b")) return "Test 3";
+        if (!lower.Contains("shakedown") && IsMotorsportMatch(lower, @"\btest\s*(2|two)\b")) return "Test 2";
+        if (!lower.Contains("shakedown") && IsMotorsportMatch(lower, @"\btest\s*(1|one)\b")) return "Test 1";
 
         // Practice sessions - most specific first, bare "practice" falls through to Practice 1
         if (lower.Contains("practice 3") || lower.Contains("practice three") || lower.Contains("fp3") || lower.Contains("free practice 3"))
@@ -1329,9 +1341,9 @@ public class EventPartDetector
             return "Sprint";
 
         // Qualifying with number (specific before catch-all)
-        if (Regex.IsMatch(lower, @"qualif(ying|ier)\s*(1|one)") || lower == "q1")
+        if (IsMotorsportMatch(lower, @"qualif(ying|ier)\s*(1|one)") || lower == "q1")
             return "Qualifying 1";
-        if (Regex.IsMatch(lower, @"qualif(ying|ier)\s*(2|two)") || lower == "q2")
+        if (IsMotorsportMatch(lower, @"qualif(ying|ier)\s*(2|two)") || lower == "q2")
             return "Qualifying 2";
 
         // Qualifying catch-all (for combined Q1+Q2 releases or F1 single qualifying)

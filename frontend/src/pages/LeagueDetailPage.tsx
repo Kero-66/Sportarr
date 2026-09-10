@@ -12,6 +12,7 @@ import EventFileDetailModal from '../components/EventFileDetailModal';
 import LeagueFilesModal from '../components/LeagueFilesModal';
 import TeamAliasesModal from '../components/TeamAliasesModal';
 import EventStatusBadge from '../components/EventStatusBadge';
+import { getEventLifecycle } from '../utils/eventStatus';
 import ManualImportModal from '../components/ManualImportModal';
 import RefreshScopeModal, { type RefreshScope } from '../components/RefreshScopeModal';
 import { useSearchQueueStatus, useDownloadQueue, useTasks } from '../api/hooks';
@@ -32,6 +33,7 @@ interface ModalLeagueData {
   idLeague: string;
   strLeague: string;
   strSport: string;
+  strSportFormat?: string | null;
   strCountry?: string;
   strLeagueAlternate?: string;
   strDescriptionEN?: string;
@@ -63,6 +65,7 @@ interface LeagueDetail {
   externalId?: string;
   name: string;
   sport: string;
+  sportFormat?: string | null;
   country?: string;
   description?: string;
   monitored: boolean;
@@ -190,6 +193,7 @@ interface EventDetail {
   externalId?: string;
   title: string;
   sport: string;
+  sportFormat?: string | null;
   leagueId?: number;
   leagueName?: string;
   homeTeamId?: number;
@@ -343,7 +347,6 @@ export default function LeagueDetailPage() {
   // Reveals events the league's own monitoring choices hide: sessions the
   // user does not follow, and games without a followed team. Needed to find
   // a one-off event and monitor it by hand.
-  const [showAllEvents, setShowAllEvents] = useState(false);
   // Held locally so the list reorders on click, then saved to the league so it
   // survives a reload and follows the user to another browser.
   const [sortOldestFirst, setSortOldestFirst] = useState(false);
@@ -416,10 +419,10 @@ export default function LeagueDetailPage() {
   // until one is opened, and a league with thousands of events answered
   // megabytes for a list that only needs counts.
   const { data: seasonSummary, isLoading: eventsLoading } = useQuery({
-    queryKey: ['league-seasons', id, showAllEvents],
+    queryKey: ['league-seasons', id],
     queryFn: async () => {
       const response = await apiClient.get<LeagueSeasonSummary>(
-        `/leagues/${id}/seasons${showAllEvents ? '?showAll=true' : ''}`);
+        `/leagues/${id}/seasons`);
       return response.data;
     },
     enabled: !!id,
@@ -455,10 +458,10 @@ export default function LeagueDetailPage() {
   const expandedSeasonList = useMemo(() => [...expandedSeasons], [expandedSeasons]);
   const seasonEventQueries = useQueries({
     queries: expandedSeasonList.map((season) => ({
-      queryKey: ['league-season-events', id, season, showAllEvents],
+      queryKey: ['league-season-events', id, season],
       queryFn: async () => {
         const response = await apiClient.get<EventDetail[]>(
-          `/leagues/${id}/events?season=${encodeURIComponent(season)}${showAllEvents ? '&showAll=true' : ''}`);
+          `/leagues/${id}/events?season=${encodeURIComponent(season)}`);
         return response.data;
       },
       enabled: !!id,
@@ -857,7 +860,7 @@ export default function LeagueDetailPage() {
       // picker, so they must be treated as teamless when computing `monitored` —
       // otherwise an empty monitoredTeamIds array forces the league off and
       // overrides the user's event-type selection.
-      const treatAsTeamless = sport ? (isTeamlessSport(sport, name) || usesFightingEventTypes(sport, name)) : false;
+      const treatAsTeamless = sport ? (isTeamlessSport(sport, name, league?.sportFormat) || usesFightingEventTypes(sport, name)) : false;
 
       // Build the payload - only include monitored if monitoredTeamIds was explicitly provided
       // This prevents inline settings changes (like monitorType dropdown) from accidentally
@@ -1041,6 +1044,7 @@ export default function LeagueDetailPage() {
           idLeague: league.externalId,
           strLeague: league.name,
           strSport: league.sport,
+          strSportFormat: league.sportFormat,
           strCountry: league.country,
           strLeagueAlternate: undefined,
           strDescriptionEN: league.description,
@@ -1687,7 +1691,7 @@ export default function LeagueDetailPage() {
                     onClick={() => setLeagueMenuOpen(false)}
                     aria-hidden="true"
                   />
-                  <div className="absolute left-0 top-full z-50 mt-2 w-64 animate-pill-down">
+                  <div className="absolute right-0 top-full z-50 mt-2 w-64 animate-pill-down">
                     <div
                       role="menu"
                       className="max-h-[75dvh] overflow-y-auto rounded-2xl border-2 border-red-900/70 bg-gradient-to-b from-gray-900 to-black shadow-2xl shadow-black/40"
@@ -1939,8 +1943,22 @@ export default function LeagueDetailPage() {
         <div className="bg-gradient-to-br from-gray-900 to-black border border-red-900/30 rounded-lg overflow-hidden">
           <div className="p-4 md:p-6 border-b border-red-900/30">
             <h2 className="text-xl md:text-2xl font-bold text-white">Events</h2>
+            {/* The stat card above counts what the library stores. This
+                line counts what passes the league's own filters, across
+                every season. Both numbers are shown when they differ, or
+                one looks like the other one is wrong. It does not count
+                what is on screen: collapsed seasons and the cancelled
+                toggle change the rows, not this. */}
             <p className="text-gray-400 text-xs md:text-sm mt-1">
-              {totalEventCount} event{totalEventCount !== 1 ? 's' : ''} in this league
+              {league.eventCount > totalEventCount ? (
+                <>
+                  {totalEventCount.toLocaleString()} of {league.eventCount.toLocaleString()} stored events match what you follow
+                </>
+              ) : (
+                <>
+                  {totalEventCount.toLocaleString()} event{totalEventCount !== 1 ? 's' : ''} in this league
+                </>
+              )}
             </p>
 
             {/* Show-cancelled toggle. Hidden by default because cancelled
@@ -1964,19 +1982,6 @@ export default function LeagueDetailPage() {
                 </label>
               );
             })()}
-
-            <label className="flex items-center gap-2 mt-2 text-xs text-gray-400 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={showAllEvents}
-                onChange={(e) => setShowAllEvents(e.target.checked)}
-                className="rounded text-red-600 focus:ring-red-500 bg-gray-800 border-gray-600"
-              />
-              Show every event
-              <span className="text-gray-500">
-                (including sessions and teams you do not follow)
-              </span>
-            </label>
 
             <label className="flex items-center gap-2 mt-2 text-xs text-gray-400 cursor-pointer select-none">
               <input
@@ -2318,18 +2323,11 @@ export default function LeagueDetailPage() {
                         <div className="divide-y divide-red-900/20">
                           {seasonEvents.map(event => {
                             const hasFile = event.hasFile;
-                            const eventDate = new Date(event.eventDate);
-                            const now = new Date();
-                            const isPastEvent = eventDate < now;
-                            const status = event.status?.toUpperCase();
-                            // 'cancelled' / 'postponed' get their own badge -- the previous
-                            // `isNotStarted = !isCompleted && !isLive` fallback was rendering
-                            // them as "Not Started", which is misleading: a cancelled game
-                            // never happens.
-                            const isCancelled = status === 'CANCELLED' || status === 'CANCELED';
-                            const isPostponed = status === 'POSTPONED';
-                            const isCompleted = hasFile || status === 'FT' || status === 'COMPLETED' || status === 'MATCH FINISHED' || (isPastEvent && (!status || status === 'NS' || status === 'NOT STARTED'));
-                            const isLive = status === 'LIVE';
+                            const lifecycle = getEventLifecycle({ status: event.status, eventDate: event.eventDate, hasFile });
+                            const isCancelled = lifecycle === 'cancelled';
+                            const isPostponed = lifecycle === 'postponed';
+                            const isCompleted = lifecycle === 'completed';
+                            const isLive = lifecycle === 'live';
                             const hasParts = config?.enableMultiPartEpisodes && isFightingSport(event.sport) && eventHasMultiPart(event);
 
                             return (
@@ -2698,18 +2696,14 @@ export default function LeagueDetailPage() {
                             </span>
                           )}
 
-                          {/* Status badge - infer from date if not set */}
+                          {/* Status badge - the clock fills in what the status has not caught up with */}
                           {(() => {
-                            const eventDate = new Date(event.eventDate);
-                            const now = new Date();
-                            const isPast = eventDate < now;
-                            const status = event.status?.toUpperCase();
-                            const isCancelled = status === 'CANCELLED' || status === 'CANCELED';
-                            const isPostponed = status === 'POSTPONED';
-                            // Event is completed if: has file, OR explicit completed status, OR past date with unstarted/no status
-                            const isCompleted = event.hasFile || status === 'FT' || status === 'COMPLETED' || status === 'MATCH FINISHED' || (isPast && (!status || status === 'NS' || status === 'NOT STARTED'));
-                            const isLive = status === 'LIVE';
-                            const isNotStarted = !isCompleted && !isLive && !isCancelled && !isPostponed;
+                            const lifecycle = getEventLifecycle({ status: event.status, eventDate: event.eventDate, hasFile: event.hasFile });
+                            const isCancelled = lifecycle === 'cancelled';
+                            const isPostponed = lifecycle === 'postponed';
+                            const isCompleted = lifecycle === 'completed';
+                            const isLive = lifecycle === 'live';
+                            const isNotStarted = lifecycle === 'upcoming';
 
                             if (isCancelled) {
                               return (

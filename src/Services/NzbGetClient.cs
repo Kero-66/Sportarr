@@ -682,16 +682,63 @@ public class NzbGetClient
     {
         try
         {
-            
-            var action = deleteFiles ? "GroupFinalDelete" : "GroupDelete";
-            var response = await SendJsonRpcRequestAsync(config, "editqueue", new object[] { action, 0, "", new[] { nzbId } });
-            return response != null;
+            var queue = await GetListAsync(config);
+            if (queue == null)
+                return false;
+
+            var wasQueued = queue.Any(item => item.NZBID == nzbId);
+            if (wasQueued && await RemoveItemAsync(config, nzbId,
+                    deleteFiles ? "GroupFinalDelete" : "GroupParkDelete"))
+                return true;
+
+            // A queued job can finish before the removal request reaches the client.
+            var history = await GetHistoryAsync(config);
+            if (history == null)
+                return false;
+
+            var historyItem = history.FirstOrDefault(item => item.NZBID == nzbId);
+            if (historyItem == null)
+                return !wasQueued;
+
+            // History removal can delete failed files, regardless of the chosen action.
+            if (!deleteFiles && !CanRemoveHistoryWithoutDeletingFiles(historyItem))
+            {
+                _logger.LogWarning("[NZBGet] Keeping history item {NzbId}: removal cannot guarantee that downloaded files are preserved", nzbId);
+                return false;
+            }
+
+            // Hide the history item but retain its duplicate protection record.
+            return await RemoveItemAsync(config, nzbId, "HistoryDelete");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "[NZBGet] Error deleting download");
             return false;
         }
+    }
+
+    private static bool CanRemoveHistoryWithoutDeletingFiles(NzbGetHistoryItem item) =>
+        string.Equals(item.DeleteStatus, "NONE", StringComparison.OrdinalIgnoreCase) &&
+        !string.IsNullOrEmpty(item.ParStatus) &&
+        !string.IsNullOrEmpty(item.UnpackStatus) &&
+        !string.Equals(item.ParStatus, "FAILURE", StringComparison.OrdinalIgnoreCase) &&
+        !string.Equals(item.UnpackStatus, "FAILURE", StringComparison.OrdinalIgnoreCase) &&
+        !string.Equals(item.UnpackStatus, "PASSWORD", StringComparison.OrdinalIgnoreCase);
+
+    private async Task<bool> RemoveItemAsync(DownloadClient config, int nzbId, string action)
+    {
+        var response = await SendJsonRpcRequestAsync(config, "editqueue",
+            new object[] { action, "", new[] { nzbId } });
+        if (response == null)
+            return false;
+
+        using var document = JsonDocument.Parse(response);
+        var root = document.RootElement;
+        var success = (!root.TryGetProperty("error", out var error) || error.ValueKind == JsonValueKind.Null) &&
+            root.TryGetProperty("result", out var result) && result.ValueKind == JsonValueKind.True;
+        if (!success)
+            _logger.LogWarning("[NZBGet] {Action} did not confirm removal of download {NzbId}", action, nzbId);
+        return success;
     }
 
     // Private helper methods
@@ -817,6 +864,9 @@ public class NzbGetHistoryItem
     public int NZBID { get; set; }
     public string Name { get; set; } = "";
     public string Status { get; set; } = "";
+    public string? DeleteStatus { get; set; }
+    public string? ParStatus { get; set; }
+    public string? UnpackStatus { get; set; }
     public string DestDir { get; set; } = "";
     public string Category { get; set; } = "";
     public long FileSizeLo { get; set; }

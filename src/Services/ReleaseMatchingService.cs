@@ -96,6 +96,13 @@ public class ReleaseMatchingService
     // Event-number patterns (UFC/Bellator/PFL/ONE/WrestleMania/SuperBowl/Week/Round/Matchday)
     // used inside fighting-event identity checks. Each is a separate compiled instance so
     // ExtractEventNumber / ExtractRoundNumber can iterate over them without re-parsing.
+    private static readonly Regex _eventRaceNumberPattern =
+        new(@"\bRace\s*(\d{1,3})\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // One file can hold two races, and its title says so ("Races 26 and 27").
+    private static readonly Regex _releaseRaceNumberPattern =
+        new(@"\bRaces?\s*(\d{1,3})(?:\s*(?:and|&|\+|,)\s*(\d{1,3}))?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _releaseRoundTokenPattern =
+        new(@"\b(?:round|rd)\s*\.?\s*\d{1,2}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex[] _eventNumberPatterns = new[]
     {
         new Regex(@"UFC[\s\.\-]+(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase),
@@ -221,7 +228,8 @@ public class ReleaseMatchingService
         string? requestedPart = null,
         bool enableMultiPartEpisodes = true,
         SportsParseResult? preParsed = null,
-        int? earlyReleaseLimitDays = null)
+        int? earlyReleaseLimitDays = null,
+        IReadOnlyList<int>? roundRaceNumbers = null)
     {
         var result = new ReleaseMatchResult
         {
@@ -314,7 +322,7 @@ public class ReleaseMatchingService
         var parseResult = preParsed ?? _sportsParser.Parse(release.Title);
 
         // AUTHORITATIVE ID TOKEN (docs/RELEASE_NAMING.md): a release tagged
-        // {sportarr-ev-XXXXXXX} in its name, or carrying a "sportarrid"
+        // sportarr-ev-XXXXXXX in its name, or carrying a "sportarrid"
         // torznab/newznab attribute from the indexer, names its event
         // exactly. When the tagged id matches this event's canonical id,
         // that IS the match - no fuzzy team/date/round arithmetic can
@@ -570,10 +578,22 @@ public class ReleaseMatchingService
             _logger.LogTrace("[Release Matching] Date comparison: release={ReleaseDate}, event={EventDate}, diff={Days} days",
                 parseResult.EventDate.Value.ToString("yyyy-MM-dd"), eventDate.ToString("yyyy-MM-dd"), daysDiff);
 
-            if (daysDiff <= 1)
+            if (daysDiff == 0)
             {
                 result.Confidence += 25;
                 result.MatchReasons.Add("Date matches exactly");
+            }
+            else if (daysDiff <= 1 && (!isTeamSport || evt.BroadcastDate == null || !evt.BroadcastDateVerified))
+            {
+                // One day of grace absorbs the UTC-vs-venue rollover, but
+                // only while the event's broadcast-local date is unknown.
+                // With a broadcast date in hand the rollover is already
+                // absorbed, and for team sports the neighboring day is the
+                // neighboring GAME: an MLB series plays daily, so a one-day
+                // window hands over yesterday's matchup between the same
+                // two teams as today's.
+                result.Confidence += 25;
+                result.MatchReasons.Add("Date within 1 day (timezone rollover)");
             }
             else if (!isTeamSport && daysDiff <= 3)
             {
@@ -858,6 +878,62 @@ public class ReleaseMatchingService
                         releaseRound, eventRound, release.Title);
                 }
             }
+
+            // VALIDATION 6d: the race number, for a series that runs several
+            // races in a round. Round 9 of a Supercars season holds races 26,
+            // 27 and 28, and without this every one of them matched the other
+            // two: the round, the year, the venue and the session all agree,
+            // and only the race number tells them apart.
+            //
+            // Releases count races two ways. "Supercars 2025 Race 25 Ipswich"
+            // counts across the season, the way the library does. "Supercars
+            // 2026 Round09 Ipswich Race 3" counts inside the round, so its
+            // number means nothing without knowing which races that round
+            // holds; roundRaceNumbers carries them when the caller knows.
+            var eventRace = ExtractRaceNumber(evt.Title);
+            if (eventRace.HasValue)
+            {
+                var releaseRaces = ExtractReleaseRaceNumbers(release.Title, out var countedInsideRound);
+
+                if (releaseRaces.Count > 0 && !countedInsideRound)
+                {
+                    if (releaseRaces.Contains(eventRace.Value))
+                    {
+                        result.Confidence += 25;
+                        result.MatchReasons.Add($"Race number matches: Race {eventRace.Value}");
+                    }
+                    else
+                    {
+                        result.Confidence -= 100;
+                        result.Rejections.Add(
+                            $"Race mismatch: release is Race {string.Join(" and ", releaseRaces)}, event is Race {eventRace.Value}");
+                        result.IsHardRejection = true;
+                        _logger.LogTrace("[Release Matching] Hard rejection: race mismatch: '{Release}' -> '{Event}'",
+                            release.Title, evt.Title);
+                    }
+                }
+                else if (releaseRaces.Count == 1 && countedInsideRound && roundRaceNumbers is { Count: > 0 })
+                {
+                    var ordered = roundRaceNumbers.OrderBy(n => n).ToList();
+                    var index = releaseRaces[0];
+                    var expected = index >= 1 && index <= ordered.Count ? ordered[index - 1] : (int?)null;
+
+                    if (expected == eventRace.Value)
+                    {
+                        result.Confidence += 25;
+                        result.MatchReasons.Add($"Race number matches: race {index} of the round is Race {eventRace.Value}");
+                    }
+                    else if (expected.HasValue)
+                    {
+                        result.Confidence -= 100;
+                        result.Rejections.Add(
+                            $"Race mismatch: release is race {index} of the round (Race {expected}), event is Race {eventRace.Value}");
+                        result.IsHardRejection = true;
+                        _logger.LogTrace("[Release Matching] Hard rejection: race-in-round mismatch: '{Release}' -> '{Event}'",
+                            release.Title, evt.Title);
+                    }
+                }
+            }
         }
 
         // VALIDATION 6c: Motorsport location mismatch detection
@@ -1124,6 +1200,44 @@ public class ReleaseMatchingService
     /// Extract round number from title (e.g., "Round 22", "Round22", "Rd 22")
     /// Used for motorsport validation to ensure Round 20 release doesn't match Round 22 event
     /// </summary>
+    /// <summary>
+    /// The race number an event title carries ("... - Race 25"). The library
+    /// counts races across the season, so this is a season number.
+    /// </summary>
+    /// <summary>The race number an event title carries. Public so a caller can
+    /// gather a round's races before it asks for a match.</summary>
+    public static int? RaceNumberInTitle(string? title) => ExtractRaceNumber(title);
+
+    private static int? ExtractRaceNumber(string? title)
+    {
+        if (string.IsNullOrEmpty(title)) return null;
+        var match = _eventRaceNumberPattern.Match(title);
+        return match.Success && int.TryParse(match.Groups[1].Value, out var race) ? race : null;
+    }
+
+    /// <summary>
+    /// The race numbers a release title carries, and whether they count inside
+    /// the round rather than across the season. A release naming a round counts
+    /// inside it ("Round09 ... Race 3"), one that names no round counts across
+    /// the season ("2025 Race 25"). One file can hold two races ("Race 23 and
+    /// 24"), so this returns every number it finds.
+    /// </summary>
+    private static List<int> ExtractReleaseRaceNumbers(string title, out bool countedInsideRound)
+    {
+        countedInsideRound = false;
+        var races = new List<int>();
+        if (string.IsNullOrEmpty(title)) return races;
+
+        var match = _releaseRaceNumberPattern.Match(title);
+        if (!match.Success) return races;
+
+        if (int.TryParse(match.Groups[1].Value, out var first)) races.Add(first);
+        if (match.Groups[2].Success && int.TryParse(match.Groups[2].Value, out var second)) races.Add(second);
+
+        countedInsideRound = _releaseRoundTokenPattern.IsMatch(title);
+        return races;
+    }
+
     private int? ExtractRoundNumber(string title)
     {
         foreach (var pattern in _roundNumberPatterns)

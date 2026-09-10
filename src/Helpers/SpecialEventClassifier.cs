@@ -1,3 +1,5 @@
+using Sportarr.Api.Models;
+
 namespace Sportarr.Api.Helpers;
 
 /// <summary>
@@ -8,12 +10,14 @@ namespace Sportarr.Api.Helpers;
 /// even when their teams aren't playing.
 ///
 /// Signals, strongest first:
-///   1. TheSportsDB numeric round codes — the upstream convention reserves
+///   1. TheSportsDB numeric round codes. The upstream convention reserves
 ///      values >= 125 for knockout rounds (regular-season matchdays top out
 ///      around 38 for soccer and 18 for the NFL):
 ///        125 quarter-final, 150 semi-final, 160 playoff,
 ///        170 playoff semi-final, 180 playoff final, 200 final,
 ///        500 pre-season (explicitly NOT special).
+///      Round 180 can also identify a qualifying stage. Full-season evidence
+///      of a later final separates it from the championship.
 ///   2. Word-based round values ("Final", "Semi-Final", "Wild Card", ...).
 ///   3. Title keywords as a fallback ("Super Bowl", "World Series", ...).
 ///      Safe in this context because the classifier only runs for leagues
@@ -120,14 +124,65 @@ public static class SpecialEventClassifier
         return result;
     }
 
-    public static SpecialTier Classify(string? round, string? title, IReadOnlySet<int>? cupStageSizes = null)
+    // These stages decide who reaches the championship.
+    private static bool IsQualifyingFinal(string value) =>
+        value.Contains("conference final") || value.Contains("conference championship") ||
+        value.Contains("division final") || value.Contains("divisional final") ||
+        value.Contains("afc championship") || value.Contains("nfc championship") ||
+        value.Contains("league championship series") ||
+        value.Contains("preliminary final") || value.Contains("qualifying final") ||
+        value.Contains("elimination final") || value.Contains("semi-final") ||
+        value.Contains("semifinal") || value.Contains("quarter-final") || value.Contains("quarterfinal");
+
+    internal static ILookup<(int? LeagueId, string Id), Event> IndexSourceEvents(IEnumerable<Event> events) =>
+        events.SelectMany(e => new[] { e.ExternalId, e.TsdbId }
+                .Where(id => !string.IsNullOrEmpty(id))
+                .Select(id => (Key: (e.LeagueId, Id: id!), Event: e)))
+            .ToLookup(pair => pair.Key, pair => pair.Event);
+
+    internal static Event ResolveSourceEvent(Event e, ILookup<(int? LeagueId, string Id), Event> sourceById) =>
+        (string.IsNullOrEmpty(e.ExternalId) ? null : sourceById[(e.LeagueId, e.ExternalId)].FirstOrDefault())
+        ?? (string.IsNullOrEmpty(e.TsdbId) ? null : sourceById[(e.LeagueId, e.TsdbId)].FirstOrDefault()) ?? e;
+
+    internal static void ApplySeasonFinalContext(IEnumerable<Event> events, IEnumerable<Event>? sourceEvents = null)
     {
+        var rows = events.ToList();
+        var source = (sourceEvents ?? rows).ToList();
+        var sourceById = IndexSourceEvents(source);
+        var finals = source
+            .Where(e => !string.IsNullOrWhiteSpace(e.Season) && e.EventDate != default
+                && int.TryParse(e.Round?.Trim(), out var code) && code == 200)
+            .GroupBy(e => (e.LeagueId, e.Season))
+            .ToDictionary(g => g.Key, g => g.Max(e => e.EventDate));
+
+        foreach (var e in rows)
+        {
+            // Use source dates for retained rows that moved across the final.
+            var current = ResolveSourceEvent(e, sourceById);
+            // A cup final earlier in the season cannot demote a later final.
+            e.HasLaterSeasonFinal = current.EventDate != default && !string.IsNullOrWhiteSpace(current.Season)
+                && finals.TryGetValue((current.LeagueId, current.Season), out var finalDate)
+                && finalDate > current.EventDate;
+        }
+    }
+
+    public static SpecialTier Classify(string? round, string? title, IReadOnlySet<int>? cupStageSizes = null,
+        bool? hasLaterSeasonFinal = null)
+    {
+        var t = title?.ToLowerInvariant() ?? "";
+        var explicitQualifier = IsQualifyingFinal(t);
+        var namedFinal = !explicitQualifier && FinalTitleKeywords.Any(t.Contains);
+        var playoffFinalTier = explicitQualifier || (hasLaterSeasonFinal == true && !namedFinal)
+            ? SpecialTier.Playoff
+            : SpecialTier.Final;
+
         // 1. Numeric TheSportsDB round codes.
         if (!string.IsNullOrWhiteSpace(round) && int.TryParse(round.Trim(), out var code))
         {
             var codeTier = code switch
             {
-                200 or 180 => SpecialTier.Final,
+                200 => SpecialTier.Final,
+                180 => playoffFinalTier,
                 125 or 150 or 160 or 170 => SpecialTier.Playoff,
                 500 => SpecialTier.Preseason,
                 _ => SpecialTier.None
@@ -155,9 +210,12 @@ public static class SpecialEventClassifier
         {
             var r = round.Trim().ToLowerInvariant();
             var isSemiOrQuarter = r.Contains("semi") || r.Contains("quarter");
+            if (IsQualifyingFinal(r)) return SpecialTier.Playoff;
             if (r.Contains("final") && !isSemiOrQuarter)
             {
-                return SpecialTier.Final;
+                return r.Contains("playoff") || r.Contains("play-off")
+                    ? playoffFinalTier
+                    : SpecialTier.Final;
             }
             if (isSemiOrQuarter || r.Contains("playoff") || r.Contains("play-off") ||
                 r.Contains("wild card") || r.Contains("wildcard") ||
@@ -184,7 +242,7 @@ public static class SpecialEventClassifier
         // 3. Title keyword fallback.
         if (!string.IsNullOrWhiteSpace(title))
         {
-            var t = title.ToLowerInvariant();
+            if (explicitQualifier) return SpecialTier.Playoff;
 
             // Playoff wording is checked first because it is the more specific
             // of the two. "Conference Finals Game 7" contains "finals game" and
@@ -220,13 +278,13 @@ public static class SpecialEventClassifier
     /// </summary>
     public static bool BypassesTeamFilter(string? round, string? title,
         bool monitorFinals, bool monitorPlayoffs, bool monitorPreseason = false,
-        IReadOnlySet<int>? cupStageSizes = null)
+        IReadOnlySet<int>? cupStageSizes = null, bool? hasLaterSeasonFinal = null)
     {
         if (!monitorFinals && !monitorPlayoffs && !monitorPreseason)
         {
             return false;
         }
-        var tier = Classify(round, title, cupStageSizes);
+        var tier = Classify(round, title, cupStageSizes, hasLaterSeasonFinal);
         return (tier == SpecialTier.Final && monitorFinals)
             || (tier == SpecialTier.Playoff && monitorPlayoffs)
             || (tier == SpecialTier.Preseason && monitorPreseason);

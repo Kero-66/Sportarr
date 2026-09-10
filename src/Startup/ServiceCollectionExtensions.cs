@@ -454,6 +454,7 @@ public static class ServiceCollectionExtensions
         // the proxy/HDHomeRun path.
         services.AddSingleton<StreamSessionTracker>();
         services.AddScoped<DvrRecordingService>();
+        services.AddSingleton<DvrEarlyFinishGuard>();
         services.AddScoped<EventDvrService>();
         services.AddScoped<DvrQualityScoreCalculator>();
         services.AddScoped<XmltvParserService>();
@@ -477,6 +478,7 @@ public static class ServiceCollectionExtensions
         services.AddHostedService(sp => sp.GetRequiredService<DiskScanService>());
 
         services.AddHostedService<TrashSyncBackgroundService>();
+        services.AddSingleton<DownloadMonitorWakeSignal>();
         services.AddHostedService<EnhancedDownloadMonitorService>();
 
         // RssSyncService doubles as the decision engine for externally pushed

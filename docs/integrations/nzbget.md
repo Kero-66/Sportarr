@@ -20,3 +20,11 @@ Efficient usenet downloader with a small resource footprint.
 4. **Test**, then **Save**
 
 Post-import modes, per-indexer client pinning, and remote path mappings are shared across all clients and documented under [Download Clients](../features/download-clients.md).
+
+## Completed download cleanup
+
+With **Remove Completed Downloads** enabled, Sportarr removes an imported job from NZBGet's visible history. Its duplicate protection record is retained when NZBGet duplicate checking is enabled. If NZBGet rejects the removal, Sportarr logs a warning and skips the remaining download folder cleanup. The imported library file stays available.
+
+A move import can remove the original download folder before the client cleanup request. A cleanup warning does not undo that move.
+
+When you remove a queued download without deleting its files, Sportarr preserves the downloaded files. A failed or previously deleted history item can require file deletion to remove it from NZBGet. Sportarr leaves that item in place when you choose to keep files.

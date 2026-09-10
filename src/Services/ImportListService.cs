@@ -700,6 +700,7 @@ public class ImportListService
                 ExternalId = leagueShortId,
                 Name = leagueItem?.Name ?? lookup.Name,
                 Sport = lookup.Sport,
+                SportFormat = lookup.SportFormat,
                 Country = lookup.Country,
                 QualityProfileId = importList.QualityProfileId > 0 ? importList.QualityProfileId : null,
                 RootFolderId = rootFolderId,

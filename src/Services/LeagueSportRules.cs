@@ -25,7 +25,7 @@ public static class LeagueSportRules
         // synced (the UI sits on "Syncing events..." forever). The frontend
         // mirror already lists both spellings.
         "Cycling", "Motorsport", "Racing", "Golf", "Darts",
-        "Climbing", "Gambling", "Badminton", "Table Tennis", "Snooker"
+        "Climbing", "Gambling", "Badminton", "Table Tennis", "Snooker", "Athletics"
     };
 
     /// <summary>
@@ -113,14 +113,23 @@ public static class LeagueSportRules
         return false;
     }
 
+    public static string? NormalizeSportFormat(string? format)
+    {
+        if (string.Equals(format?.Trim(), "EventSport", StringComparison.OrdinalIgnoreCase)) return "EventSport";
+        if (string.Equals(format?.Trim(), "TeamvsTeam", StringComparison.OrdinalIgnoreCase)) return "TeamvsTeam";
+        return null;
+    }
+
     /// <summary>
     /// Returns true for sports/leagues that do not have meaningful home/away
     /// teams. Individual tennis tours (ATP/WTA) also qualify, but team-based
     /// tennis competitions (Fed Cup, Davis Cup, Olympics, Billie Jean King Cup)
     /// do not.
     /// </summary>
-    public static bool IsTeamlessSport(string? sport, string? leagueName)
+    public static bool IsTeamlessSport(string? sport, string? leagueName, string? sportFormat = null)
     {
+        var format = NormalizeSportFormat(sportFormat);
+        if (format != null) return format == "EventSport";
         if (string.IsNullOrEmpty(sport)) return false;
         if (TeamlessSports.Contains(sport, System.StringComparer.OrdinalIgnoreCase)) return true;
         return IsIndividualTennisLeague(sport, leagueName ?? string.Empty);

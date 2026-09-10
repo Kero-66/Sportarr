@@ -60,14 +60,20 @@ public class FileWatcherService : BackgroundService
         }
 
         // Keep running and periodically refresh watchers (in case root folders change)
+        var refreshCount = 0;
         while (!stoppingToken.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromMinutes(30), stoppingToken);
+            refreshCount++;
 
-            // Refresh watchers in case root folders were added/removed
+            // Refresh watchers in case root folders were added/removed. The
+            // full sweep behind it exists for events the watchers missed, so
+            // it runs on a fraction of the refreshes; on every one, it re-read
+            // whole folder trees twice an hour and the drives underneath never
+            // rested.
             try
             {
-                await RefreshWatchersAsync(stoppingToken);
+                await RefreshWatchersAsync(stoppingToken, sweep: refreshCount % 4 == 0);
             }
             catch (Exception ex)
             {
@@ -225,7 +231,7 @@ public class FileWatcherService : BackgroundService
         }
     }
 
-    private async Task RefreshWatchersAsync(CancellationToken cancellationToken)
+    private async Task RefreshWatchersAsync(CancellationToken cancellationToken, bool sweep = true)
     {
         using var scope = _serviceProvider.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
@@ -259,8 +265,12 @@ public class FileWatcherService : BackgroundService
         }
 
         // Poll fallback: watcher events are best-effort on network mounts,
-        // and a watch folder has no other scan covering it.
-        SweepWatchFolders(watchFolders);
+        // and a watch folder has no other scan covering it. Only some
+        // refreshes carry it, so an idle download drive gets to rest.
+        if (sweep)
+        {
+            SweepWatchFolders(watchFolders);
+        }
     }
 
     private void OnFileCreated(object sender, FileSystemEventArgs e)
@@ -401,10 +411,16 @@ public class FileWatcherService : BackgroundService
                            await db.EventFiles.AnyAsync(ef => ef.FilePath == filePath);
             if (isTracked) return;
 
-            // Check if already pending
-            var isPending = await db.PendingImports
-                .AnyAsync(pi => pi.FilePath == filePath && pi.Status == PendingImportStatus.Pending);
-            if (isPending) return;
+            // The disk scan lists a file without judging it. A row it made
+            // first is kept and filled in below, or the reason a copy was
+            // left out would never show. A row a download client owns, or
+            // one that already carries a reason, is left alone.
+            var existingPending = await db.PendingImports
+                .FirstOrDefaultAsync(pi => pi.FilePath == filePath && pi.Status == PendingImportStatus.Pending);
+            if (existingPending != null && (existingPending.DownloadClientId != null || existingPending.ErrorMessage != null))
+            {
+                return;
+            }
 
             // User-ignored files: rejecting a pending import writes a
             // Blocklist row carrying the path. Without this check the
@@ -474,6 +490,7 @@ public class FileWatcherService : BackgroundService
             var suggestedEventId = analysis?.MatchedEventId;
             var confidence = analysis?.MatchConfidence ?? 0;
             var quality = analysis?.Quality;
+            string? rejectionReason = null;
 
             // Manually split part files (ptN in the name) only auto-import
             // for fighting sports, where parts are first-class (Prelims,
@@ -515,6 +532,9 @@ public class FileWatcherService : BackgroundService
                             FilePath = filePath,
                             EventId = suggestedEventId,
                             Quality = quality,
+                            // A file found on disk replaces what the event holds
+                            // only as an upgrade; a rejection leaves it where it is.
+                            OnlyIfUpgrade = true,
                         }
                     });
                     if (importResult.Imported.Count + importResult.Created.Count > 0)
@@ -522,16 +542,45 @@ public class FileWatcherService : BackgroundService
                         _logger.LogInformation(
                             "[File Watcher] Auto-imported {Path} (confidence {Confidence}%, event {EventId})",
                             filePath, confidence, suggestedEventId);
+                        if (existingPending != null)
+                        {
+                            existingPending.Status = PendingImportStatus.Completed;
+                            await db.SaveChangesAsync();
+                        }
                         return;
                     }
-                    _logger.LogWarning(
-                        "[File Watcher] Auto-import of {Path} did not import (skipped: {Skipped}, failed: {Failed}); leaving it for manual review",
-                        filePath, importResult.Skipped.Count, importResult.Failed.Count + importResult.Errors.Count);
+                    if (importResult.Rejected.Count > 0)
+                    {
+                        // Left where it is; the pending row below carries the
+                        // reason to Activity and stops the file being judged again.
+                        rejectionReason = importResult.Rejected[0].Reason;
+                        _logger.LogInformation("[File Watcher] {Reason} Left where it is, Library Import can still take it: {Path}",
+                            rejectionReason, filePath);
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "[File Watcher] Auto-import of {Path} did not import (skipped: {Skipped}, failed: {Failed}); leaving it for manual review",
+                            filePath, importResult.Skipped.Count, importResult.Failed.Count + importResult.Errors.Count);
+                    }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "[File Watcher] Auto-import of {Path} failed; leaving it for manual review", filePath);
                 }
+            }
+
+            if (existingPending != null)
+            {
+                existingPending.Size = fileInfo.Length;
+                existingPending.Quality = quality;
+                existingPending.SuggestedEventId = suggestedEventId;
+                existingPending.SuggestionConfidence = confidence;
+                existingPending.ErrorMessage = rejectionReason;
+                await db.SaveChangesAsync();
+                _logger.LogInformation("[File Watcher] Filled in the listed file: {Path} (Confidence: {Confidence}%)",
+                    filePath, confidence);
+                return;
             }
 
             var pendingImport = new PendingImport
@@ -545,7 +594,8 @@ public class FileWatcherService : BackgroundService
                 SuggestedEventId = suggestedEventId,
                 SuggestionConfidence = confidence,
                 Detected = DateTime.UtcNow,
-                Status = PendingImportStatus.Pending
+                Status = PendingImportStatus.Pending,
+                ErrorMessage = rejectionReason
             };
 
             db.PendingImports.Add(pendingImport);

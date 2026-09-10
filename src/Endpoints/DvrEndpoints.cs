@@ -630,12 +630,17 @@ app.MapGet("/api/dvr/settings", async (ConfigService configService) =>
         postRecordingCommand = config.DvrPostRecordingCommand,
         overtimeGuardEnabled = config.DvrOvertimeGuardEnabled,
         overtimeMaxExtensionMinutes = config.DvrOvertimeMaxExtensionMinutes,
+        earlyFinishGuardEnabled = config.DvrEarlyFinishGuardEnabled,
+        earlyFinishBufferMinutes = Math.Clamp(config.DvrEarlyFinishBufferMinutes, 0, 60),
         reresolveChannelsEnabled = config.DvrReresolveChannelsEnabled,
         reresolveLockMinutes = config.DvrReresolveLockMinutes,
         reresolveMinImprovement = config.DvrReresolveMinImprovement,
         enableReconnect = config.DvrEnableReconnect,
         maxReconnectAttempts = config.DvrMaxReconnectAttempts,
-        reconnectDelaySeconds = config.DvrReconnectDelaySeconds,
+        // Values stored before the 5-300 clamp existed display as the
+        // effective value the recorder uses.
+        reconnectDelaySeconds = Math.Clamp(config.DvrReconnectDelaySeconds, 5, 300),
+        readTimeoutSeconds = config.DvrReadTimeoutSeconds,
         // Catchup settings
         useCatchupWhenAvailable = config.DvrUseCatchupWhenAvailable,
         catchupReadyGraceMinutes = config.DvrCatchupReadyGraceMinutes,
@@ -656,7 +661,28 @@ app.MapPut("/api/dvr/settings", async (HttpRequest request, ConfigService config
 {
     using var reader = new StreamReader(request.Body);
     var json = await reader.ReadToEndAsync();
-    var settings = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(json);
+    JsonElement settings;
+    try
+    {
+        settings = JsonSerializer.Deserialize<JsonElement>(json);
+    }
+    catch (JsonException)
+    {
+        return Results.BadRequest(new { error = "DVR settings must be a JSON object." });
+    }
+
+    if (settings.ValueKind != JsonValueKind.Object)
+        return Results.BadRequest(new { error = "DVR settings must be a JSON object." });
+
+    var hasEarlyFinishGuard = settings.TryGetProperty("earlyFinishGuardEnabled", out var earlyFinishGuard);
+    if (hasEarlyFinishGuard && earlyFinishGuard.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        return Results.BadRequest(new { error = "earlyFinishGuardEnabled must be a boolean." });
+
+    var hasEarlyFinishBuffer = settings.TryGetProperty("earlyFinishBufferMinutes", out var earlyFinishBuffer);
+    var earlyFinishBufferMinutes = 0;
+    if (hasEarlyFinishBuffer && (earlyFinishBuffer.ValueKind != JsonValueKind.Number ||
+        !earlyFinishBuffer.TryGetInt32(out earlyFinishBufferMinutes)))
+        return Results.BadRequest(new { error = "earlyFinishBufferMinutes must be an integer." });
 
     var config = await configService.GetConfigAsync();
 
@@ -708,6 +734,11 @@ app.MapPut("/api/dvr/settings", async (HttpRequest request, ConfigService config
     if (settings.TryGetProperty("overtimeMaxExtensionMinutes", out var overtimeMaxExtensionMinutes))
         config.DvrOvertimeMaxExtensionMinutes = Math.Clamp(overtimeMaxExtensionMinutes.GetInt32(), 0, 360);
 
+    if (hasEarlyFinishGuard)
+        config.DvrEarlyFinishGuardEnabled = earlyFinishGuard.GetBoolean();
+    if (hasEarlyFinishBuffer)
+        config.DvrEarlyFinishBufferMinutes = Math.Clamp(earlyFinishBufferMinutes, 0, 60);
+
     if (settings.TryGetProperty("reresolveChannelsEnabled", out var reresolveEnabled))
         config.DvrReresolveChannelsEnabled = reresolveEnabled.GetBoolean();
     if (settings.TryGetProperty("reresolveLockMinutes", out var reresolveLock))
@@ -723,7 +754,14 @@ app.MapPut("/api/dvr/settings", async (HttpRequest request, ConfigService config
     if (settings.TryGetProperty("maxReconnectAttempts", out var maxReconnect))
         config.DvrMaxReconnectAttempts = maxReconnect.GetInt32();
     if (settings.TryGetProperty("reconnectDelaySeconds", out var reconnectDelay))
-        config.DvrReconnectDelaySeconds = reconnectDelay.GetInt32();
+        // Clamped on save so the page never shows a value the recorder
+        // would silently correct.
+        config.DvrReconnectDelaySeconds = Math.Clamp(reconnectDelay.GetInt32(), 5, 300);
+    if (settings.TryGetProperty("readTimeoutSeconds", out var readTimeout))
+        // 0 disables the ffmpeg-level read timeout. The cap matches the DVR
+        // watchdog's two-minute no-growth kill, which makes any larger value
+        // a dead letter.
+        config.DvrReadTimeoutSeconds = Math.Clamp(readTimeout.GetInt32(), 0, 120);
 
     // Catchup settings
     if (settings.TryGetProperty("useCatchupWhenAvailable", out var useCatchup))

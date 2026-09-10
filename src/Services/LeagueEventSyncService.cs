@@ -193,7 +193,7 @@ public class LeagueEventSyncService
         //   Note: Team-based tennis (Fed Cup, Davis Cup, Olympics) still needs team filtering
         var monitoredTeamIds = new HashSet<string>();
 
-        if (!LeagueSportRules.IsTeamlessSport(league.Sport, league.Name))
+        if (!LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat))
         {
             monitoredTeamIds = league.MonitoredTeams
                 .Where(lt => lt.Monitored && lt.Team != null)
@@ -305,13 +305,15 @@ public class LeagueEventSyncService
         _logger.LogInformation("[League Event Sync] Syncing {Count} seasons for league: {LeagueName}",
             seasons.Count, league.Name);
 
-        // One-query preload of every Scheduled DVR recording, replacing the
-        // former per-existing-event lookup — one DB round-trip per event and
-        // the second-largest contributor in the [Sync Metrics] baseline.
-        // Grouped by EventId; rows realigned inside ProcessEvent stay
-        // tracked on this context, so the per-season SaveChanges persists
-        // them exactly as the per-event query version did.
-        var scheduledRecordingsByEventId = (await _db.DvrRecordings
+        // One query per season for every Scheduled DVR recording, replacing
+        // the former per-existing-event lookup that was the second-largest
+        // contributor in the [Sync Metrics] baseline. Loaded inside the loop
+        // rather than hoisted above it, because the per-season tracker clear
+        // detaches whatever the previous season loaded, and a realignment
+        // written to a detached row saves nothing. Each season works on rows
+        // this context is actually tracking.
+        async Task<Dictionary<int, List<DvrRecording>>> LoadScheduledRecordingsAsync() =>
+            (await _db.DvrRecordings
                 .Where(r => r.Status == DvrRecordingStatus.Scheduled && r.EventId != null)
                 .ToListAsync())
             .GroupBy(r => r.EventId!.Value)
@@ -323,6 +325,8 @@ public class LeagueEventSyncService
         {
             cancellationToken.ThrowIfCancellationRequested();
             seasonIndex++;
+
+            var scheduledRecordingsByEventId = await LoadScheduledRecordingsAsync();
             var seasonStartCount = result.NewCount + result.UpdatedCount;
 
             // Per-season progress checkpoint. Maps the season index
@@ -388,13 +392,25 @@ public class LeagueEventSyncService
             // Computed from the season's full pre-filter list and reused by
             // the cleanup predicates below so all sides classify
             // identically.
+            var fullSeasonEvents = events.ToList();
+            foreach (var e in fullSeasonEvents) e.LeagueId = league.Id;
+            SpecialEventClassifier.ApplySeasonFinalContext(fullSeasonEvents);
             var cupStageSizes = SpecialEventClassifier.ComputeCupStageSizes(events.Select(e => e.Round));
+            var fullSeasonById = SpecialEventClassifier.IndexSourceEvents(fullSeasonEvents);
+            bool BypassesSeasonTeamFilter(Event e)
+            {
+                // Cleanup must use the same source round and title as admission.
+                var current = SpecialEventClassifier.ResolveSourceEvent(e, fullSeasonById);
+                return SpecialEventClassifier.BypassesTeamFilter(current.Round, current.Title,
+                    league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason,
+                    cupStageSizes, current.HasLaterSeasonFinal);
+            }
             if (monitoredTeamIds.Any() && !league.KeepAllEvents)
             {
                 events = events.Where(e =>
                     (!string.IsNullOrEmpty(e.HomeTeamExternalId) && monitoredTeamIds.Contains(e.HomeTeamExternalId)) ||
                     (!string.IsNullOrEmpty(e.AwayTeamExternalId) && monitoredTeamIds.Contains(e.AwayTeamExternalId)) ||
-                    SpecialEventClassifier.BypassesTeamFilter(e.Round, e.Title, league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes)
+                    BypassesSeasonTeamFilter(e)
                 ).ToList();
 
                 _logger.LogInformation("[League Event Sync] Season {Season}: Filtered {Original} events to {Filtered} based on monitored teams{SpecialNote}",
@@ -469,9 +485,12 @@ public class LeagueEventSyncService
             // per season; the rows come back tracked, so the same instances are
             // reused by existingByExternalId and the cleanup pass below.
             var localByDateTitle = new Dictionary<string, List<Event>>(StringComparer.Ordinal);
-            foreach (var local in await _db.Events
-                         .Where(e => e.LeagueId == league.Id && e.Season == season && e.ExternalId != null)
-                         .ToListAsync())
+            var localSeasonRows = await _db.Events
+                .Where(e => e.LeagueId == league.Id && e.Season == season && e.ExternalId != null)
+                .ToListAsync();
+            // Refresh retained rows even when the new filter excludes them.
+            SpecialEventClassifier.ApplySeasonFinalContext(localSeasonRows, fullSeasonEvents);
+            foreach (var local in localSeasonRows)
             {
                 var sig = BuildEventMatchSignature(local.EventDate, local.Title);
                 if (!localByDateTitle.TryGetValue(sig, out var bucket))
@@ -615,7 +634,7 @@ public class LeagueEventSyncService
                 ? allLocalSeasonEvents.Where(e =>
                         (e.HomeTeamExternalId != null && monitoredTeamIds.Contains(e.HomeTeamExternalId)) ||
                         (e.AwayTeamExternalId != null && monitoredTeamIds.Contains(e.AwayTeamExternalId)) ||
-                        SpecialEventClassifier.BypassesTeamFilter(e.Round, e.Title, league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes))
+                        BypassesSeasonTeamFilter(e))
                     .ToList()
                 : allLocalSeasonEvents;
 
@@ -783,7 +802,7 @@ public class LeagueEventSyncService
                 var outOfFilter = allLocalSeasonEvents
                     .Where(e => !orphanedIds.Contains(e.Id))
                     .Where(e => !MatchesTeamFilter(e) &&
-                        !SpecialEventClassifier.BypassesTeamFilter(e.Round, e.Title, league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes))
+                        !BypassesSeasonTeamFilter(e))
                     .ToList();
 
                 // SAFETY GUARD: a broken team-id mapping (the pre-short-id
@@ -862,6 +881,13 @@ public class LeagueEventSyncService
 
             // Save changes after each season (batch save)
             await _db.SaveChangesAsync();
+
+            // Forget the season we just saved. Every entity from every earlier
+            // season stayed tracked otherwise, so a thirty-season league held
+            // thousands of them and DetectChanges walked the whole set on each
+            // season's save, which made the sync slower the longer it ran.
+            _db.ChangeTracker.Clear();
+
             await FlushStreamAsync();
 
             var seasonEventsProcessed = (result.NewCount + result.UpdatedCount) - seasonStartCount;
@@ -970,8 +996,16 @@ public class LeagueEventSyncService
             }
         }
 
-        // Update league's last sync timestamp
-        league.LastUpdate = DateTime.UtcNow;
+        // Update league's last sync timestamp. The per-season tracker clear
+        // detached the league loaded at the top, so stamping that copy would
+        // save nothing and the auto sync would treat the league as forever
+        // stale and walk the whole schedule again on every pass.
+        var stampedLeague = await _db.Leagues.FirstOrDefaultAsync(l => l.Id == league.Id);
+        if (stampedLeague != null)
+        {
+            stampedLeague.LastUpdate = DateTime.UtcNow;
+            league.LastUpdate = stampedLeague.LastUpdate;
+        }
         await _db.SaveChangesAsync();
         await FlushStreamAsync();
 
@@ -1004,9 +1038,13 @@ public class LeagueEventSyncService
                             renumberedCount, seasonStr);
                     }
 
-                    // ALWAYS scan and rename files to ensure they match current naming format
-                    // This catches files that were imported with wrong episode numbers or old naming format
-                    var renamedCount = await _fileRenameService.RenameAllFilesInSeasonAsync(seasonLeagueId, seasonStr);
+                    // Rename only the files whose season or episode marker no
+                    // longer matches, so a renumbered season keeps its files
+                    // identifiable. A naming format change on its own is left
+                    // to a manual rename, as in the other arrs. This used to
+                    // enforce the whole format and rewrote every file in a
+                    // library the moment its owner edited the format.
+                    var renamedCount = await _fileRenameService.RenameAllFilesInSeasonAsync(seasonLeagueId, seasonStr, numberingOnly: true);
                     totalRenamed += renamedCount;
 
                     if (renamedCount > 0)
@@ -1285,7 +1323,7 @@ public class LeagueEventSyncService
         // 2) Migrate Team rows + the HomeTeamExternalId / AwayTeamExternalId
         //    columns on existing Event rows for this league. Teamless
         //    sports skip — no team rows to update.
-        if (LeagueSportRules.IsTeamlessSport(league.Sport, league.Name)) return;
+        if (LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat)) return;
 
         List<Team>? apiTeams;
         try
@@ -1448,6 +1486,21 @@ public class LeagueEventSyncService
             // when upstream surfaces a value the existing row was
             // missing (the most common case for legacy leagues added
             // before the new bindings landed).
+            // The name follows the source too. A competition can be renamed
+            // (V8 Supercars became Supercars in 2016) and the old name is then
+            // in no release, so a search built from it finds nothing. The
+            // league folder is built from this name, so the files already
+            // imported stay where they are and stay linked, and Library >
+            // rename moves them when the user wants that.
+            if (!string.IsNullOrEmpty(fullDetails.Name) &&
+                !string.Equals(fullDetails.Name, league.Name, StringComparison.Ordinal))
+            {
+                _logger.LogInformation(
+                    "[League Event Sync] {Old} is now called {New} upstream. Searches use the new name; files already imported keep their folder until a rename.",
+                    league.Name, fullDetails.Name);
+                league.Name = fullDetails.Name;
+            }
+            league.SportFormat = LeagueSportRules.NormalizeSportFormat(fullDetails.SportFormat) ?? league.SportFormat;
             if (!string.IsNullOrEmpty(fullDetails.AlternateName)) league.AlternateName = fullDetails.AlternateName;
             if (!string.IsNullOrEmpty(fullDetails.LogoUrl))       league.LogoUrl = fullDetails.LogoUrl;
             if (!string.IsNullOrEmpty(fullDetails.BannerUrl))     league.BannerUrl = fullDetails.BannerUrl;
@@ -1645,6 +1698,15 @@ public class LeagueEventSyncService
             // when leagues.broadcast_timezone changes). Flag the season for
             // renumber + rename so existing files pick up the new branding
             // calendar date in their filename.
+            // An equal wire-served date still upgrades provenance: a legacy
+            // UTC backfill that happened to match must not keep the
+            // exact-day matching rule disarmed forever.
+            if (apiEvent.BroadcastDate.HasValue && !apiEvent.BroadcastDateIsFallback
+                && !existingEvent.BroadcastDateVerified
+                && existingEvent.BroadcastDate == apiEvent.BroadcastDate)
+            {
+                existingEvent.BroadcastDateVerified = true;
+            }
             if (apiEvent.BroadcastDate.HasValue && existingEvent.BroadcastDate != apiEvent.BroadcastDate)
             {
                 _logger.LogInformation("[League Event Sync] Broadcast date changed for '{EventTitle}': {OldDate} → {NewDate}",
@@ -1652,6 +1714,7 @@ public class LeagueEventSyncService
                     existingEvent.BroadcastDate?.ToString("yyyy-MM-dd") ?? "null",
                     apiEvent.BroadcastDate.Value.ToString("yyyy-MM-dd"));
                 existingEvent.BroadcastDate = apiEvent.BroadcastDate;
+                existingEvent.BroadcastDateVerified = !apiEvent.BroadcastDateIsFallback;
                 dateChanged = true;
                 needsUpdate = true;
 
@@ -1700,6 +1763,11 @@ public class LeagueEventSyncService
             }
 
             // Round/Week
+            if (existingEvent.HasLaterSeasonFinal != apiEvent.HasLaterSeasonFinal)
+            {
+                existingEvent.HasLaterSeasonFinal = apiEvent.HasLaterSeasonFinal;
+                needsUpdate = true;
+            }
             if (existingEvent.Round != apiEvent.Round)
             {
                 existingEvent.Round = apiEvent.Round;
@@ -1829,13 +1897,13 @@ public class LeagueEventSyncService
             {
                 var isSpecial = SpecialEventClassifier.BypassesTeamFilter(
                     apiEvent.Round,
-                    LeagueSportRules.IsTeamlessSport(league.Sport, league.Name) ? null : apiEvent.Title,
+                    LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat) ? null : apiEvent.Title,
                     league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason,
-                    cupStageSizes);
+                    cupStageSizes, apiEvent.HasLaterSeasonFinal);
 
                 if (isSpecial
                     && ShouldMonitorEvent(league, apiEvent.EventDate, apiEvent.Season, currentSeason, latestSeasonWithData,
-                        apiEvent.Round, apiEvent.Title, cupStageSizes)
+                        apiEvent.Round, apiEvent.Title, cupStageSizes, apiEvent.HasLaterSeasonFinal)
                     && ShouldMonitorMotorsportSession(league.Sport, league.Name, apiEvent.Title, league.MonitoredSessionTypes)
                     && ShouldMonitorFightingEventType(league.Sport, league.Name, apiEvent.Title, league.MonitoredEventTypes))
                 {
@@ -1928,8 +1996,10 @@ public class LeagueEventSyncService
             EpisodeNumber = GetEpisodeNumberFromApiOrCalculate(
                 apiEpisodeMap, apiEvent.ExternalId, league.Id, apiEvent.Season, apiEvent.EventDate, apiEvent.Status),
             Round = apiEvent.Round,
+            HasLaterSeasonFinal = apiEvent.HasLaterSeasonFinal,
             EventDate = apiEvent.EventDate,
             BroadcastDate = apiEvent.BroadcastDate,
+            BroadcastDateVerified = apiEvent.BroadcastDate.HasValue && !apiEvent.BroadcastDateIsFallback,
             Venue = apiEvent.Venue,
             Location = apiEvent.Location,
             Broadcast = apiEvent.Broadcast,
@@ -1945,7 +2015,7 @@ public class LeagueEventSyncService
             Monitored = league.Monitored
                 && IsInsideTeamSelection(apiEvent, league, monitoredTeamIds, cupStageSizes)
                 && ShouldMonitorEvent(league, apiEvent.EventDate, apiEvent.Season, currentSeason, latestSeasonWithData,
-                    apiEvent.Round, apiEvent.Title, cupStageSizes)
+                    apiEvent.Round, apiEvent.Title, cupStageSizes, apiEvent.HasLaterSeasonFinal)
                 && ShouldMonitorMotorsportSession(league.Sport, league.Name, apiEvent.Title, league.MonitoredSessionTypes)
                 && ShouldMonitorFightingEventType(league.Sport, league.Name, apiEvent.Title, league.MonitoredEventTypes),
             // Session/event types the league maps to a specific quality profile
@@ -2034,14 +2104,14 @@ public class LeagueEventSyncService
 
         return matchesTeam || SpecialEventClassifier.BypassesTeamFilter(
             apiEvent.Round, apiEvent.Title,
-            league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes);
+            league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes, apiEvent.HasLaterSeasonFinal);
     }
 
     /// <summary>
     /// Determines if an event should be monitored based on the league's MonitorType setting
     /// </summary>
     internal static bool ShouldMonitorEvent(League league, DateTime eventDate, string? eventSeason, string currentSeason, string latestSeasonWithData,
-        string? round, string? title, IReadOnlySet<int> cupStageSizes)
+        string? round, string? title, IReadOnlySet<int> cupStageSizes, bool? hasLaterSeasonFinal = null)
     {
         var now = DateTime.UtcNow;
 
@@ -2053,9 +2123,9 @@ public class LeagueEventSyncService
 
         var isSpecial = SpecialEventClassifier.BypassesTeamFilter(
             round,
-            LeagueSportRules.IsTeamlessSport(league.Sport, league.Name) ? null : title,
+            LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat) ? null : title,
             league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason,
-            cupStageSizes);
+            cupStageSizes, hasLaterSeasonFinal);
 
         // Special events only. Which kinds is the toggles above, how far back
         // is the reach beside them, so this reads the same way as every other

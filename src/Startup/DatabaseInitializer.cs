@@ -2684,6 +2684,8 @@ public static class DatabaseInitializer
     private static void EnsureCriticalColumns(SportarrDbContext db)
     {
         EnsureColumn(db, "Events", "BroadcastDate", "TEXT NULL");
+        EnsureColumn(db, "Events", "BroadcastDateVerified", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(db, "Events", "HasLaterSeasonFinal", "INTEGER NULL");
         EnsureColumn(db, "EventFiles", "IndexerFlags", "TEXT");
         EnsureColumn(db, "EventFiles", "Languages", "TEXT NOT NULL DEFAULT '[]'");
         EnsureColumn(db, "EventFiles", "ReleaseGroup", "TEXT");
@@ -2697,6 +2699,7 @@ public static class DatabaseInitializer
         EnsureColumn(db, "IptvSources", "FfmpegInputArgs", "TEXT");
         EnsureColumn(db, "EpgSources", "Priority", "INTEGER NOT NULL DEFAULT 25");
         EnsureColumn(db, "EpgSources", "IptvSourceId", "INTEGER");
+        EnsureColumn(db, "Leagues", "SportFormat", "TEXT NULL");
         EnsureColumn(db, "Leagues", "RetentionDays", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn(db, "Leagues", "AllowHighlights", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn(db, "Leagues", "EnableDvr", "INTEGER NOT NULL DEFAULT 1");

@@ -78,6 +78,7 @@ http://localhost:1867/api
 | GET | `/api/queue` | Get download queue |
 | GET | `/api/queue/{id}` | Get queue item |
 | DELETE | `/api/queue/{id}` | Remove from queue |
+| POST | `/api/download/completed` | [Notify Sportarr that a tracked download finished](APPLICATION_API.md#download-completion-notifications) |
 
 ### Download Clients
 

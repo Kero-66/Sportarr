@@ -277,6 +277,7 @@ public class ChannelAutoMappingService
         // find every channel whose guide names the league's competition
         // or upcoming events, then seed those as candidates.
         var epgSeeds = await BuildEpgLeagueSeedsAsync(leagues);
+        var broadcastSeeds = await BuildBroadcastLeagueSeedsAsync(leagues, channels);
         _logger.LogDebug("[AutoMapping] EPG evidence seeds cover {Count} channels", epgSeeds.Count);
 
         var networksDetectedCount = 0;
@@ -293,7 +294,7 @@ public class ChannelAutoMappingService
                     networksDetectedCount++;
                 }
 
-                var mappingsCreated = await AutoMapChannelAsync(channel, leagueAltNames, leagues, epgSeeds);
+                var mappingsCreated = await AutoMapChannelAsync(channel, leagueAltNames, leagues, epgSeeds, broadcastSeeds);
                 result.ChannelsProcessed++;
                 result.MappingsCreated += mappingsCreated;
 
@@ -367,6 +368,74 @@ public class ChannelAutoMappingService
     // carry no meaning at all ("UK (MAX 013)", "US (Peacock 047)").
     private const int W_EPG_SEED_PER_HIT = 10;
     private const int W_EPG_SEED_CAP = 60;
+    private const int W_BROADCAST_FIRST_EVENT = 50;
+    private const int W_BROADCAST_EVENT_CAP = 65;
+
+    private record BroadcastObservation(string EventKey, int LeagueId, string Name);
+    private record BroadcastEvidence(int EventCount, string Names);
+
+    private async Task<Dictionary<int, Dictionary<int, BroadcastEvidence>>> BuildBroadcastLeagueSeedsAsync(
+        List<League> leagues, List<IptvChannel> channels)
+    {
+        var now = DateTime.UtcNow;
+        var windowStart = now.AddDays(-7);
+        var windowEnd = now.AddDays(14);
+        var leagueIds = leagues.Select(league => league.Id).ToList();
+        var events = await _db.Events.AsNoTracking()
+            .Where(evt => evt.LeagueId != null && leagueIds.Contains(evt.LeagueId.Value) &&
+                evt.EventDate >= windowStart && evt.EventDate <= windowEnd &&
+                evt.Broadcast != null && evt.Broadcast != "")
+            .Select(evt => new { evt.Id, evt.ExternalId, evt.LeagueId, evt.Broadcast })
+            .ToListAsync();
+
+        var byName = new Dictionary<string, List<BroadcastObservation>>(StringComparer.Ordinal);
+        foreach (var evt in events)
+        {
+            var eventKey = string.IsNullOrEmpty(evt.ExternalId) ? $"local:{evt.Id}" : evt.ExternalId;
+            foreach (var name in evt.Broadcast!.Split(new[] { '/', ',', ';', '|' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var key = NormalizeBroadcasterName(name);
+                if (key.Length == 0) continue;
+                if (!byName.TryGetValue(key, out var observations))
+                    byName[key] = observations = new List<BroadcastObservation>();
+                observations.Add(new BroadcastObservation(eventKey, evt.LeagueId!.Value, name.Trim()));
+            }
+        }
+
+        var seeds = new Dictionary<int, Dictionary<int, BroadcastEvidence>>();
+        foreach (var channel in channels)
+        {
+            var matches = new[] { channel.Name, channel.TvgName }
+                .Select(NormalizeBroadcasterName)
+                .Where(key => key.Length > 0)
+                .Distinct()
+                .Where(byName.ContainsKey)
+                .SelectMany(key => byName[key])
+                .GroupBy(observation => observation.LeagueId)
+                .ToDictionary(group => group.Key, group => new BroadcastEvidence(
+                    group.Select(observation => observation.EventKey).Distinct().Count(),
+                    string.Join(" / ", group.Select(observation => observation.Name).Distinct(StringComparer.OrdinalIgnoreCase))));
+            if (matches.Count > 0) seeds[channel.Id] = matches;
+        }
+        return seeds;
+    }
+
+    private static string NormalizeBroadcasterName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+        value = value.Trim().ToLowerInvariant();
+        value = Regex.Replace(value, @"^(?:\[(?:us|usa|uk|gb|ca|au|nz|ie|de|fr|es|it)\]|(?:us|usa|uk|gb|ca|au|nz|ie|de|fr|es|it)\s*[:|])\s*", "");
+        // Remove presentation labels without merging numbered or premium channels.
+        string previous;
+        do
+        {
+            previous = value;
+            value = Regex.Replace(value, @"(?:[\s|:_-]+|\[|\()(?:sd|hd|fhd|uhd|4k|720p|1080p|1080i|2160p|hevc|h264|h265|50fps|60fps)(?:\]|\))?\s*$", "").Trim();
+        } while (value != previous);
+        var key = Regex.Replace(value, @"[^\p{L}\p{Nd}+]+", "");
+        return key.Length < 3 || key is "sports" or "sport" or "live" or "channel" or "network" or "ppv" or "unknown" or "tba" or "tbd"
+            ? string.Empty : key;
+    }
 
     /// <summary>
     /// Auto-map a single channel to leagues using stacked signals.
@@ -460,7 +529,8 @@ public class ChannelAutoMappingService
 
     private async Task<int> AutoMapChannelAsync(IptvChannel channel, Dictionary<string, League> leaguesByName,
         IReadOnlyCollection<League> allLeagues,
-        Dictionary<string, Dictionary<int, int>>? epgSeeds = null)
+        Dictionary<string, Dictionary<int, int>>? epgSeeds = null,
+        Dictionary<int, Dictionary<int, BroadcastEvidence>>? broadcastSeeds = null)
     {
         // Manual mappings stay put. Collect their league_ids so we
         // skip them entirely below — even if the auto-mapper would
@@ -473,7 +543,7 @@ public class ChannelAutoMappingService
         // manual rows before the endpoint set IsManual would otherwise have
         // them deleted below as unjustifiable auto rows.
         var manualLeagueIds = existingMappings
-            .Where(m => m.IsManual || (m.MappingSignals == null && m.LastAutoMapped == null))
+            .Where(m => m.IsManual || m.Priority < 0 || (m.MappingSignals == null && m.LastAutoMapped == null))
             .Select(m => m.LeagueId)
             .ToHashSet();
 
@@ -498,6 +568,15 @@ public class ChannelAutoMappingService
         // be mapped by anything.
         var leaguesById = allLeagues.DistinctBy(l => l.Id).ToDictionary(l => l.Id);
         var leaguesList = leaguesById.Values.ToList();
+
+        if (broadcastSeeds != null && broadcastSeeds.TryGetValue(channel.Id, out var broadcastLeagues))
+        {
+            foreach (var (leagueId, evidence) in broadcastLeagues)
+            {
+                AddScore(leagueId, Math.Min(W_BROADCAST_EVENT_CAP, W_BROADCAST_FIRST_EVENT + (evidence.EventCount - 1) * 5),
+                    "event_broadcasts", $"{evidence.EventCount} recent or upcoming events list {evidence.Names}");
+            }
+        }
 
         // Signal 0 — EPG evidence seeds (league-side scan). Runs FIRST so
         // channels whose provider names carry no meaning ("UK (MAX 013)")

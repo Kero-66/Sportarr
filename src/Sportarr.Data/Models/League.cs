@@ -93,6 +93,9 @@ public class League
     [JsonPropertyName("strSport")]
     public required string Sport { get; set; }
 
+    [JsonPropertyName("strSportFormat")]
+    public string? SportFormat { get; set; }
+
     /// <summary>
     /// League country/region (e.g., "USA", "England", "International")
     /// </summary>
@@ -412,6 +415,7 @@ public class AddLeagueRequest
     public string? ExternalId { get; set; }
     public required string Name { get; set; }
     public required string Sport { get; set; }
+    public string? SportFormat { get; set; }
     public string? Country { get; set; }
     public string? Description { get; set; }
     public bool Monitored { get; set; } = true;
@@ -533,6 +537,7 @@ public class AddLeagueRequest
             ExternalId = ExternalId,
             Name = Name,
             Sport = Sport,
+            SportFormat = SportFormat,
             Country = Country,
             Description = Description,
             Monitored = Monitored,
@@ -575,6 +580,7 @@ public class LeagueResponse
     public string? ExternalId { get; set; }
     public string Name { get; set; } = string.Empty;
     public string Sport { get; set; } = string.Empty;
+    public string? SportFormat { get; set; }
     public string? Country { get; set; }
     public string? Description { get; set; }
     public bool Monitored { get; set; }
@@ -729,6 +735,7 @@ public class LeagueResponse
             ExternalId = league.ExternalId,
             Name = league.Name,
             Sport = league.Sport,
+            SportFormat = league.SportFormat,
             Country = league.Country,
             Description = league.Description,
             Monitored = league.Monitored,
@@ -780,6 +787,7 @@ public class SportarrLeagueDto
     public string IdLeague { get; set; } = string.Empty;
     public string StrLeague { get; set; } = string.Empty;
     public string StrSport { get; set; } = string.Empty;
+    public string? StrSportFormat { get; set; }
     public string? StrLeagueAlternate { get; set; }
     public string? IntFormedYear { get; set; }
     public string? StrCountry { get; set; }
@@ -797,6 +805,7 @@ public class SportarrLeagueDto
             IdLeague = league.ExternalId ?? "",
             StrLeague = league.Name,
             StrSport = league.Sport,
+            StrSportFormat = league.SportFormat,
             StrCountry = league.Country,
             StrDescriptionEN = league.Description,
             IntFormedYear = league.FormedYear,

@@ -181,13 +181,23 @@ public class Config
     public bool PreferIndexerFlags { get; set; } = true; // prefer releases with special indexer flags (Freeleech, Scene, etc.)
 
     /// <summary>
-    /// Minutes between full disk scan passes (DiskScanService). Default 60
-    /// (hourly). Widen this for slow network storage (NFS/SMB) with many
-    /// root folders, where a full library walk every hour is unnecessary
-    /// churn. A manual scan can still be triggered on demand regardless of
-    /// this interval.
+    /// Minutes between full disk scan passes (DiskScanService). Default 720
+    /// (twice a day). The file watcher reports changes as they happen; this
+    /// walk is the safety net behind it, and at an hourly default it kept
+    /// library drives awake around the clock. Lower it on network storage
+    /// (NFS/SMB) where change events from other machines never arrive. A
+    /// manual scan can still be triggered on demand regardless.
     /// </summary>
-    public int DiskScanIntervalMinutes { get; set; } = 60;
+    public int DiskScanIntervalMinutes { get; set; } = 720;
+
+    /// <summary>
+    /// One-time settings upgrades already applied to this config file. Kept
+    /// at zero by the initializer on purpose: XmlSerializer only overwrites
+    /// properties the file contains, so a config written before this field
+    /// existed reads back as level zero and receives the upgrades once. A
+    /// value the user changes after an upgrade is theirs and stays.
+    /// </summary>
+    public int SettingsUpgradeLevel { get; set; }
 
     /// <summary>
     /// RETIRED: event retention moved to League.RetentionDays (per-league).
@@ -300,10 +310,13 @@ public class Config
     public bool DvrEnableReconnect { get; set; } = true; // Enable stream reconnection on failures
     public int DvrMaxReconnectAttempts { get; set; } = 5; // Maximum reconnection attempts
     public int DvrReconnectDelaySeconds { get; set; } = 5; // Delay between reconnection attempts
+    public int DvrReadTimeoutSeconds { get; set; } = 0; // Seconds ffmpeg waits for stream data before giving up. 0 (the default) sets no ffmpeg-level timeout, the DVR watchdog's two-minute rule alone applies, which is the long-standing behavior
     public int StalledDownloadTimeoutMinutes { get; set; } = 60; // Fail, blocklist, and re-search torrents with no progress for this long (0 = never)
     public string DownloadPropersAndRepacks { get; set; } = "preferAndUpgrade"; // preferAndUpgrade | doNotUpgrade | doNotPrefer
     public bool DvrOvertimeGuardEnabled { get; set; } = true; // Keep recording past the scheduled end while livescore says the event is still in progress
     public int DvrOvertimeMaxExtensionMinutes { get; set; } = 120; // Ceiling on total overtime extension per recording (0 = disabled)
+    public bool DvrEarlyFinishGuardEnabled { get; set; } = false;
+    public int DvrEarlyFinishBufferMinutes { get; set; } = 5;
     public bool DvrReresolveChannelsEnabled { get; set; } = true; // Move a scheduled recording to a better channel when new EPG data arrives
     public int DvrReresolveLockMinutes { get; set; } = 45; // Stop changing the channel this many minutes before the recording starts
     public int DvrReresolveMinImprovement { get; set; } = 10; // Confidence points a rival channel must beat the current one by

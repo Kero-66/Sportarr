@@ -30,6 +30,10 @@ public class DvrSchedulerService : BackgroundService
             {
                 await ProcessScheduledRecordingsAsync(stoppingToken);
             }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[DVR Scheduler] Error processing scheduled recordings");
@@ -89,7 +93,7 @@ public class DvrSchedulerService : BackgroundService
         }
 
         // Stop recordings that are complete
-        var recordingsToStop = await dvrService.GetRecordingsToStopAsync();
+        var recordingsToStop = await dvrService.GetRecordingsToStopAsync(stoppingToken);
 
         foreach (var recording in recordingsToStop)
         {
@@ -99,8 +103,10 @@ public class DvrSchedulerService : BackgroundService
             // Overtime guard: if the linked event is still in progress per
             // the livescore feed, the recording's end has been pushed out -
             // don't stop it this tick.
-            if (await dvrService.ShouldExtendForOvertimeAsync(recording))
+            if (!await dvrService.IsReadyToStopAsync(recording, stoppingToken))
                 continue;
+
+            stoppingToken.ThrowIfCancellationRequested();
 
             _logger.LogInformation("[DVR Scheduler] Stopping completed recording {Id}: {Title}",
                 recording.Id, recording.Title);

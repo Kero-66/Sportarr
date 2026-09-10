@@ -658,6 +658,7 @@ public static class SonarrSeriesEndpoints
                 ExternalId = externalId,
                 Name = catalogLeague.Name,
                 Sport = catalogLeague.Sport ?? "Unknown",
+                SportFormat = catalogLeague.SportFormat,
                 Country = catalogLeague.Country,
                 Description = catalogLeague.Description,
                 Monitored = monitored,

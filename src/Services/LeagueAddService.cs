@@ -67,15 +67,17 @@ public class LeagueAddService
         {
             // Convert DTO to League entity
             league = request.ToLeague();
+            league.SportFormat = LeagueSportRules.NormalizeSportFormat(league.SportFormat);
 
             // Enrich league with full details (including images) if missing
             // The /all/leagues endpoint doesn't include images, so fetch from lookup
-            if (string.IsNullOrEmpty(league.LogoUrl) && !string.IsNullOrEmpty(league.ExternalId))
+            if ((string.IsNullOrEmpty(league.LogoUrl) || league.SportFormat == null) && !string.IsNullOrEmpty(league.ExternalId))
             {
                 _logger.LogInformation("[LEAGUES] Fetching full league details to get images for: {Name}", league.Name);
                 var fullDetails = await _sportsDbClient.LookupLeagueAsync(league.ExternalId);
                 if (fullDetails != null)
                 {
+                    league.SportFormat = LeagueSportRules.NormalizeSportFormat(fullDetails.SportFormat) ?? league.SportFormat;
                     league.LogoUrl = fullDetails.LogoUrl;
                     league.BannerUrl = fullDetails.BannerUrl;
                     league.PosterUrl = fullDetails.PosterUrl;
@@ -196,7 +198,7 @@ public class LeagueAddService
             // got stuck never syncing events (see the isTeamless check a
             // few lines below, which this mirrors instead of duplicating).
             if (request.MonitoredTeamIds != null && request.MonitoredTeamIds.Any()
-                && !LeagueSportRules.IsTeamlessSport(league.Sport, league.Name))
+                && !LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat))
             {
                 _logger.LogInformation("[LEAGUES] Processing {Count} monitored teams for league: {Name}",
                     request.MonitoredTeamIds.Count, league.Name);
@@ -251,7 +253,7 @@ public class LeagueAddService
                 // Teamless sports (motorsport, golf, darts, climbing, gambling,
                 // badminton, table tennis, snooker, individual tennis, fighting)
                 // auto-monitor without team selection.
-                var isTeamless = LeagueSportRules.IsTeamlessSport(league.Sport, league.Name);
+                var isTeamless = LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat);
                 var isGolf = league.Sport.Equals("Golf", StringComparison.OrdinalIgnoreCase);
                 var isIndividualTennis = Sportarr.Api.Helpers.TennisLeagueHelper.IsIndividualTennisLeague(league.Sport, league.Name);
                 var isFightingSport = EventPartDetector.IsFightingSport(league.Sport);
@@ -352,7 +354,7 @@ public class LeagueAddService
                 // and choose teams it has no picker for.
                 var teamsMissing = false;
                 if (request?.MonitoredTeamIds is { Count: > 0 }
-                    && !LeagueSportRules.IsTeamlessSport(league.Sport, league.Name))
+                    && !LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat))
                 {
                     try
                     {

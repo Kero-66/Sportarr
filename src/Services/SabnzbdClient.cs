@@ -973,6 +973,13 @@ public class SabnzbdClient
                 {
                     var failMessage = historyItem.fail_message?.ToLowerInvariant() ?? "";
 
+                    // SABnzbd always sends fail_message and sends it empty when it
+                    // has no detail. The property is never null, so treat an empty
+                    // message as absent. The fallback text below can then apply.
+                    var reportedFailure = string.IsNullOrWhiteSpace(historyItem.fail_message)
+                        ? null
+                        : historyItem.fail_message;
+
                     var isRepairFailure =
                         failMessage.Contains("repair") ||
                         failMessage.Contains("par2") ||
@@ -1022,14 +1029,14 @@ public class SabnzbdClient
                         _logger.LogError("[SABnzbd] Download {NzoId} REPAIR FAILED: {FailMessage}. Files are incomplete/corrupted - NOT importing.",
                             nzoId, historyItem.fail_message);
                         status = "failed";
-                        errorMessage = historyItem.fail_message ?? "Repair failed - files are incomplete";
+                        errorMessage = reportedFailure ?? "Repair failed - files are incomplete";
                     }
                     else if (isUnpackOrMoveFailure)
                     {
                         _logger.LogError("[SABnzbd] Download {NzoId} UNPACK/MOVE FAILED: {FailMessage}. Destination folder is empty - NOT importing.",
                             nzoId, historyItem.fail_message);
                         status = "failed";
-                        errorMessage = historyItem.fail_message ?? "Unpack failed - no files to import";
+                        errorMessage = reportedFailure ?? "Unpack failed - no files to import";
                     }
                     else if (isPostProcessingScriptFailure)
                     {
@@ -1039,14 +1046,14 @@ public class SabnzbdClient
                         _logger.LogWarning("[SABnzbd] Download {NzoId} completed but post-processing script failed: {FailMessage}. Will attempt import anyway.",
                             nzoId, historyItem.fail_message);
                         status = "completed";
-                        errorMessage = $"Post-processing warning: {historyItem.fail_message}";
+                        errorMessage = $"Post-processing warning: {reportedFailure ?? "script failed"}";
                     }
                     else
                     {
                         // Other download failures (network, missing files on server, etc.)
                         _logger.LogError("[SABnzbd] Download {NzoId} failed: {FailMessage}", nzoId, historyItem.fail_message);
                         status = "failed";
-                        errorMessage = historyItem.fail_message ?? "Download failed";
+                        errorMessage = reportedFailure ?? "Download failed";
                     }
                 }
 
@@ -1114,70 +1121,54 @@ public class SabnzbdClient
     {
         try
         {
-            // SABnzbd splits storage between an active queue and a completed-history
-            // store. A download moves out of the queue into history when it finishes,
-            // and the two delete endpoints (?mode=queue&name=delete and ?mode=history
-            // &name=delete) operate independently. The previous implementation called
-            // queue-delete first and short-circuited the history call as soon as the
-            // HTTP request returned a non-null body — but SABnzbd's queue-delete
-            // returns {"status":true,"nzo_ids":[]} even when the nzo_id isn't in the
-            // queue, which the early code read as success. Result: a completed
-            // download sitting in history was never actually removed, the detector
-            // re-found it on the next 30-second poll, and the user got stuck in a
-            // re-add loop.
-            //
-            // The fix: parse the response body, check whether the requested nzo_id
-            // is in the returned nzo_ids list, and ALWAYS try both endpoints. Both
-            // are idempotent on their own (SABnzbd reports success with an empty
-            // list when the id isn't there), so calling both costs at most one
-            // extra HTTP roundtrip and guarantees the entry is gone regardless of
-            // which store it lives in.
-            // Both delete URLs need output=json so SABnzbd returns
-            // {"status":true,"nzo_ids":[...]}; without it SAB defaults
-            // to text/plain "ok\n" or HTML, JsonDocument.Parse throws
-            // in DeletionTouched, the catch silently returns false,
-            // and this method warns "neither queue nor history
-            // acknowledged" even when the deletion succeeded.
-            var deletedFromAnything = false;
-            var mode = deleteFiles ? "delete" : "remove";
+            var queue = await GetQueueByNzoIdsAsync(config, nzoId);
+            if (queue == null)
+                return false;
+
+            var wasQueued = queue.Any(item => string.Equals(item.nzo_id, nzoId, StringComparison.OrdinalIgnoreCase));
+            if (!deleteFiles && config.Type == DownloadClientType.DecypharrUsenet)
+            {
+                if (!wasQueued)
+                {
+                    var existingHistory = await GetHistoryByNzoIdAsync(config, nzoId);
+                    if (existingHistory == null)
+                        return false;
+                    if (!existingHistory.Any(item => string.Equals(item.nzo_id, nzoId, StringComparison.OrdinalIgnoreCase)))
+                        return true;
+                }
+
+                // This client deletes files even when the request omits del_files.
+                _logger.LogWarning("[SABnzbd] {Client} cannot remove download {NzoId} while keeping its files; leaving the download in the client",
+                    config.Name, nzoId);
+                return false;
+            }
+
+            var queueRemoved = false;
             var delFilesParam = deleteFiles ? "&del_files=1" : "";
-
-            var queueResponse = await SendApiRequestAsync(config, $"?mode=queue&name={mode}&value={nzoId}{delFilesParam}&output=json");
-            if (DeletionTouched(queueResponse, nzoId))
+            if (wasQueued)
             {
-                _logger.LogInformation("[SABnzbd] Removed {NzoId} from queue", nzoId);
-                deletedFromAnything = true;
-            }
-            else
-            {
-                _logger.LogDebug("[SABnzbd] Queue delete reported no change for {NzoId} (likely already in history). Raw response: {Response}",
-                    nzoId, TruncateForLog(queueResponse));
+                var queueResponse = await SendApiRequestAsync(config,
+                    $"?mode=queue&name=delete&value={nzoId}{delFilesParam}&output=json");
+                queueRemoved = DeletionTouched(queueResponse, nzoId);
             }
 
-            var historyDelFilesParam = deleteFiles ? "&del_files=1" : "";
-            var historyResponse = await SendApiRequestAsync(config, $"?mode=history&name=delete&value={nzoId}{historyDelFilesParam}&output=json");
-            if (DeletionTouched(historyResponse, nzoId))
-            {
-                _logger.LogInformation("[SABnzbd] Removed {NzoId} from history", nzoId);
-                deletedFromAnything = true;
-            }
-            else
-            {
-                _logger.LogDebug("[SABnzbd] History delete reported no change for {NzoId}. Raw response: {Response}",
+            // Queue removal or completion can move the job into history.
+            var history = await GetHistoryByNzoIdAsync(config, nzoId);
+            if (history == null)
+                return false;
+
+            var inHistory = history.Any(item => string.Equals(item.nzo_id, nzoId, StringComparison.OrdinalIgnoreCase));
+            if (!inHistory)
+                return queueRemoved || !wasQueued;
+
+            // A queue acknowledgement cannot confirm removal from history.
+            var historyResponse = await SendApiRequestAsync(config,
+                $"?mode=history&name=delete&value={nzoId}{delFilesParam}&output=json");
+            var removed = DeletionTouched(historyResponse, nzoId);
+            if (!removed)
+                _logger.LogWarning("[SABnzbd] History removal was not confirmed for {NzoId}: {Response}",
                     nzoId, TruncateForLog(historyResponse));
-            }
-
-            if (!deletedFromAnything)
-            {
-                // Log the raw bodies when the warning fires - this is
-                // the only diagnostic we'll have if SAB returns
-                // something unexpected. Capped at 500 chars per body.
-                _logger.LogWarning(
-                    "[SABnzbd] Neither queue nor history acknowledged deletion of {NzoId} - already gone, or SAB returned an unexpected shape. queue={Queue} history={History}",
-                    nzoId, TruncateForLog(queueResponse), TruncateForLog(historyResponse));
-            }
-
-            return deletedFromAnything;
+            return removed;
         }
         catch (Exception ex)
         {
@@ -1186,13 +1177,6 @@ public class SabnzbdClient
         }
     }
 
-    /// <summary>
-    /// SABnzbd's delete endpoints return {"status":true,"nzo_ids":[…]} where
-    /// the array contains the nzo_ids that were actually affected. An empty
-    /// array means SABnzbd accepted the request but didn't have anything
-    /// matching to remove. Returns true only when the requested id appears
-    /// in the returned list.
-    /// </summary>
     /// <summary>
     /// Truncate a response body for log output. Keeps the head of
     /// any unexpected response (HTML error page, plain "ok", whatever
@@ -1216,26 +1200,10 @@ public class SabnzbdClient
             var root = doc.RootElement;
             if (!root.TryGetProperty("status", out var statusProp) || !statusProp.GetBoolean()) return false;
 
-            // SABnzbd's history-delete reliably returns status:true on
-            // success but the shape of nzo_ids varies by version: some
-            // versions return ["nzo_id"], some return [], and some
-            // omit the field entirely. Previously we required the id
-            // to appear in the array, which rejected legitimate
-            // single-id history-delete successes from any SAB build
-            // that omits/empties the array (warning fired after every
-            // import despite SAB having actually performed the
-            // delete). Treat status:true as authoritative success;
-            // when nzo_ids IS present we still verify the id appears
-            // in it so a delete that affected something else doesn't
-            // get counted.
+            // Some compatible clients omit affected IDs. Callers first verify membership.
             if (!root.TryGetProperty("nzo_ids", out var idsProp) || idsProp.ValueKind != JsonValueKind.Array)
                 return true;
 
-            // Empty array on a status:true response means SAB accepted
-            // the request and either removed nothing or simply didn't
-            // echo the list. Trust status:true here too - the
-            // alternative is the spurious-warning regression noted
-            // above.
             var any = false;
             foreach (var idElement in idsProp.EnumerateArray())
             {

@@ -114,6 +114,7 @@ public class TvScheduleSyncService : BackgroundService
         _logger.LogInformation("[TV Schedule] Syncing TV schedules for {Count} upcoming events", upcomingEvents.Count);
 
         int updatedCount = 0;
+        var eventsWithListings = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var evt in upcomingEvents)
         {
@@ -123,15 +124,16 @@ public class TvScheduleSyncService : BackgroundService
             try
             {
                 // Fetch TV schedule using event's ExternalId from Sportarr API
-                var tvSchedule = await theSportsDbClient.GetEventTVScheduleAsync(evt.ExternalId!);
+                var tvSchedules = await theSportsDbClient.GetEventTVScheduleAsync(evt.ExternalId!);
 
                 // Reset consecutive errors on success
                 _consecutiveErrors = 0;
 
-                if (tvSchedule != null)
+                if (tvSchedules != null)
                 {
-                    // Build broadcast string from TV schedule
-                    var broadcast = BuildBroadcastString(tvSchedule);
+                    var broadcast = BuildBroadcastString(tvSchedules);
+                    if (!string.IsNullOrEmpty(broadcast))
+                        eventsWithListings.Add(evt.ExternalId!);
 
                     if (!string.IsNullOrEmpty(broadcast) && evt.Broadcast != broadcast)
                     {
@@ -185,7 +187,7 @@ public class TvScheduleSyncService : BackgroundService
         // Also sync daily TV schedules by sport for next 7 days (if not rate limited)
         if (!_isRateLimited)
         {
-            await SyncDailyTVSchedulesAsync(db, theSportsDbClient, cancellationToken);
+            await SyncDailyTVSchedulesAsync(db, theSportsDbClient, eventsWithListings, cancellationToken);
         }
     }
 
@@ -194,11 +196,13 @@ public class TvScheduleSyncService : BackgroundService
     /// OPTIMIZED: Only makes ONE API call per day instead of one per sport
     /// (The TV schedule endpoint returns ALL sports, sport filtering happens in application)
     /// </summary>
-    private async Task SyncDailyTVSchedulesAsync(SportarrDbContext db, SportarrApiClient client, CancellationToken cancellationToken)
+    private async Task SyncDailyTVSchedulesAsync(SportarrDbContext db, SportarrApiClient client,
+        HashSet<string> eventsWithListings, CancellationToken cancellationToken)
     {
         _logger.LogInformation("[TV Schedule] Syncing daily TV schedules...");
 
         int updatedCount = 0;
+        var schedules = new List<TVSchedule>();
 
         // Check next 7 days of TV schedules - ONE request per day (not per sport!)
         for (int dayOffset = 0; dayOffset < 7; dayOffset++)
@@ -222,40 +226,8 @@ public class TvScheduleSyncService : BackgroundService
                     _logger.LogDebug("[TV Schedule] Found {Count} TV schedules for {Date}",
                         tvSchedules.Count, dateStr);
 
-                    // Match TV schedules to existing monitored events. Batch-load every
-                    // candidate event for this day in one query instead of a per-item
-                    // lookup (previously one round trip per schedule entry, repeated for
-                    // each of the 7 days checked).
-                    var scheduleExternalIds = tvSchedules
-                        .Select(s => s.EventId)
-                        .Where(id => !string.IsNullOrEmpty(id))
-                        .Distinct()
-                        .ToList();
-                    // GroupBy tolerates a duplicate ExternalId across events (the column has
-                    // no unique constraint) by keeping one match per id, same as the old
-                    // FirstOrDefaultAsync per-item lookup it replaces.
-                    var eventsByExternalId = (await db.Events
-                        .Where(e => scheduleExternalIds.Contains(e.ExternalId) && e.Monitored)
-                        .ToListAsync(cancellationToken))
-                        .GroupBy(e => e.ExternalId!)
-                        .ToDictionary(g => g.Key, g => g.First());
-
-                    foreach (var schedule in tvSchedules)
-                    {
-                        if (string.IsNullOrEmpty(schedule.EventId))
-                            continue;
-
-                        if (eventsByExternalId.TryGetValue(schedule.EventId, out var matchingEvent))
-                        {
-                            var broadcast = BuildBroadcastString(schedule);
-                            if (!string.IsNullOrEmpty(broadcast) && matchingEvent.Broadcast != broadcast)
-                            {
-                                matchingEvent.Broadcast = broadcast;
-                                matchingEvent.LastUpdate = DateTime.UtcNow;
-                                updatedCount++;
-                            }
-                        }
-                    }
+                    schedules.AddRange(tvSchedules.Where(schedule => schedule != null &&
+                        !string.IsNullOrEmpty(schedule.EventId) && !eventsWithListings.Contains(schedule.EventId)));
                 }
             }
             catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
@@ -282,6 +254,28 @@ public class TvScheduleSyncService : BackgroundService
             await Task.Delay(500, cancellationToken);
         }
 
+        var schedulesByEvent = schedules.GroupBy(schedule => schedule.EventId!).ToList();
+        var eventIds = schedulesByEvent.Select(group => group.Key).ToList();
+        var eventsByExternalId = (await db.Events
+            .Where(evt => eventIds.Contains(evt.ExternalId!) && evt.Monitored)
+            .ToListAsync(cancellationToken))
+            .GroupBy(evt => evt.ExternalId!)
+            .ToDictionary(group => group.Key, group => group.First());
+
+        foreach (var eventSchedules in schedulesByEvent)
+        {
+            if (!eventsByExternalId.TryGetValue(eventSchedules.Key, out var matchingEvent))
+                continue;
+
+            var broadcast = BuildBroadcastString(eventSchedules);
+            if (!string.IsNullOrEmpty(broadcast) && matchingEvent.Broadcast != broadcast)
+            {
+                matchingEvent.Broadcast = broadcast;
+                matchingEvent.LastUpdate = DateTime.UtcNow;
+                updatedCount++;
+            }
+        }
+
         if (updatedCount > 0)
         {
             await db.SaveChangesAsync(cancellationToken);
@@ -292,19 +286,12 @@ public class TvScheduleSyncService : BackgroundService
     /// <summary>
     /// Build broadcast string from TV schedule
     /// </summary>
-    private string BuildBroadcastString(TVSchedule schedule)
+    private static string BuildBroadcastString(IEnumerable<TVSchedule> schedules)
     {
-        var parts = new List<string>();
-
-        if (!string.IsNullOrEmpty(schedule.Network))
-            parts.Add(schedule.Network);
-
-        if (!string.IsNullOrEmpty(schedule.Channel))
-            parts.Add(schedule.Channel);
-
-        if (!string.IsNullOrEmpty(schedule.StreamingService))
-            parts.Add(schedule.StreamingService);
-
-        return parts.Any() ? string.Join(" / ", parts) : string.Empty;
+        return string.Join(" / ", schedules
+            .SelectMany(schedule => new[] { schedule.Network, schedule.Channel, schedule.StreamingService })
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase));
     }
 }

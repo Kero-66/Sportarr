@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeftIcon, ChevronRightIcon, TvIcon, FunnelIcon, CalendarDaysIcon, XCircleIcon, LinkIcon, ClipboardDocumentIcon, ClipboardDocumentCheckIcon, EyeSlashIcon } from '@heroicons/react/24/outline';
+import { isTerminalStatus } from '../utils/eventStatus';
+import { ChevronLeftIcon, ChevronRightIcon, TvIcon, CalendarDaysIcon, XCircleIcon, LinkIcon, ClipboardDocumentIcon, ClipboardDocumentCheckIcon, EyeSlashIcon } from '@heroicons/react/24/outline';
 import { CheckCircleIcon, EyeIcon as EyeSolidIcon } from '@heroicons/react/24/solid';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -37,7 +38,7 @@ interface CalendarUISettings {
   firstDayOfWeek?: string;
 }
 
-const TOOLBAR_GROUP_CLASS = 'inline-flex min-w-max items-center space-x-1 rounded-lg bg-gray-900 p-1';
+const TOOLBAR_GROUP_CLASS = 'inline-flex flex-wrap items-center gap-1 rounded-lg bg-gray-900 p-1 sm:min-w-max sm:flex-nowrap sm:space-x-1 sm:gap-0';
 
 // Sport color mappings.
 // Reserved colors (do not assign to sports):
@@ -158,10 +159,7 @@ const isEventLive = (event: Event, timezone: string | null): boolean => {
   // already recognises "Match Finished", "Canceled", "AET" and case
   // variants, and comparing raw literals here kept the live pulse on for
   // events that page already showed as over.
-  const terminal = (event.status || '').toUpperCase();
-  if (terminal === 'COMPLETED' || terminal === 'FT' || terminal === 'AET' ||
-      terminal === 'MATCH FINISHED' || terminal === 'CANCELLED' ||
-      terminal === 'CANCELED' || terminal === 'POSTPONED') {
+  if (isTerminalStatus(event.status)) {
     return false;
   }
 
@@ -752,8 +750,13 @@ export default function CalendarPage() {
               <h1 className="text-2xl font-bold text-white md:text-3xl">Calendar</h1>
             </div>
 
-            <div className="overflow-x-auto xl:max-w-[calc(100%-16rem)]">
-              <div className="flex sm:min-w-max flex-wrap items-center justify-start gap-2 xl:justify-end">
+            {/* The controls wrap onto a second line when the window is too
+                narrow for one. They used to sit on a single line inside a
+                scrolling strip, so on anything under about 1900px the filters
+                and the iCal link were off the right edge with nothing to say
+                they were there. */}
+            <div className="xl:max-w-[calc(100%-16rem)]">
+              <div className="flex flex-wrap items-center justify-start gap-2 xl:justify-end">
                 {/* Calendar Navigation */}
                 <div className={TOOLBAR_GROUP_CLASS}>
                   {/* Today Button */}
@@ -779,7 +782,7 @@ export default function CalendarPage() {
                   </button>
 
                   {/* Fixed width container for date range */}
-                  <div className="min-w-[170px] rounded-md bg-gray-800 px-3 py-1.5 text-center md:min-w-[230px]">
+                  <div className="min-w-[150px] rounded-md bg-gray-800 px-2.5 py-1.5 text-center md:min-w-[195px]">
                     <p data-testid="calendar-current-month-label" className="truncate text-sm font-semibold text-white">
                       {headerLabel}
                     </p>
@@ -835,16 +838,6 @@ export default function CalendarPage() {
 
                 {/* Filters */}
                 <div className={TOOLBAR_GROUP_CLASS}>
-                  <div className="inline-flex items-center gap-2 rounded-md bg-gray-800 px-3 py-1.5 text-sm text-gray-400">
-                    <FunnelIcon className="h-4 w-4" />
-                    <span>Filter</span>
-                    {(filterSport !== 'all' || filterTvOnly || showUnmonitored) && (
-                      <span className="rounded-full bg-red-600 px-1.5 py-0.5 text-xs text-white">
-                        {(filterSport !== 'all' ? 1 : 0) + (filterTvOnly ? 1 : 0) + (showUnmonitored ? 1 : 0)}
-                      </span>
-                    )}
-                  </div>
-
                   {/* Monitoring Filter */}
                   <select
                     value={showUnmonitored ? 'all' : 'monitored'}
@@ -896,10 +889,9 @@ export default function CalendarPage() {
                       Clear
                     </button>
                   )}
-                </div>
 
-                {/* iCal Feed Link */}
-                <div className={TOOLBAR_GROUP_CLASS}>
+                  {/* Sits with the filters so it never wraps onto a line of
+                      its own. */}
                   <button
                     onClick={() => { setShowIcalModal(true); setIcalCopied(false); }}
                     className={`${TOOLBAR_BUTTON_BASE_CLASS} ${TOOLBAR_BUTTON_INACTIVE_CLASS} flex items-center gap-1.5`}
@@ -938,7 +930,17 @@ export default function CalendarPage() {
           <div className="overflow-x-auto md:flex-1 md:min-h-0">
             {/* Phones fit all 7 columns (Google-style dot cells); sm+ keeps the
                 wide grid with full event chips. */}
-            <table className="w-full sm:min-w-[900px] table-fixed border-collapse md:h-full" data-testid="calendar-table">
+            {/* The month grid is as tall as its weeks, never stretched to
+                the page. A full-height CSS table hands its leftover height to
+                rows in proportion to what they already hold, so the busiest
+                week grew by far the most and carried a block of empty space
+                under its events. Each cell keeps its 132px, which a table
+                treats as a minimum, so a quiet week still looks like a
+                calendar. The week view is one row and still fills the page. */}
+            <table
+              className={`w-full sm:min-w-[600px] md:min-w-[700px] xl:min-w-[900px] table-fixed border-collapse ${currentView === 'week' ? 'md:h-full' : ''}`}
+              data-testid="calendar-table"
+            >
               <thead>
                 <tr>
                   {weekdayNames.map(dayName => (
@@ -960,7 +962,7 @@ export default function CalendarPage() {
                         <td
                           key={day.date.toISOString()}
                           data-testid={`calendar-day-${formatDateInputValue(day.date)}`}
-                          className={`relative h-14 sm:h-[132px] md:h-auto align-top border-b border-r border-gray-700/35 ${currentDayIsToday ? "bg-amber-500/5 ring-1 ring-inset ring-amber-500" : ""}`}
+                          className={`relative h-14 sm:h-[132px] ${currentView === 'week' ? 'md:h-auto' : ''} align-top border-b border-r border-gray-700/35 ${currentDayIsToday ? "bg-amber-500/5 ring-1 ring-inset ring-amber-500" : ""}`}
                         >
                           {currentDayIsToday && (
                             <div className="absolute left-0 top-0 bg-amber-500 px-1.5 py-0.5 text-xs font-bold leading-tight text-black">

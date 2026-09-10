@@ -24,9 +24,47 @@ Each download client has a **Post-Import Mode** controlling how files reach your
 
 If you manage seeding manually and never want Sportarr to move files out of your download folder, set the client's Post-Import Mode to **Hardlink**.
 
+With **Remove Completed Downloads** enabled on a client, a move import finishes by removing the job from the client and deleting the job's leftover folder, including nfo, sample, and archive leftovers, so nothing of the release stays behind in the download directory. With the setting off, Sportarr leaves the client's jobs and folders completely alone.
+
+### A file for an event that already has one
+
+Sportarr keeps one file per event, or per part of an event. Every way a file can arrive is judged by the same rule. A lower quality never replaces the file you have. The same quality replaces it unless it is an older revision while propers and repacks are preferred, or its custom format score is lower. A higher quality always replaces it.
+
+A copy that is equal to the file an event already holds is not swapped in. It is listed in Activity with the reason, so you decide whether to import it, ignore it or remove it.
+
+A completed download that fails the rule stays in the queue with the reason and an **Import Anyway** button. A file that appears in a league folder and fails the rule is left where it is and listed in Activity with the reason. **Library Import** also lists it and imports whatever you select. The Remove button on such a row deletes the file too, to the recycle bin when one is set, unless you untick that in the remove dialog. Ignore keeps the file and only stops the scans listing it. When a copy that already sits beside the file it replaces takes over, the replaced file stays on disk untracked. A copy from anywhere else replaces it through the recycle bin.
+
 ## Per-indexer client assignment
 
 Under an indexer's advanced settings you can pin a specific download client, so grabs from that indexer always go to that client regardless of priority order. Useful when one tracker should hit a dedicated seedbox client.
+
+## Completion notifications
+
+A client or integration can call `POST /api/download/completed` with its job ID
+to wake the download monitor after a job finishes. This avoids waiting for the
+next regular poll. See the [API contract and example](../APPLICATION_API.md#download-completion-notifications)
+for authentication, optional client IDs, and responses.
+
+The monitor still checks the client's status and follows your import settings.
+Repeated callbacks combine into one pending check, with at least five seconds
+between checks. Normal polling remains active. Unknown and already imported
+jobs return successfully without requesting another check.
+
+## Background scanning and drive activity
+
+Sportarr finds file changes two ways. A filesystem watcher reports changes the moment they happen, and a full disk scan walks every root folder as the safety net behind it. **Disk Scan Interval** under **Settings > Download Clients** controls that walk. The default is 720 minutes, twice a day.
+
+The walk reads every directory of every root folder and checks every tracked file, which wakes every drive holding library content. At the old hourly default, drives never sat idle long enough to reach their spin-down timers. At twice a day they rest between passes.
+
+Nothing you download waits for the scan:
+
+- Downloads import through the download client's own queue. The default poll interval is 30 seconds, configurable with a five-second minimum. Completion notifications can wake the monitor sooner
+- Blackhole grabs are tracked per queue item on that same poll
+- Files the watcher sees become pending imports immediately
+
+**When to lower it:** root folders on network shares (NFS/SMB). Change events made by other machines never reach the watcher there, so the scan is what finds files you drop in by hand. On local storage the watcher covers that instantly and there is no reason to scan more often.
+
+A manual scan from **System > Tasks** picks up changes immediately regardless of the interval. Between scans an idle Sportarr writes nothing to disk, and recurring health checks only read, so a resting drive stays resting.
 
 ## Remote path mappings
 

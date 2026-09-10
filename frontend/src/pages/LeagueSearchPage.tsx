@@ -12,7 +12,7 @@ import AddLeagueModal from '../components/AddLeagueModal';
 import ConfirmationModal from '../components/ConfirmationModal';
 import { apiGet, apiPost, apiPut, apiDelete } from '../utils/api';
 import { PAGE_PADDING, TABLE_ROW_HOVER } from '../utils/designTokens';
-import { isMotorsport, isGolf, isIndividualTennis, isTeamlessSport, usesFightingEventTypes } from '../utils/leagueSportRules';
+import { isMotorsport, isTeamlessSport, usesFightingEventTypes } from '../utils/leagueSportRules';
 import { getSportIcon } from '../utils/sportIcons';
 import { BUTTON_PRIMARY, BUTTON_INFO, BUTTON_SECONDARY } from '../utils/designTokens';
 
@@ -21,6 +21,7 @@ interface League {
   idLeague: string;
   strLeague: string;
   strSport: string;
+  strSportFormat?: string | null;
   strLeagueAlternate?: string;
   intFormedYear?: string;
   strCountry?: string;
@@ -239,7 +240,7 @@ export default function LeagueSearchPage() {
       // tennis, badminton, table tennis, snooker) and fighting leagues that
       // monitor by event type (UFC, WWE, ONE) auto-monitor on add. Everything
       // else requires at least one selected team.
-      const monitored = isTeamlessSport(league.strSport, league.strLeague) ||
+      const monitored = isTeamlessSport(league.strSport, league.strLeague, league.strSportFormat) ||
         usesFightingEventTypes(league.strSport, league.strLeague) ||
         monitoredTeamIds.length > 0;
 
@@ -247,6 +248,7 @@ export default function LeagueSearchPage() {
         externalId: league.idLeague,
         name: league.strLeague,
         sport: league.strSport,
+        sportFormat: league.strSportFormat,
         country: league.strCountry,
         description: league.strDescriptionEN,
         monitored: monitored,
@@ -285,8 +287,8 @@ export default function LeagueSearchPage() {
     },
     onSuccess: (data, variables) => {
       const isMotorsportLeague = isMotorsport(variables.league.strSport);
-      const isGolfLeague = isGolf(variables.league.strSport);
-      const isIndividualTennisLeague = isIndividualTennis(variables.league.strSport, variables.league.strLeague);
+      const teamless = isTeamlessSport(variables.league.strSport, variables.league.strLeague, variables.league.strSportFormat)
+        || usesFightingEventTypes(variables.league.strSport, variables.league.strLeague);
       let message: string;
 
       if (isMotorsportLeague) {
@@ -294,7 +296,7 @@ export default function LeagueSearchPage() {
         message = sessionCount > 0
           ? `Added ${variables.league.strLeague} with ${sessionCount} monitored session type${sessionCount !== 1 ? 's' : ''}!`
           : `Added ${variables.league.strLeague} (all session types monitored)`;
-      } else if (isGolfLeague || isIndividualTennisLeague) {
+      } else if (teamless) {
         message = `Added ${variables.league.strLeague} (all events monitored)`;
       } else {
         const teamCount = variables.monitoredTeamIds.length;
@@ -342,6 +344,7 @@ export default function LeagueSearchPage() {
       searchQueryTemplate,
       tags,
       sport,
+      sportFormat,
       leagueName,
       monitorFinals,
       specialEventsMonitorType,
@@ -366,6 +369,7 @@ export default function LeagueSearchPage() {
       searchQueryTemplate?: string | null;
       tags?: number[];
       sport: string;
+      sportFormat?: string | null;
       leagueName: string;
       monitorFinals?: boolean;
       specialEventsMonitorType?: string;
@@ -378,12 +382,8 @@ export default function LeagueSearchPage() {
       enableDvr?: boolean;
     }) => {
       // Teamless sports auto-monitor; other sports require at least one selected team.
-      const isMotorsportLeague = isMotorsport(sport);
-      const isGolfLeague = isGolf(sport);
-      const isIndividualTennisLeague = isIndividualTennis(sport, leagueName);
-      const monitored = isTeamlessSport(sport, leagueName) ||
-        usesFightingEventTypes(sport, leagueName) ||
-        monitoredTeamIds.length > 0;
+      const teamless = isTeamlessSport(sport, leagueName, sportFormat) || usesFightingEventTypes(sport, leagueName);
+      const monitored = teamless || monitoredTeamIds.length > 0;
 
       // First update the league settings
       const settingsResponse = await apiPut(`/api/leagues/${leagueId}`, {
@@ -413,7 +413,7 @@ export default function LeagueSearchPage() {
       }
 
       // Then update the monitored teams (only for sports that use team selection)
-      if (!isMotorsportLeague && !isGolfLeague && !isIndividualTennisLeague) {
+      if (!teamless) {
         const teamsResponse = await apiPut(`/api/leagues/${leagueId}/teams`, {
           monitoredTeamIds: monitoredTeamIds.length > 0 ? monitoredTeamIds : null,
         });
@@ -430,8 +430,8 @@ export default function LeagueSearchPage() {
     },
     onSuccess: async (data, variables) => {
       const isMotorsportLeague = isMotorsport(variables.sport);
-      const isGolfLeague = isGolf(variables.sport);
-      const isIndividualTennisLeague = isIndividualTennis(variables.sport, variables.leagueName);
+      const teamless = isTeamlessSport(variables.sport, variables.leagueName, variables.sportFormat)
+        || usesFightingEventTypes(variables.sport, variables.leagueName);
       let message: string;
 
       if (isMotorsportLeague) {
@@ -439,7 +439,7 @@ export default function LeagueSearchPage() {
         message = partsCount > 0
           ? `Updated settings with ${partsCount} monitored session${partsCount !== 1 ? 's' : ''}`
           : 'League settings updated (no sessions selected)';
-      } else if (isGolfLeague || isIndividualTennisLeague) {
+      } else if (teamless) {
         message = 'League settings updated (all events monitored)';
       } else {
         const teamCount = data.teamCount || variables.monitoredTeamIds.length;
@@ -568,6 +568,7 @@ export default function LeagueSearchPage() {
         searchQueryTemplate,
         tags,
         sport: league.strSport,
+        sportFormat: league.strSportFormat,
         leagueName: league.strLeague,
         monitorFinals,
         specialEventsMonitorType,

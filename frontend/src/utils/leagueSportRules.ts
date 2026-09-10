@@ -104,8 +104,12 @@ export function isGambling(sport: string): boolean {
  * stay in sync with the backend's sportsWithoutTeamFiltering list in
  * LeagueEventSyncService.cs.
  */
-export function isTeamlessSport(sport: string, leagueName: string): boolean {
+export function isTeamlessSport(sport: string, leagueName: string, sportFormat?: string | null): boolean {
+  const format = sportFormat?.trim().toLowerCase();
+  if (format === 'eventsport') return true;
+  if (format === 'teamvsteam') return false;
   return (
+    sport.toLowerCase() === 'athletics' ||
     isMotorsport(sport) ||
     isGolf(sport) ||
     isDarts(sport) ||

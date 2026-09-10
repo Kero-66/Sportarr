@@ -819,7 +819,7 @@ app.MapPut("/api/leagues/{leagueId:int}/seasons/{season}/toggle", async (
     // claim, and the claim reads the team filter alone, so a game held only
     // because it has a file still gets one. Teamless sports never filter by
     // team, so nothing there is at risk.
-    var monitoredTeamIds = LeagueSportRules.IsTeamlessSport(league.Sport, league.Name)
+    var monitoredTeamIds = LeagueSportRules.IsTeamlessSport(league.Sport, league.Name, league.SportFormat)
         ? new HashSet<string>()
         : (await db.LeagueTeams
             .Where(lt => lt.LeagueId == leagueId && lt.Monitored && lt.Team != null && lt.Team.ExternalId != null)
@@ -832,7 +832,7 @@ app.MapPut("/api/leagues/{leagueId:int}/seasons/{season}/toggle", async (
         ? new HashSet<Event>()
         : events
             .Where(e => !LeagueEndpoints.MatchesMonitoredTeams(e, monitoredTeamIds)
-                && !SpecialEventClassifier.BypassesTeamFilter(e.Round, e.Title, league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes))
+                && !SpecialEventClassifier.BypassesTeamFilter(e.Round, e.Title, league.MonitorFinals, league.MonitorPlayoffs, league.MonitorPreseason, cupStageSizes, e.HasLaterSeasonFinal))
             .ToHashSet();
 
     foreach (var evt in events)

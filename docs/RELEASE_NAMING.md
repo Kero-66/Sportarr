@@ -48,7 +48,9 @@ sportarr.ev.2336155
 ev-2336155
 ```
 
-The canonical form groups should emit is the first one.
+The canonical form groups should emit is the first one. Files Sportarr
+names itself carry the branded form without braces, `sportarr-ev-2336155`,
+and both forms parse.
 
 The bare short form (`ev-2336155` with no braces and no brand, added in
 v1.1) has nothing marking it as a token, so its rules are stricter than
@@ -152,8 +154,8 @@ read tags back:
   non-MKV containers the filename token carries the id.
 - Sportarr reads the embedded tag on import and scan and treats it with
   the same authority as a filename token (the filename token wins if
-  both are present and disagree). Note that media servers do not
-  currently read embedded ids for matching, so keep the token in the
+  both are present and disagree). The media server agents read the
+  filename token, not the embedded tag, so keep the token in the
   release name too; the embedded tag is the recovery path for files
   whose names get mangled downstream.
 

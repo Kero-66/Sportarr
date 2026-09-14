@@ -18,6 +18,8 @@ public class HealthCheckService
     private readonly SportarrApiClient _sportarrApiClient;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly FileNamingService _fileNamingService;
+    private readonly DatabaseHealthTracker _databaseHealth;
+    private readonly BackupService _backupService;
 
     public HealthCheckService(
         SportarrDbContext db,
@@ -27,7 +29,9 @@ public class HealthCheckService
         DiskSpaceService diskSpaceService,
         SportarrApiClient sportarrApiClient,
         IHttpClientFactory httpClientFactory,
-        FileNamingService fileNamingService)
+        FileNamingService fileNamingService,
+        DatabaseHealthTracker databaseHealth,
+        BackupService backupService)
     {
         _db = db;
         _logger = logger;
@@ -37,6 +41,8 @@ public class HealthCheckService
         _sportarrApiClient = sportarrApiClient;
         _httpClientFactory = httpClientFactory;
         _fileNamingService = fileNamingService;
+        _databaseHealth = databaseHealth;
+        _backupService = backupService;
     }
 
     /// <summary>
@@ -46,9 +52,14 @@ public class HealthCheckService
     {
         var results = new List<HealthCheckResult>();
 
+        // First, and never from a query. A damaged database makes the checks
+        // below throw, and this one has to be reported when that happens.
+        results.AddRange(CheckDatabaseDamage());
+
         try
         {
             // Run all health checks
+            results.AddRange(await CheckBackupsAsync());
             results.AddRange(await CheckRootFoldersAsync());
             results.AddRange(await CheckDownloadClientsAsync());
             results.AddRange(await CheckIndexersAsync());
@@ -76,16 +87,133 @@ public class HealthCheckService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error performing health checks");
-            results.Add(new HealthCheckResult
+
+            // A check that threw on a damaged database is the damage
+            // reporting itself. Record it so the probe endpoint agrees, and
+            // report it as damage rather than as a check that misbehaved.
+            _databaseHealth.RecordFailure(ex);
+
+            if (DatabaseHealthTracker.IsDamageSignal(ex))
             {
-                Type = HealthCheckType.CorruptedDatabase,
-                Level = HealthCheckLevel.Error,
-                Message = "Health check system error",
-                Details = ex.Message
-            });
+                if (!results.Any(r => r.Type == HealthCheckType.CorruptedDatabase))
+                    results.AddRange(CheckDatabaseDamage());
+            }
+            else
+            {
+                // Anything else is a check that misbehaved, not a damaged
+                // database. Saying "Database Corruption" here would send a
+                // user looking for a restore they do not need.
+                results.Add(new HealthCheckResult
+                {
+                    Type = HealthCheckType.HealthCheckFailed,
+                    Level = HealthCheckLevel.Warning,
+                    Message = "A health check could not complete",
+                    Details = ex.Message
+                });
+            }
         }
 
         return results.OrderByDescending(r => r.Level).ToList();
+    }
+
+    /// <summary>
+    /// A database that is damaged rather than merely busy. Read from the
+    /// tracker, never queried, so it still answers when no query can run.
+    /// </summary>
+    private List<HealthCheckResult> CheckDatabaseDamage()
+    {
+        var results = new List<HealthCheckResult>();
+        var (count, lastError, firstSeenUtc, _) = _databaseHealth.Snapshot();
+
+        if (count == 0)
+            return results;
+
+        var since = firstSeenUtc.HasValue
+            ? $" since {firstSeenUtc.Value:yyyy-MM-dd HH:mm} UTC"
+            : "";
+
+        results.Add(new HealthCheckResult
+        {
+            Type = HealthCheckType.CorruptedDatabase,
+            Level = HealthCheckLevel.Error,
+            Message = "The database is damaged and queries are failing",
+            Details = $"{count} command(s) have failed{since} because the stored data is damaged. " +
+                      "Parts of Sportarr keep working because only some tables are affected, so this can run for a long time unnoticed. " +
+                      "Restoring a backup from before the damage is the usual repair, and some index damage can be undone with REINDEX instead. " +
+                      "Take a copy of the database before you try either, and treat new backups as unreliable while this shows. " +
+                      (string.IsNullOrWhiteSpace(lastError) ? "" : $"Last error: {lastError}")
+        });
+
+        return results;
+    }
+
+    /// <summary>
+    /// Scheduled backups that have stopped. The scheduled run logs its
+    /// failure and moves on, so nothing else would say.
+    ///
+    /// Judged by the age of the newest backup rather than by watching for a
+    /// failure, so a full disk and a damaged database read the same way.
+    /// </summary>
+    private async Task<List<HealthCheckResult>> CheckBackupsAsync()
+    {
+        var results = new List<HealthCheckResult>();
+
+        try
+        {
+            var config = await _configService.GetConfigAsync();
+            if (config.BackupInterval <= 0)
+                return results;
+
+            List<BackupInfo> backups;
+            try
+            {
+                backups = await _backupService.GetBackupsAsync();
+            }
+            catch (Exception ex)
+            {
+                // An unreadable backup folder means no backups are being kept
+                // either, so it belongs on the same notice.
+                _logger.LogWarning(ex, "Could not read the backup folder");
+                results.Add(new HealthCheckResult
+                {
+                    Type = HealthCheckType.BackupsFailing,
+                    Level = HealthCheckLevel.Warning,
+                    Message = "The backup folder cannot be read",
+                    Details = $"Scheduled backups cannot run until this is fixed. {ex.Message}"
+                });
+                return results;
+            }
+
+            // A fresh install and one whose backups never worked look the
+            // same from here, so this waits for a first backup to exist.
+            // Backups that stop after working is what it reports.
+            if (backups.Count == 0)
+                return results;
+
+            // One missed run is a slow machine or a restart at the wrong
+            // moment. Two is a backup that is not happening.
+            var overdueAfter = TimeSpan.FromDays(config.BackupInterval * 2);
+            var newest = backups.Max(b => b.CreatedAt);
+
+            if (DateTime.UtcNow - newest <= overdueAfter)
+                return results;
+
+            results.Add(new HealthCheckResult
+            {
+                Type = HealthCheckType.BackupsFailing,
+                Level = HealthCheckLevel.Warning,
+                Message = "Scheduled backups have stopped",
+                Details = $"Backups are set to run every {config.BackupInterval} day(s) and the newest is from {newest:yyyy-MM-dd}. " +
+                          "Check the logs for [Housekeeping] Scheduled backup failed. A damaged database cannot be backed up, " +
+                          "so this and a database error together mean the backups you have are the last good ones."
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not determine backup state");
+        }
+
+        return results;
     }
 
     /// <summary>

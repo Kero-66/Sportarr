@@ -548,10 +548,16 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddSportarrDatabase(this IServiceCollection services, IConfiguration configuration, string dbPath)
     {
+        // One tracker for the whole process. The interceptor writes to it and
+        // the health surfaces read it, so a damaged database is reported from
+        // in-memory state that still answers when no query can run.
+        var databaseHealth = new Sportarr.Api.Services.DatabaseHealthTracker();
+        services.AddSingleton(databaseHealth);
+
         // Single shared interceptor instance. It only does work inside a
         // SyncMetrics measured block (one AsyncLocal read otherwise), so it
         // is safe to attach to every context including the request path.
-        var commandCounter = new Sportarr.Api.Data.CommandCountingInterceptor();
+        var commandCounter = new Sportarr.Api.Data.CommandCountingInterceptor(databaseHealth);
         var dbSettings = DatabaseSettings.FromConfiguration(configuration);
 
         void ConfigureProvider(DbContextOptionsBuilder options)

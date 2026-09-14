@@ -555,6 +555,7 @@ public class ReleaseMatchingService
         // were missing in RssSyncService — causing team validation to be completely bypassed during RSS sync
         if (isTeamSport)
         {
+            var (titleHomeName, titleAwayName) = ResolveTitleTeamAliases(evt);
             var teamMatch = ValidateTeamNames(
                 release.Title,
                 evt.HomeTeamName!,
@@ -562,7 +563,9 @@ public class ReleaseMatchingService
                 evt.HomeTeam,
                 evt.AwayTeam,
                 evt.League,
-                knownLeagues);
+                knownLeagues,
+                titleHomeName,
+                titleAwayName);
             if (teamMatch >= 2)
             {
                 result.Confidence += 35;
@@ -1456,11 +1459,15 @@ public class ReleaseMatchingService
         Team? homeTeam = null,
         Team? awayTeam = null,
         League? league = null,
-        IReadOnlyCollection<League>? knownLeagues = null)
+        IReadOnlyCollection<League>? knownLeagues = null,
+        string? titleHomeName = null,
+        string? titleAwayName = null)
     {
         var normalizedRelease = NormalizeTitle(releaseTitle);
-        var homeMatches = ContainsTeamName(normalizedRelease, homeTeamName, homeTeam);
-        var awayMatches = ContainsTeamName(normalizedRelease, awayTeamName, awayTeam);
+        var homeMatches = ContainsTeamName(normalizedRelease, homeTeamName, homeTeam) ||
+            (!string.IsNullOrWhiteSpace(titleHomeName) && ContainsTeamName(normalizedRelease, titleHomeName, homeTeam));
+        var awayMatches = ContainsTeamName(normalizedRelease, awayTeamName, awayTeam) ||
+            (!string.IsNullOrWhiteSpace(titleAwayName) && ContainsTeamName(normalizedRelease, titleAwayName, awayTeam));
 
         var normalizedHomeTeam = NormalizeTitle(homeTeamName);
         var normalizedAwayTeam = NormalizeTitle(awayTeamName);
@@ -1520,6 +1527,31 @@ public class ReleaseMatchingService
 
         return left.Name.Equals(right.Name, StringComparison.OrdinalIgnoreCase)
             && LeagueSportRules.AreEquivalentSports(left.Sport, right.Sport);
+    }
+
+    private (string? HomeAlias, string? AwayAlias) ResolveTitleTeamAliases(Event evt)
+    {
+        if (string.IsNullOrWhiteSpace(evt.Title)) return (null, null);
+
+        var titleTeams = Regex.Split(evt.Title, @"\s+vs\.?\s+", RegexOptions.IgnoreCase)
+            .Select(name => name.Trim())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToArray();
+        if (titleTeams.Length != 2) return (null, null);
+
+        var first = NormalizeTitle(titleTeams[0]);
+        var second = NormalizeTitle(titleTeams[1]);
+        var alignedEvidence =
+            (ContainsTeamName(first, evt.HomeTeamName!, evt.HomeTeam) ? 1 : 0) +
+            (ContainsTeamName(second, evt.AwayTeamName!, evt.AwayTeam) ? 1 : 0);
+        var reversedEvidence =
+            (ContainsTeamName(first, evt.AwayTeamName!, evt.AwayTeam) ? 1 : 0) +
+            (ContainsTeamName(second, evt.HomeTeamName!, evt.HomeTeam) ? 1 : 0);
+
+        if (alignedEvidence == reversedEvidence) return (null, null);
+        return alignedEvidence > reversedEvidence
+            ? (titleTeams[0], titleTeams[1])
+            : (titleTeams[1], titleTeams[0]);
     }
 
     /// <summary>

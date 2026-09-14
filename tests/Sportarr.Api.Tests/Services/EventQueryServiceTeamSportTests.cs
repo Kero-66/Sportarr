@@ -127,4 +127,52 @@ public class EventQueryServiceTeamSportTests
 
         service.BuildEventQueries(evt).Should().Equal("Arsenal Chelsea");
     }
+
+    [Theory]
+    [InlineData("Spanish La Liga", "Real Betis vs Real Madrid", "Real Betis", "Real Madrid", "Real Betis Real Madrid")]
+    [InlineData("German Bundesliga", "Hoffenheim vs Borussia Dortmund", "Hoffenheim", "Borussia Dortmund", "Borussia Dortmund Hoffenheim")]
+    [InlineData("Italian Serie A", "Juventus vs AC Milan", "Juventus", "AC Milan", "AC Milan Juventus")]
+    [InlineData("French Ligue 1", "Paris Saint-Germain vs Monaco", "Paris SG", "Monaco", "Monaco Paris Saint-Germain")]
+    public void BuildEventQueries_VerifiedEuropeanFootballLeague_UsesOneFullTitleTeamPair(
+        string leagueName,
+        string title,
+        string homeTeamName,
+        string awayTeamName,
+        string expected)
+    {
+        var service = CreateService();
+        var evt = new Event
+        {
+            Title = title,
+            Sport = "Soccer",
+            EventDate = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc),
+            League = new League { Name = leagueName, Sport = "Soccer" },
+            HomeTeamId = 30,
+            AwayTeamId = 40,
+            HomeTeamName = homeTeamName,
+            AwayTeamName = awayTeamName
+        };
+
+        service.BuildEventQueries(evt).Should().Equal(expected);
+    }
+
+    [Fact]
+    public void BuildEventQueries_MlsGame_KeepsSharedSeasonQueries()
+    {
+        var service = CreateService();
+        var evt = new Event
+        {
+            Title = "Inter Miami vs Atlanta United",
+            Sport = "Soccer",
+            EventDate = new DateTime(2026, 9, 5, 0, 0, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 9, 5),
+            League = new League { Name = "American Major League Soccer", Sport = "Soccer" },
+            HomeTeamId = 30,
+            AwayTeamId = 40,
+            HomeTeamName = "Inter Miami",
+            AwayTeamName = "Atlanta United"
+        };
+
+        service.BuildEventQueries(evt).Should().Equal("MLS 2026 09", "MLS 2026");
+    }
 }

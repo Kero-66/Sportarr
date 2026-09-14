@@ -822,21 +822,25 @@ public class EventQueryService
             evt.AwayTeamId.HasValue &&
             evt.HomeTeamId.Value != evt.AwayTeamId.Value;
 
-        if (hasStablePair && (leaguePrefix == "NBA" ||
-            string.Equals(leagueName, "English Premier League", StringComparison.OrdinalIgnoreCase)))
+        if (hasStablePair && (leaguePrefix == "NBA" || IsVerifiedCompactPairLeague(leagueName)))
         {
-            var homeFirst = evt.HomeTeamId.GetValueOrDefault() < evt.AwayTeamId.GetValueOrDefault();
-            var first = homeFirst ? homeName! : awayName!;
-            var second = homeFirst ? awayName! : homeName!;
             if (leaguePrefix == "NBA")
             {
+                var homeFirst = evt.HomeTeamId.GetValueOrDefault() < evt.AwayTeamId.GetValueOrDefault();
+                var first = homeFirst ? homeName! : awayName!;
+                var second = homeFirst ? awayName! : homeName!;
                 first = first.Split(' ', StringSplitOptions.RemoveEmptyEntries).Last();
                 second = second.Split(' ', StringSplitOptions.RemoveEmptyEntries).Last();
                 queries.Add($"NBA {first} {second}");
             }
             else
             {
-                queries.Add($"{first} {second}");
+                var titleTeams = Regex.Split(evt.Title, @"\s+vs\.?\s+", RegexOptions.IgnoreCase)
+                    .Select(name => name.Trim())
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .ToArray();
+                var teamNames = titleTeams.Length == 2 ? titleTeams : new[] { homeName!, awayName! };
+                queries.Add(string.Join(" ", teamNames.Order(StringComparer.OrdinalIgnoreCase)));
             }
 
             AddTeamAliasQueries(evt, leaguePrefix, year, queries);
@@ -893,6 +897,16 @@ public class EventQueryService
         // Fallback: "NFL 2025" (year only)
         queries.Add($"{leaguePrefix} {year}");
         AddTeamAliasQueries(evt, leaguePrefix, year, queries);
+    }
+
+    private static bool IsVerifiedCompactPairLeague(string? leagueName)
+    {
+        return leagueName?.Trim().ToLowerInvariant() is
+            "english premier league" or "premier league" or
+            "spanish la liga" or "la liga" or
+            "german bundesliga" or "bundesliga" or
+            "italian serie a" or "serie a" or
+            "french ligue 1" or "ligue 1";
     }
 
     /// <summary>

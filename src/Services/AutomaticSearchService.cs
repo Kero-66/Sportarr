@@ -487,6 +487,15 @@ public class AutomaticSearchService : IAutomaticSearchService
                 }
             }
 
+            var knownLeagues = await LeagueMatchContext.LoadAsync(_db);
+            IReadOnlyCollection<Event>? datePeers = null;
+            if (!isManualSearch && !evt.BroadcastDateVerified
+                && !string.IsNullOrWhiteSpace(evt.HomeTeamName)
+                && !string.IsNullOrWhiteSpace(evt.AwayTeamName))
+            {
+                datePeers = await EventDateMatchContext.LoadAsync(_db, evt);
+            }
+
             // MATCH SCORING: Calculate how well each release matches the event
             // This is critical for filtering out wrong releases (different games, TV shows, etc.)
             // Cached releases already have MatchScore set, but live indexer results need calculation
@@ -496,7 +505,7 @@ public class AutomaticSearchService : IAutomaticSearchService
                 // Only calculate if not already scored (cached releases have scores)
                 if (release.MatchScore == 0)
                 {
-                    release.MatchScore = _releaseMatchScorer.CalculateMatchScore(release.Title, evt);
+                    release.MatchScore = _releaseMatchScorer.CalculateMatchScore(release.Title, evt, knownLeagues);
                     scoredCount++;
                 }
 
@@ -715,7 +724,8 @@ public class AutomaticSearchService : IAutomaticSearchService
             {
                 var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(release, earlyReleaseLimits);
                 var matchResult = _releaseMatchingService.ValidateRelease(release, evt, part, config.EnableMultiPartEpisodes,
-                    earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers);
+                    earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers, knownLeagues: knownLeagues,
+                    datePeers: datePeers);
 
                 if (matchResult.IsHardRejection)
                 {

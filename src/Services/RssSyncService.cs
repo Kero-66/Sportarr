@@ -175,6 +175,26 @@ public class RssSyncService : BackgroundService
             .Where(i => i.EarlyReleaseLimit.HasValue)
             .Select(i => new { i.Id, i.EarlyReleaseLimit })
             .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit, cancellationToken);
+        var knownLeagues = await LeagueMatchContext.LoadAsync(db, cancellationToken);
+        var releaseDates = recentReleases
+            .Select(release => releaseMatchingService.ParseRelease(release.Title).EventDate)
+            .Where(date => date.HasValue)
+            .Select(date => date!.Value)
+            .ToArray();
+        var datePeerLeagueIds = monitoredEvents
+            .Where(evt => !evt.BroadcastDateVerified
+                && !string.IsNullOrWhiteSpace(evt.HomeTeamName)
+                && !string.IsNullOrWhiteSpace(evt.AwayTeamName))
+            .Select(evt => evt.LeagueId)
+            .Where(leagueId => leagueId.HasValue)
+            .Select(leagueId => leagueId!.Value)
+            .Distinct()
+            .ToArray();
+        var datePeers = await EventDateMatchContext.LoadAsync(
+            db,
+            releaseDates,
+            datePeerLeagueIds,
+            cancellationToken);
 
         _logger.LogDebug("[RSS Sync] Loaded {ProfileCount} quality profiles, {FormatCount} custom formats, {ReleaseProfileCount} release profiles for evaluation",
             qualityProfiles.Count, customFormats.Count, releaseProfiles.Count);
@@ -189,7 +209,14 @@ public class RssSyncService : BackgroundService
             try
             {
                 // Try to match this release to a monitored event
-                var matchedEvent = FindMatchingEvent(release, monitoredEvents, releaseMatchingService, config.EnableMultiPartEpisodes, earlyReleaseLimits);
+                var matchedEvent = FindMatchingEvent(
+                    release,
+                    monitoredEvents,
+                    releaseMatchingService,
+                    config.EnableMultiPartEpisodes,
+                    earlyReleaseLimits,
+                    knownLeagues,
+                    datePeers);
 
                 if (matchedEvent == null)
                     continue;
@@ -381,9 +408,31 @@ public class RssSyncService : BackgroundService
             .Where(i => i.EarlyReleaseLimit.HasValue)
             .Select(i => new { i.Id, i.EarlyReleaseLimit })
             .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit, cancellationToken);
+        var knownLeagues = await LeagueMatchContext.LoadAsync(db, cancellationToken);
+        var parsedReleaseDate = releaseMatchingService.ParseRelease(release.Title).EventDate;
+        var datePeerLeagueIds = monitoredEvents
+            .Where(evt => !evt.BroadcastDateVerified
+                && !string.IsNullOrWhiteSpace(evt.HomeTeamName)
+                && !string.IsNullOrWhiteSpace(evt.AwayTeamName))
+            .Select(evt => evt.LeagueId)
+            .Where(leagueId => leagueId.HasValue)
+            .Select(leagueId => leagueId!.Value)
+            .Distinct()
+            .ToArray();
+        var datePeers = await EventDateMatchContext.LoadAsync(
+            db,
+            parsedReleaseDate.HasValue ? new[] { parsedReleaseDate.Value } : Array.Empty<DateTime>(),
+            datePeerLeagueIds,
+            cancellationToken);
 
         var matchedEvent = FindMatchingEvent(
-            release, monitoredEvents, releaseMatchingService, config.EnableMultiPartEpisodes, earlyReleaseLimits);
+            release,
+            monitoredEvents,
+            releaseMatchingService,
+            config.EnableMultiPartEpisodes,
+            earlyReleaseLimits,
+            knownLeagues,
+            datePeers);
 
         if (matchedEvent == null)
         {
@@ -509,7 +558,9 @@ public class RssSyncService : BackgroundService
         List<Event> monitoredEvents,
         ReleaseMatchingService matchingService,
         bool enableMultiPartEpisodes,
-        IReadOnlyDictionary<int, int?> earlyReleaseLimits)
+        IReadOnlyDictionary<int, int?> earlyReleaseLimits,
+        IReadOnlyCollection<League> knownLeagues,
+        IReadOnlyCollection<Event> datePeers)
     {
         Event? bestMatch = null;
         int bestConfidence = int.MinValue;
@@ -541,7 +592,7 @@ public class RssSyncService : BackgroundService
             // so per-event validation is cheap enough to skip the brittle
             // keyword prefilter entirely.
             var matchResult = matchingService.ValidateRelease(release, evt, null, enableMultiPartEpisodes, preParsed,
-                earlyReleaseLimitDays: earlyLimit);
+                earlyReleaseLimitDays: earlyLimit, knownLeagues: knownLeagues, datePeers: datePeers);
             if (!matchResult.IsMatch || matchResult.IsHardRejection)
                 continue;
 

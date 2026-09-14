@@ -229,7 +229,9 @@ public class ReleaseMatchingService
         bool enableMultiPartEpisodes = true,
         SportsParseResult? preParsed = null,
         int? earlyReleaseLimitDays = null,
-        IReadOnlyList<int>? roundRaceNumbers = null)
+        IReadOnlyList<int>? roundRaceNumbers = null,
+        IReadOnlyCollection<League>? knownLeagues = null,
+        IReadOnlyCollection<Event>? datePeers = null)
     {
         var result = new ReleaseMatchResult
         {
@@ -487,7 +489,14 @@ public class ReleaseMatchingService
         // were missing in RssSyncService — causing team validation to be completely bypassed during RSS sync
         if (isTeamSport)
         {
-            var teamMatch = ValidateTeamNames(release.Title, evt.HomeTeamName!, evt.AwayTeamName!, evt.HomeTeam, evt.AwayTeam);
+            var teamMatch = ValidateTeamNames(
+                release.Title,
+                evt.HomeTeamName!,
+                evt.AwayTeamName!,
+                evt.HomeTeam,
+                evt.AwayTeam,
+                evt.League,
+                knownLeagues);
             if (teamMatch >= 2)
             {
                 result.Confidence += 35;
@@ -592,8 +601,17 @@ public class ReleaseMatchingService
                 // neighboring GAME: an MLB series plays daily, so a one-day
                 // window hands over yesterday's matchup between the same
                 // two teams as today's.
-                result.Confidence += 25;
-                result.MatchReasons.Add("Date within 1 day (timezone rollover)");
+                if (isTeamSport && DateMatchesAnotherTeamEvent(evt, parseResult.EventDate.Value.Date, datePeers))
+                {
+                    result.Confidence -= 100;
+                    result.IsHardRejection = true;
+                    result.Rejections.Add("Date matches another game between these teams");
+                }
+                else
+                {
+                    result.Confidence += 25;
+                    result.MatchReasons.Add("Date within 1 day (timezone rollover)");
+                }
             }
             else if (!isTeamSport && daysDiff <= 3)
             {
@@ -1115,6 +1133,74 @@ public class ReleaseMatchingService
         return result;
     }
 
+    private static bool DateMatchesAnotherTeamEvent(
+        Event evt,
+        DateTime releaseDate,
+        IReadOnlyCollection<Event>? datePeers)
+    {
+        if (datePeers == null || datePeers.Count == 0)
+            return false;
+
+        return datePeers.Any(peer =>
+            !IsSameEvent(evt, peer)
+            && IsSameEventLeague(evt, peer)
+            && IsSameTeamPair(evt, peer)
+            && IsPlausibleEventDate(peer, releaseDate));
+    }
+
+    private static bool IsSameEvent(Event left, Event right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        if (left.Id != 0 && right.Id != 0)
+            return left.Id == right.Id;
+        return !string.IsNullOrWhiteSpace(left.ExternalId)
+            && !string.IsNullOrWhiteSpace(right.ExternalId)
+            && left.ExternalId.Equals(right.ExternalId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSameEventLeague(Event left, Event right)
+    {
+        if (left.LeagueId.HasValue && right.LeagueId.HasValue)
+            return left.LeagueId == right.LeagueId;
+        if (left.League != null && right.League != null)
+            return IsSameLeague(left.League, right.League);
+        return LeagueSportRules.AreEquivalentSports(left.Sport, right.Sport);
+    }
+
+    private static bool IsSameTeamPair(Event left, Event right)
+    {
+        if (left.HomeTeamId.HasValue && left.AwayTeamId.HasValue
+            && right.HomeTeamId.HasValue && right.AwayTeamId.HasValue)
+        {
+            return (left.HomeTeamId == right.HomeTeamId && left.AwayTeamId == right.AwayTeamId)
+                || (left.HomeTeamId == right.AwayTeamId && left.AwayTeamId == right.HomeTeamId);
+        }
+
+        var leftHome = NormalizeTitle(left.HomeTeamName ?? left.HomeTeam?.Name ?? "");
+        var leftAway = NormalizeTitle(left.AwayTeamName ?? left.AwayTeam?.Name ?? "");
+        var rightHome = NormalizeTitle(right.HomeTeamName ?? right.HomeTeam?.Name ?? "");
+        var rightAway = NormalizeTitle(right.AwayTeamName ?? right.AwayTeam?.Name ?? "");
+        if (string.IsNullOrWhiteSpace(leftHome) || string.IsNullOrWhiteSpace(leftAway)
+            || string.IsNullOrWhiteSpace(rightHome) || string.IsNullOrWhiteSpace(rightAway))
+        {
+            return false;
+        }
+
+        return (leftHome.Equals(rightHome, StringComparison.OrdinalIgnoreCase)
+                && leftAway.Equals(rightAway, StringComparison.OrdinalIgnoreCase))
+            || (leftHome.Equals(rightAway, StringComparison.OrdinalIgnoreCase)
+                && leftAway.Equals(rightHome, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsPlausibleEventDate(Event evt, DateTime releaseDate)
+    {
+        var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
+        var daysDiff = Math.Abs((eventDate - releaseDate).TotalDays);
+        return daysDiff == 0
+            || (daysDiff <= 1 && (!evt.BroadcastDate.HasValue || !evt.BroadcastDateVerified));
+    }
+
     /// <summary>
     /// Filter a list of releases to only include valid matches for the event.
     /// Returns releases sorted by match confidence.
@@ -1125,7 +1211,8 @@ public class ReleaseMatchingService
     /// <param name="enableMultiPartEpisodes">Whether multi-part episodes are enabled</param>
     public List<(ReleaseSearchResult Release, ReleaseMatchResult Match)> FilterValidReleases(
         List<ReleaseSearchResult> releases, Event evt, string? requestedPart = null, bool enableMultiPartEpisodes = true,
-        IReadOnlyDictionary<int, int?>? earlyReleaseLimitsByIndexer = null)
+        IReadOnlyDictionary<int, int?>? earlyReleaseLimitsByIndexer = null,
+        IReadOnlyCollection<League>? knownLeagues = null)
     {
         var validReleases = new List<(ReleaseSearchResult, ReleaseMatchResult)>();
 
@@ -1133,7 +1220,7 @@ public class ReleaseMatchingService
         {
             var limit = ResolveEarlyReleaseLimit(release, earlyReleaseLimitsByIndexer);
             var matchResult = ValidateRelease(release, evt, requestedPart, enableMultiPartEpisodes,
-                earlyReleaseLimitDays: limit);
+                earlyReleaseLimitDays: limit, knownLeagues: knownLeagues);
 
             if (matchResult.IsMatch)
             {
@@ -1256,18 +1343,77 @@ public class ReleaseMatchingService
     /// Returns 0, 1, or 2.
     /// Uses string fields (always available) with optional Team navigation properties for ShortName access.
     /// </summary>
-    private int ValidateTeamNames(string releaseTitle, string homeTeamName, string awayTeamName, Team? homeTeam = null, Team? awayTeam = null)
+    private int ValidateTeamNames(
+        string releaseTitle,
+        string homeTeamName,
+        string awayTeamName,
+        Team? homeTeam = null,
+        Team? awayTeam = null,
+        League? league = null,
+        IReadOnlyCollection<League>? knownLeagues = null)
     {
         var normalizedRelease = NormalizeTitle(releaseTitle);
-        int matchCount = 0;
+        var homeMatches = ContainsTeamName(normalizedRelease, homeTeamName, homeTeam);
+        var awayMatches = ContainsTeamName(normalizedRelease, awayTeamName, awayTeam);
 
-        if (ContainsTeamName(normalizedRelease, homeTeamName, homeTeam))
-            matchCount++;
+        var normalizedHomeTeam = NormalizeTitle(homeTeamName);
+        var normalizedAwayTeam = NormalizeTitle(awayTeamName);
+        var homeVariantMatches = !homeMatches
+            && TeamNameMatcher.ContainsRegularPluralVariant(normalizedRelease, normalizedHomeTeam);
+        var awayVariantMatches = !awayMatches
+            && TeamNameMatcher.ContainsRegularPluralVariant(normalizedRelease, normalizedAwayTeam);
+        if ((homeVariantMatches || awayVariantMatches) && AllowsRegularPluralTeamMatch(
+            releaseTitle,
+            normalizedRelease,
+            league,
+            knownLeagues,
+            normalizedHomeTeam,
+            normalizedAwayTeam))
+        {
+            homeMatches |= homeVariantMatches;
+            awayMatches |= awayVariantMatches;
+        }
 
-        if (ContainsTeamName(normalizedRelease, awayTeamName, awayTeam))
-            matchCount++;
+        return (homeMatches ? 1 : 0) + (awayMatches ? 1 : 0);
+    }
 
-        return matchCount;
+    internal static bool AllowsRegularPluralTeamMatch(
+        string releaseTitle,
+        string normalizedRelease,
+        League? eventLeague,
+        IReadOnlyCollection<League>? knownLeagues,
+        string normalizedHomeTeam,
+        string normalizedAwayTeam)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedHomeTeam) || string.IsNullOrWhiteSpace(normalizedAwayTeam))
+            return false;
+
+        // Missing library context cannot prove that a league token is absent.
+        if (eventLeague == null || knownLeagues == null || knownLeagues.Count == 0)
+            return false;
+
+        var titleNamesOtherLeague = knownLeagues.Any(league =>
+            !IsSameLeague(league, eventLeague) && TitleNamesLeague(releaseTitle, league));
+        if (titleNamesOtherLeague)
+            return false;
+
+        return TeamNameMatcher.AllowsRegularPluralVariant(
+            normalizedRelease,
+            TitleNamesLeague(releaseTitle, eventLeague),
+            normalizedHomeTeam,
+            normalizedAwayTeam);
+    }
+
+    private static bool IsSameLeague(League left, League right)
+    {
+        if (left.Id != 0 && right.Id != 0)
+            return left.Id == right.Id;
+
+        if (!string.IsNullOrWhiteSpace(left.ExternalId) && !string.IsNullOrWhiteSpace(right.ExternalId))
+            return left.ExternalId.Equals(right.ExternalId, StringComparison.OrdinalIgnoreCase);
+
+        return left.Name.Equals(right.Name, StringComparison.OrdinalIgnoreCase)
+            && LeagueSportRules.AreEquivalentSports(left.Sport, right.Sport);
     }
 
     /// <summary>
@@ -1275,7 +1421,10 @@ public class ReleaseMatchingService
     /// Uses the team name string (always available) with optional Team nav property for ShortName.
     /// Checks against TeamNameVariationData for comprehensive abbreviation/nickname coverage.
     /// </summary>
-    private bool ContainsTeamName(string normalizedRelease, string teamName, Team? team = null)
+    private bool ContainsTeamName(
+        string normalizedRelease,
+        string teamName,
+        Team? team = null)
     {
         var normalizedName = NormalizeTitle(teamName);
 

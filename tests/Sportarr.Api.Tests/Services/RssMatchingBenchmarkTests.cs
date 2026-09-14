@@ -16,7 +16,8 @@ public class RssMatchingMeasurementCollection;
 public class RssMatchingBenchmarkTests(ITestOutputHelper output)
 {
     private delegate Event? FindMatch(ReleaseSearchResult release, List<Event> events,
-        ReleaseMatchingService matcher, bool multiPart, IReadOnlyDictionary<int, int?> earlyLimits);
+        ReleaseMatchingService matcher, bool multiPart, IReadOnlyDictionary<int, int?> earlyLimits,
+        IReadOnlyCollection<League> knownLeagues, IReadOnlyCollection<Event> datePeers);
 
     [Fact]
     public void MixedFeed_SelectsExpectedEvents_OnFirstAndRepeatPass()
@@ -32,22 +33,114 @@ public class RssMatchingBenchmarkTests(ITestOutputHelper output)
         var findMatch = typeof(RssSyncService).GetMethod("FindMatchingEvent",
             BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate<FindMatch>(rss);
         var earlyLimits = new Dictionary<int, int?>();
+        var knownLeagues = events.Select(evt => evt.League!).DistinctBy(league => league.Id).ToArray();
 
         output.WriteLine($"Runtime: {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}; " +
             $"OS: {System.Runtime.InteropServices.RuntimeInformation.OSDescription}; " +
             $"architecture: {System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture}");
         output.WriteLine($"Releases: {releases.Count}; events: {events.Count}; pairs/pass: {releases.Count * events.Count}");
 
-        var first = Measure("first", findMatch, releases, events, matcher, earlyLimits);
-        var repeat = Measure("repeat", findMatch, releases, events, matcher, earlyLimits);
+        var first = Measure("first", findMatch, releases, events, matcher, earlyLimits, knownLeagues);
+        var repeat = Measure("repeat", findMatch, releases, events, matcher, earlyLimits, knownLeagues);
 
         first.Should().Equal(releases.Select(release => release.ExpectedId));
         repeat.Should().Equal(first);
     }
 
+    [Fact]
+    public void TeamFeed_SelectsExpectedEvents_OnFirstAndRepeatPass()
+    {
+        var fullSize = Environment.GetEnvironmentVariable("SPORTARR_RSS_BENCHMARK") == "1";
+        var events = CreateTeamEvents();
+        var releases = CreateTeamReleases(fullSize ? 900 : 20);
+        using var services = new ServiceCollection().BuildServiceProvider();
+        using var rss = new RssSyncService(services, NullLogger<RssSyncService>.Instance);
+        var matcher = new ReleaseMatchingService(NullLogger<ReleaseMatchingService>.Instance,
+            new SportsFileNameParser(NullLogger<SportsFileNameParser>.Instance),
+            new EventPartDetector(NullLogger<EventPartDetector>.Instance));
+        var findMatch = typeof(RssSyncService).GetMethod("FindMatchingEvent",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate<FindMatch>(rss);
+        var earlyLimits = new Dictionary<int, int?>();
+        var knownLeagues = events.Select(evt => evt.League!).DistinctBy(league => league.Id).ToArray();
+
+        output.WriteLine($"Team releases: {releases.Count}; events: {events.Count}; pairs/pass: {releases.Count * events.Count}");
+
+        var first = Measure("team first", findMatch, releases, events, matcher, earlyLimits, knownLeagues);
+        var repeat = Measure("team repeat", findMatch, releases, events, matcher, earlyLimits, knownLeagues);
+
+        first.Should().Equal(releases.Select(release => release.ExpectedId));
+        repeat.Should().Equal(first);
+    }
+
+    [Fact]
+    public void TeamFeed_prefers_the_named_day_over_an_unverified_adjacent_game()
+    {
+        var league = new League { Id = 1, Name = "MLB", Sport = "Baseball" };
+        var adjacentGame = new Event
+        {
+            Id = 1,
+            Title = "Detroit Tigers vs Los Angeles Dodgers",
+            Sport = "Baseball",
+            LeagueId = league.Id,
+            League = league,
+            HomeTeamId = 10,
+            AwayTeamId = 11,
+            HomeTeamName = "Detroit Tigers",
+            AwayTeamName = "Los Angeles Dodgers",
+            EventDate = new DateTime(2026, 8, 29, 17, 10, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 8, 29),
+            BroadcastDateVerified = false,
+            Monitored = true
+        };
+        var namedGame = new Event
+        {
+            Id = 2,
+            Title = "Los Angeles Dodgers vs Detroit Tigers",
+            Sport = "Baseball",
+            LeagueId = league.Id,
+            League = league,
+            HomeTeamId = 11,
+            AwayTeamId = 10,
+            HomeTeamName = "Los Angeles Dodgers",
+            AwayTeamName = "Detroit Tigers",
+            EventDate = new DateTime(2026, 8, 28, 17, 10, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 8, 28),
+            BroadcastDateVerified = false,
+            Monitored = false
+        };
+        var release = new ReleaseSearchResult
+        {
+            Title = "MLB RS 2026 Los Angeles Dodgers vs Detroit Tigers 28 08 1080pEN60fps SNLA",
+            Guid = "mlb-2026-08-28",
+            DownloadUrl = "http://test/mlb-2026-08-28",
+            Indexer = "Test"
+        };
+        using var services = new ServiceCollection().BuildServiceProvider();
+        using var rss = new RssSyncService(services, NullLogger<RssSyncService>.Instance);
+        var matcher = new ReleaseMatchingService(
+            NullLogger<ReleaseMatchingService>.Instance,
+            new SportsFileNameParser(NullLogger<SportsFileNameParser>.Instance),
+            new EventPartDetector(NullLogger<EventPartDetector>.Instance));
+        var findMatch = typeof(RssSyncService).GetMethod(
+            "FindMatchingEvent",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate<FindMatch>(rss);
+
+        var result = findMatch(
+            release,
+            new List<Event> { adjacentGame },
+            matcher,
+            true,
+            new Dictionary<int, int?>(),
+            new[] { league },
+            new[] { adjacentGame, namedGame });
+
+        result.Should().BeNull();
+    }
+
     private int?[] Measure(string pass, FindMatch findMatch,
         List<(ReleaseSearchResult Release, int? ExpectedId)> releases, List<Event> events,
-        ReleaseMatchingService matcher, IReadOnlyDictionary<int, int?> earlyLimits)
+        ReleaseMatchingService matcher, IReadOnlyDictionary<int, int?> earlyLimits,
+        IReadOnlyCollection<League> knownLeagues)
     {
         using var process = Process.GetCurrentProcess();
         var results = new int?[releases.Count];
@@ -56,7 +149,14 @@ public class RssMatchingBenchmarkTests(ITestOutputHelper output)
         var timer = Stopwatch.StartNew();
         for (var index = 0; index < releases.Count; index++)
         {
-            results[index] = findMatch(releases[index].Release, events, matcher, true, earlyLimits)?.Id;
+            results[index] = findMatch(
+                releases[index].Release,
+                events,
+                matcher,
+                true,
+                earlyLimits,
+                knownLeagues,
+                events)?.Id;
         }
         timer.Stop();
         var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
@@ -130,6 +230,84 @@ public class RssMatchingBenchmarkTests(ITestOutputHelper output)
             {
                 Title = $"{sample.Title}-BENCH{index:D4}", Guid = $"benchmark-{index}",
                 DownloadUrl = $"https://example.invalid/releases/{index}", Indexer = "Synthetic"
+            }, sample.ExpectedId);
+        }).ToList();
+    }
+
+    private static List<Event> CreateTeamEvents()
+    {
+        var teams = new[]
+        {
+            ("Athletics", "Toronto Blue Jays"),
+            ("New York Yankees", "Boston Red Sox"),
+            ("Baltimore Orioles", "Tampa Bay Rays"),
+            ("Cleveland Guardians", "Detroit Tigers"),
+            ("Kansas City Royals", "Minnesota Twins"),
+            ("Houston Astros", "Texas Rangers"),
+            ("Seattle Mariners", "Los Angeles Angels"),
+            ("Atlanta Braves", "Miami Marlins"),
+            ("New York Mets", "Philadelphia Phillies"),
+            ("Washington Nationals", "Chicago Cubs"),
+            ("Cincinnati Reds", "Milwaukee Brewers"),
+            ("Pittsburgh Pirates", "St Louis Cardinals"),
+            ("Arizona Diamondbacks", "Colorado Rockies"),
+            ("Los Angeles Dodgers", "San Diego Padres"),
+            ("San Francisco Giants", "Chicago White Sox")
+        };
+        var league = new League { Id = 2, Name = "MLB", Sport = "Baseball" };
+        var events = new List<Event>();
+
+        for (var day = 0; day < 6; day++)
+        {
+            foreach (var (home, away) in teams)
+            {
+                var date = new DateTime(2026, 9, 1).AddDays(day);
+                events.Add(new Event
+                {
+                    Id = 1000 + events.Count,
+                    Title = $"{home} vs {away}",
+                    Sport = "Baseball",
+                    League = league,
+                    LeagueId = league.Id,
+                    HomeTeamName = home,
+                    AwayTeamName = away,
+                    Season = "2026",
+                    Monitored = true,
+                    EventDate = DateTime.SpecifyKind(date.AddHours(23), DateTimeKind.Utc),
+                    BroadcastDate = date,
+                    BroadcastDateVerified = true
+                });
+            }
+        }
+
+        return events;
+    }
+
+    private static List<(ReleaseSearchResult Release, int? ExpectedId)> CreateTeamReleases(int count)
+    {
+        var samples = new (string Title, int? ExpectedId)[]
+        {
+            ("MLB.2026.09.01.Athletics.vs.Toronto.Blue.Jays.1080p.WEB.h264", 1000),
+            ("MLB.2026.09.01.Athletic.vs.Toronto.Blue.Jays.1080p.WEB.h264", 1000),
+            ("Toronto.Blue.Jays.vs.Athletic.2026.09.01.1080p.WEB.h264", 1000),
+            ("MLB.2026.09.02.New.York.Yankees.vs.Boston.Red.Sox.720p.HDTV.x264", 1016),
+            ("MLB.2026.09.03.Los.Angeles.Dodgers.vs.San.Diego.Padres.1080p.WEB.h264", 1043),
+            ("MLB.2026.09.04.Seattle.Mariners.vs.Los.Angeles.Angels.1080p.WEB.h264", 1051),
+            ("NBA.2026.09.01.Lakers.vs.Celtics.1080p.WEB.h264", null),
+            ("LaLiga.2026.09.01.Athletic.Bilbao.vs.Barcelona.1080p.WEB.h264", null),
+            ("MLB.2025.09.01.Athletics.vs.Toronto.Blue.Jays.1080p.WEB.h264", null),
+            ("Example.Movie.2026.1080p.BluRay.x264", null)
+        };
+
+        return Enumerable.Range(0, count).Select(index =>
+        {
+            var sample = samples[index % samples.Length];
+            return (new ReleaseSearchResult
+            {
+                Title = $"{sample.Title}-TEAMBENCH{index:D4}",
+                Guid = $"team-benchmark-{index}",
+                DownloadUrl = $"https://example.invalid/team-releases/{index}",
+                Indexer = "Synthetic"
             }, sample.ExpectedId);
         }).ToList();
     }

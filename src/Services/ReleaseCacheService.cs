@@ -227,6 +227,7 @@ public class ReleaseCacheService
             .OrderByDescending(r => r.PublishDate)
             .Take(1000) // Limit to prevent memory issues
             .ToListAsync(cancellationToken);
+        var knownLeagues = await LeagueMatchContext.LoadAsync(_db, cancellationToken);
 
         _logger.LogDebug("[ReleaseCache] Found {Count} candidate releases for filtering", candidates.Count);
 
@@ -240,7 +241,8 @@ public class ReleaseCacheService
                 cached.Day,
                 cached.RoundNumber,
                 cached.SportPrefix,
-                evt);
+                evt,
+                knownLeagues);
 
             if (matchScore >= ReleaseMatchScorer.MinimumMatchScore)
             {

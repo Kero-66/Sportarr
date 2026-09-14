@@ -343,13 +343,14 @@ app.MapPost("/api/event/{eventId:int}/search", async (
         .Where(i => i.EarlyReleaseLimit.HasValue)
         .Select(i => new { i.Id, i.EarlyReleaseLimit })
         .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit);
+    var knownLeagues = await LeagueMatchContext.LoadAsync(db);
 
     var dateRejectionCount = 0;
     foreach (var result in allResults)
     {
         var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(result, earlyReleaseLimits);
         var matchResult = releaseMatchingService.ValidateRelease(result, evt, part, config.EnableMultiPartEpisodes,
-            earlyReleaseLimitDays: earlyLimit);
+            earlyReleaseLimitDays: earlyLimit, knownLeagues: knownLeagues);
 
         if (matchResult.IsHardRejection)
         {
@@ -374,7 +375,7 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     // Releases that don't match the event (wrong game, TV shows, documentaries) are marked as rejected
     foreach (var result in allResults)
     {
-        result.MatchScore = releaseMatchScorer.CalculateMatchScore(result.Title, evt);
+        result.MatchScore = releaseMatchScorer.CalculateMatchScore(result.Title, evt, knownLeagues);
 
         // Mark non-matching releases as rejected (so UI "Hide Rejected" filter works)
         if (result.MatchScore < ReleaseMatchScorer.MinimumMatchScore)
@@ -522,6 +523,7 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
     // already blocklisted pack was presented as approved and listed first.
     // They get the same checks a normal manual search applies.
     var packConfig = await configService.GetConfigAsync();
+    var knownLeagues = await LeagueMatchContext.LoadAsync(db);
 
     // The week the event belongs to. The general validation compares numbers
     // found in the release title against numbers in the event title, and a
@@ -532,7 +534,7 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
     foreach (var result in allResults)
     {
         var matchResult = releaseMatchingService.ValidateRelease(
-            result, evt, null, packConfig.EnableMultiPartEpisodes);
+            result, evt, null, packConfig.EnableMultiPartEpisodes, knownLeagues: knownLeagues);
         if (matchResult.Rejections.Any())
         {
             result.Rejections.AddRange(matchResult.Rejections);
@@ -552,7 +554,7 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
             }
         }
 
-        result.MatchScore = releaseMatchScorer.CalculateMatchScore(result.Title, evt);
+        result.MatchScore = releaseMatchScorer.CalculateMatchScore(result.Title, evt, knownLeagues);
     }
 
     await MarkBlocklistedAsync(db, allResults);

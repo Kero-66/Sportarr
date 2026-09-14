@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -387,17 +388,21 @@ public class ReleaseMatchScorer
     /// Calculate match score for a release against an event.
     /// Returns 0-100, higher is better.
     /// </summary>
-    public int CalculateMatchScore(string releaseTitle, Event evt)
+    public int CalculateMatchScore(
+        string releaseTitle,
+        Event evt,
+        IReadOnlyCollection<League>? knownLeagues = null)
     {
         var parsed = ParseReleaseTitle(releaseTitle);
-        return CalculateMatchScoreInternal(releaseTitle, parsed, evt);
+        return CalculateMatchScoreInternal(releaseTitle, parsed, evt, knownLeagues);
     }
 
     /// <summary>
     /// Calculate match score with pre-parsed release metadata (for cached releases).
     /// </summary>
     public int CalculateMatchScore(string releaseTitle, int? year, int? month, int? day,
-        int? roundNumber, string? sportPrefix, Event evt)
+        int? roundNumber, string? sportPrefix, Event evt,
+        IReadOnlyCollection<League>? knownLeagues = null)
     {
         var parsed = new ParsedRelease
         {
@@ -407,10 +412,14 @@ public class ReleaseMatchScorer
             RoundNumber = roundNumber,
             SportPrefix = sportPrefix
         };
-        return CalculateMatchScoreInternal(releaseTitle, parsed, evt);
+        return CalculateMatchScoreInternal(releaseTitle, parsed, evt, knownLeagues);
     }
 
-    private int CalculateMatchScoreInternal(string releaseTitle, ParsedRelease parsed, Event evt)
+    private int CalculateMatchScoreInternal(
+        string releaseTitle,
+        ParsedRelease parsed,
+        Event evt,
+        IReadOnlyCollection<League>? knownLeagues)
     {
         var score = 0;
         var eventSportPrefix = GetSportPrefix(evt.League?.Name, evt.Sport);
@@ -591,7 +600,7 @@ public class ReleaseMatchScorer
         // These negative scores should cause immediate rejection (return 0)
         if (IsTeamSport(eventSportPrefix))
         {
-            var teamScore = GetTeamMatchScore(releaseTitle, evt);
+            var teamScore = GetTeamMatchScore(releaseTitle, evt, knownLeagues);
             if (teamScore < 0)
                 return 0; // Wrong game or not a game at all - reject immediately
             score += teamScore; // 0-40 points for matching teams
@@ -1283,7 +1292,10 @@ public class ReleaseMatchScorer
     /// Returns negative score if both teams don't match (to reject wrong games).
     /// CRITICAL: For "Team A vs Team B" events, BOTH teams must be present in the release.
     /// </summary>
-    private int GetTeamMatchScore(string releaseTitle, Event evt)
+    private int GetTeamMatchScore(
+        string releaseTitle,
+        Event evt,
+        IReadOnlyCollection<League>? knownLeagues)
     {
         var normalizedRelease = NormalizeTitle(releaseTitle);
         var homeScore = 0;
@@ -1305,6 +1317,26 @@ public class ReleaseMatchScorer
             var (hasMatch, score) = CheckTeamMatch(normalizedRelease, evt.AwayTeamName);
             awayHasMatch = hasMatch;
             awayScore = score;
+        }
+
+        (bool hasMatch, int score) homeVariantMatch = !homeHasMatch && !string.IsNullOrEmpty(evt.HomeTeamName)
+            ? CheckRegularPluralTeamMatch(normalizedRelease, evt.HomeTeamName)
+            : (false, 0);
+        (bool hasMatch, int score) awayVariantMatch = !awayHasMatch && !string.IsNullOrEmpty(evt.AwayTeamName)
+            ? CheckRegularPluralTeamMatch(normalizedRelease, evt.AwayTeamName)
+            : (false, 0);
+        if ((homeVariantMatch.hasMatch || awayVariantMatch.hasMatch) && ReleaseMatchingService.AllowsRegularPluralTeamMatch(
+            releaseTitle,
+            normalizedRelease,
+            evt.League,
+            knownLeagues,
+            NormalizeTitle(evt.HomeTeamName ?? ""),
+            NormalizeTitle(evt.AwayTeamName ?? "")))
+        {
+            if (homeVariantMatch.hasMatch)
+                (homeHasMatch, homeScore) = homeVariantMatch;
+            if (awayVariantMatch.hasMatch)
+                (awayHasMatch, awayScore) = awayVariantMatch;
         }
 
         // Check if this looks like a game release (has "vs", "@", "at", or team matchup indicators)
@@ -1764,6 +1796,25 @@ public class ReleaseMatchScorer
         var score = hasMatch ? (int)(20.0 * matchPercentage) : 0;
 
         return (hasMatch, score);
+    }
+
+    private (bool hasMatch, int score) CheckRegularPluralTeamMatch(string normalizedRelease, string teamName)
+    {
+        var teamWords = NormalizeTitle(teamName)
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(w => w.Length > 2 && !IsCommonWord(w))
+            .ToList();
+
+        if (teamWords.Count == 0
+            || !TeamNameMatcher.ContainsRegularPluralVariant(normalizedRelease, teamWords[^1]))
+        {
+            return (false, 0);
+        }
+
+        var matchedWordCount = teamWords
+            .Take(teamWords.Count - 1)
+            .Count(w => normalizedRelease.Contains(w, StringComparison.OrdinalIgnoreCase)) + 1;
+        return (true, (int)(20.0 * matchedWordCount / teamWords.Count));
     }
 
     /// <summary>

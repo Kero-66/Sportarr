@@ -112,6 +112,7 @@ public class SeasonSearchService
             .Where(i => i.EarlyReleaseLimit.HasValue)
             .Select(i => new { i.Id, i.EarlyReleaseLimit })
             .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit);
+        var knownLeagues = await LeagueMatchContext.LoadAsync(_db);
 
         // Match releases to events
         var seasonReleases = new List<SeasonSearchRelease>();
@@ -142,7 +143,8 @@ public class SeasonSearchService
                     requestedPart: null,
                     enableMultiPartEpisodes: enableMultiPart,
                     preParsed: preParsed,
-                    earlyReleaseLimitDays: earlyLimit);
+                    earlyReleaseLimitDays: earlyLimit,
+                    knownLeagues: knownLeagues);
 
                 if (matchResult.IsMatch)
                 {

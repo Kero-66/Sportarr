@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Sportarr.Api.Data;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -801,6 +802,10 @@ public class DvrRecordingService
         if (recording == null || recording.Status != DvrRecordingStatus.Recording)
             return;
 
+        using var finalizing = _ffmpegRecorder.TryBeginFinalizing(recordingId);
+        if (finalizing == null)
+            return;
+
         var now = DateTime.UtcNow;
         var windowEnd = recording.ScheduledEnd.AddMinutes(recording.PostPadding);
         _overtimeExtensions.TryRemove(recordingId, out _);
@@ -842,6 +847,8 @@ public class DvrRecordingService
         if (ExitLooksLikeANormalEnd(now, recording.ScheduledStart, recording.ScheduledEnd, recording.PostPadding, fileSize))
         {
             await FinalizeCaptureContainerAsync(recording);
+            await ProbeCompletedOutputAsync(recording);
+            await RenameCompletedOutputAsync(recording);
             fileSize = TryReadFileSize() ?? fileSize; // keep the pre-remux size if the re-read fails
 
             recording.Status = DvrRecordingStatus.Completed;
@@ -965,6 +972,7 @@ public class DvrRecordingService
             return;
 
         var target = Path.ChangeExtension(recording.OutputPath, ".mp4");
+        SelfMoveTracker.Register(recording.OutputPath, target);
         if (await _ffmpegRecorder.RemuxAsync(recording.OutputPath, target))
         {
             try { File.Delete(recording.OutputPath); }
@@ -1027,6 +1035,8 @@ public class DvrRecordingService
         if (result.Success)
         {
             await FinalizeCaptureContainerAsync(recording);
+            await ProbeCompletedOutputAsync(recording);
+            await RenameCompletedOutputAsync(recording);
 
             recording.Status = DvrRecordingStatus.Completed;
             recording.FileSize = result.FileSize;
@@ -1509,6 +1519,171 @@ public class DvrRecordingService
     // ============================================================================
 
     /// <summary>
+    /// Probe a finalized recording and replace its assumed channel quality
+    /// with the media file's detected quality.
+    /// </summary>
+    public async Task<MediaProbeResult?> ProbeCompletedOutputAsync(DvrRecording recording)
+    {
+        if (string.IsNullOrWhiteSpace(recording.OutputPath) || !File.Exists(recording.OutputPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var probeResult = await _ffmpegRecorder.ProbeFileAsync(recording.OutputPath);
+            if (!probeResult.Success)
+            {
+                _logger.LogWarning("[DVR] Failed to probe recording {Id}: {Error}", recording.Id, probeResult.Error);
+                return null;
+            }
+
+            recording.VideoWidth = probeResult.Width;
+            recording.VideoHeight = probeResult.Height;
+            recording.VideoCodec = probeResult.GetCodecDisplay();
+            recording.AudioCodec = probeResult.AudioCodec;
+            recording.AudioChannels = probeResult.AudioChannels;
+            var resolution = probeResult.GetResolution();
+            recording.Quality = QualityParser.MapQuality(QualityParser.QualitySource.IPTV, resolution, false).Name;
+            return probeResult;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[DVR] Error probing recording {Id}", recording.Id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Rename a direct completed recording after the media probe replaces the
+    /// channel's assumed quality with the file's detected quality.
+    /// </summary>
+    public async Task RenameCompletedOutputAsync(DvrRecording recording)
+    {
+        if (!string.IsNullOrWhiteSpace(recording.ImportMode)
+            || !recording.EventId.HasValue
+            || string.IsNullOrWhiteSpace(recording.OutputPath)
+            || !File.Exists(recording.OutputPath))
+        {
+            return;
+        }
+
+        var originalPath = recording.OutputPath;
+        var finalContainer = Path.GetExtension(originalPath).TrimStart('.');
+        if (string.IsNullOrWhiteSpace(finalContainer))
+        {
+            _logger.LogWarning(
+                "[DVR] Cannot update the completed name for recording {Id}; the output path has no file extension: {Path}",
+                recording.Id, originalPath);
+            return;
+        }
+
+        string expectedPath;
+        Event eventInfo;
+        try
+        {
+            if (recording.Event == null)
+            {
+                await _db.Entry(recording).Reference(r => r.Event).LoadAsync();
+            }
+            if (recording.Event?.LeagueId.HasValue == true && recording.Event.League == null)
+            {
+                await _db.Entry(recording.Event).Reference(e => e.League).LoadAsync();
+            }
+            if (recording.Event == null)
+            {
+                return;
+            }
+            eventInfo = recording.Event;
+
+            var settings = await GetMediaManagementSettingsAsync();
+            if (!settings.RenameEvents)
+            {
+                return;
+            }
+
+            var episodeNumber = await _episodeNumberResolver.ResolveAsync(eventInfo);
+            if (!eventInfo.EpisodeNumber.HasValue || eventInfo.EpisodeNumber.Value != episodeNumber)
+            {
+                eventInfo.EpisodeNumber = episodeNumber;
+            }
+
+            var filename = BuildEventOutputFileName(recording, eventInfo, settings, finalContainer, episodeNumber);
+            expectedPath = Path.Combine(Path.GetDirectoryName(originalPath) ?? string.Empty, filename);
+            expectedPath = await ClaimFreeOutputPathAsync(expectedPath, recording);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "[DVR] Could not build the detected-quality name for recording {Id}; keeping {Path}",
+                recording.Id, originalPath);
+            return;
+        }
+
+        if (PathsMatch(originalPath, expectedPath))
+        {
+            return;
+        }
+
+        var moved = false;
+        var linkedFiles = new List<EventFile>();
+        var linkedEvents = new List<Event>();
+        try
+        {
+            linkedFiles = await _db.EventFiles.Where(f => f.FilePath == originalPath).ToListAsync();
+            linkedEvents = await _db.Events.Where(e => e.FilePath == originalPath).ToListAsync();
+            SelfMoveTracker.Register(originalPath, expectedPath);
+            File.Move(originalPath, expectedPath);
+            moved = true;
+            recording.OutputPath = expectedPath;
+            foreach (var linkedFile in linkedFiles)
+            {
+                linkedFile.FilePath = expectedPath;
+            }
+            foreach (var linkedEvent in linkedEvents)
+            {
+                linkedEvent.FilePath = expectedPath;
+            }
+            await _db.SaveChangesAsync();
+            _logger.LogInformation(
+                "[DVR] Updated completed recording {Id} to its detected-quality name: {Path}",
+                recording.Id, expectedPath);
+        }
+        catch (Exception ex)
+        {
+            if (moved)
+            {
+                try
+                {
+                    SelfMoveTracker.Register(expectedPath, originalPath);
+                    File.Move(expectedPath, originalPath);
+                }
+                catch (Exception rollbackEx)
+                {
+                    recording.OutputPath = expectedPath;
+                    _logger.LogError(rollbackEx,
+                        "[DVR] Could not restore recording {Id} after its path update failed; the file remains at {Path}",
+                        recording.Id, expectedPath);
+                    return;
+                }
+            }
+
+            recording.OutputPath = originalPath;
+            foreach (var linkedFile in linkedFiles)
+            {
+                linkedFile.FilePath = originalPath;
+            }
+            foreach (var linkedEvent in linkedEvents)
+            {
+                linkedEvent.FilePath = originalPath;
+            }
+            _logger.LogWarning(ex,
+                "[DVR] Could not rename completed recording {Id}; keeping {Path}",
+                recording.Id, originalPath);
+        }
+    }
+
+    /// <summary>
     /// Generate output path for DVR recording using the same folder structure as regular imports.
     /// Uses MediaManagementSettings and FileNamingService for consistency with indexer downloads.
     /// Public so CatchupDownloadService produces identical event-aware paths for archive downloads.
@@ -1598,7 +1773,7 @@ public class DvrRecordingService
 
             // IMPORTANT: Calculate episode number BEFORE building folder path
             // This ensures the {Episode} token in EventFolderFormat has the correct value
-        var episodeNumber = await _episodeNumberResolver.ResolveAsync(eventInfo);
+            var episodeNumber = await _episodeNumberResolver.ResolveAsync(eventInfo);
 
             // Update event's episode number if needed
             if (!eventInfo.EpisodeNumber.HasValue || eventInfo.EpisodeNumber.Value != episodeNumber)
@@ -1614,49 +1789,8 @@ public class DvrRecordingService
                 destinationPath = Path.Combine(destinationPath, folderPath);
             }
 
-            // Build filename using FileNamingService with same tokens as regular imports
-            // Note: Use RenameEvents setting (same as FileRenameService) so user has single setting to control renaming
-            // RenameFiles was a separate setting that caused confusion - imports should respect RenameEvents
-            if (settings.RenameEvents)
-            {
-                var partSuffix = !string.IsNullOrEmpty(recording.PartName)
-                    ? $" - {recording.PartName}"
-                    : "";
-
-                // Use the broadcaster-branding date for filename tokens —
-                // see FileRenameService for the UTC-rollover rationale.
-                var brandingDate = eventInfo.BroadcastDate ?? eventInfo.EventDate.Date;
-
-                var tokens = new FileNamingTokens
-                {
-                    EventTitle = eventInfo.Title,
-                    EventTitleThe = eventInfo.Title,
-                    SportarrId = eventInfo.ExternalId ?? string.Empty,
-                    AirDate = brandingDate,
-                    Quality = recording.Quality ?? "HDTV-1080p",
-                    QualityFull = $"{recording.Quality ?? "HDTV-1080p"}.DVR",
-                    ReleaseGroup = "DVR",
-                    OriginalTitle = recording.Title,
-                    OriginalFilename = recording.Title,
-                    Series = eventInfo.League?.Name ?? eventInfo.Sport,
-                    Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString(),
-                    Episode = episodeNumber.ToString("00"),
-                    Part = partSuffix
-                };
-
-                var filename = _namingService.BuildFileName(settings.StandardFileFormat, tokens, $".{container}", settings.ReplaceIllegalCharacters);
-                destinationPath = Path.Combine(destinationPath, filename);
-            }
-            else
-            {
-                // No renaming - use event title with timestamp
-                var timestamp = recording.ScheduledStart.ToString("yyyy-MM-dd_HHmm");
-                var partSuffix = !string.IsNullOrEmpty(recording.PartName)
-                    ? $" - {SanitizeFileName(recording.PartName)}"
-                    : "";
-                var filename = $"{SanitizeFileName(eventInfo.Title)}{partSuffix} [{timestamp}].{container}";
-                destinationPath = Path.Combine(destinationPath, filename);
-            }
+            var filename = BuildEventOutputFileName(recording, eventInfo, settings, container, episodeNumber);
+            destinationPath = Path.Combine(destinationPath, filename);
         }
         else
         {
@@ -1681,6 +1815,50 @@ public class DvrRecordingService
         destinationPath = await ClaimFreeOutputPathAsync(destinationPath, recording);
 
         return HideWhileWriting(destinationPath);
+    }
+
+    private string BuildEventOutputFileName(
+        DvrRecording recording,
+        Event eventInfo,
+        MediaManagementSettings settings,
+        string container,
+        int episodeNumber)
+    {
+        if (!settings.RenameEvents)
+        {
+            var timestamp = recording.ScheduledStart.ToString("yyyy-MM-dd_HHmm");
+            var unrenamedPartSuffix = !string.IsNullOrEmpty(recording.PartName)
+                ? $" - {SanitizeFileName(recording.PartName)}"
+                : "";
+            return $"{SanitizeFileName(eventInfo.Title)}{unrenamedPartSuffix} [{timestamp}].{container}";
+        }
+
+        var partSuffix = !string.IsNullOrEmpty(recording.PartName)
+            ? $" - {recording.PartName}"
+            : "";
+        var brandingDate = eventInfo.BroadcastDate ?? eventInfo.EventDate.Date;
+        var tokens = new FileNamingTokens
+        {
+            EventTitle = eventInfo.Title,
+            EventTitleThe = eventInfo.Title,
+            SportarrId = eventInfo.ExternalId ?? string.Empty,
+            AirDate = brandingDate,
+            Quality = recording.Quality ?? "HDTV-1080p",
+            QualityFull = $"{recording.Quality ?? "HDTV-1080p"}.DVR",
+            ReleaseGroup = "DVR",
+            OriginalTitle = recording.Title,
+            OriginalFilename = recording.Title,
+            Series = eventInfo.League?.Name ?? eventInfo.Sport,
+            Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString(),
+            Episode = episodeNumber.ToString("00"),
+            Part = partSuffix
+        };
+
+        return _namingService.BuildFileName(
+            settings.StandardFileFormat,
+            tokens,
+            $".{container}",
+            settings.ReplaceIllegalCharacters);
     }
 
     /// <summary>
@@ -1853,6 +2031,7 @@ public class DvrRecordingService
         {
             if (File.Exists(path))
             {
+                SelfMoveTracker.Register(path, target);
                 File.Move(path, target, overwrite: true);
                 _logger.LogDebug("[DVR] Capture finished, revealed as {Path}", target);
                 return target;

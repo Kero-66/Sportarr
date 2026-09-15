@@ -547,6 +547,11 @@ public class EventDvrService
             return true;
         }
 
+        if (recording.Method == DvrRecordingMethod.Catchup)
+        {
+            await _dvrService.RenameCompletedOutputAsync(recording);
+        }
+
         // Get quality score based on event's quality profile
         var qualityScore = recording.QualityScore ?? 50;
         var customFormatScore = recording.CustomFormatScore ?? 0;
@@ -660,25 +665,14 @@ public class EventDvrService
 
         try
         {
-            var probeResult = await _ffmpegService.ProbeFileAsync(recording.OutputPath);
-            if (!probeResult.Success)
+            var probeResult = await _dvrService.ProbeCompletedOutputAsync(recording);
+            if (probeResult == null)
             {
-                _logger.LogWarning("[EventDVR] Failed to probe recording {RecordingId}: {Error}",
-                    recording.Id, probeResult.Error);
                 return;
             }
 
-            // Update recording with detected quality info
-            recording.VideoWidth = probeResult.Width;
-            recording.VideoHeight = probeResult.Height;
-            recording.VideoCodec = probeResult.GetCodecDisplay();
-            recording.AudioCodec = probeResult.AudioCodec;
-            recording.AudioChannels = probeResult.AudioChannels;
-
-            // Determine quality based on resolution
             var resolution = probeResult.GetResolution();
             var qualityDef = QualityParser.MapQuality(QualityParser.QualitySource.IPTV, resolution, false);
-            recording.Quality = qualityDef.Name;
 
             // Calculate quality score based on event's quality profile
             if (recording.Event != null)

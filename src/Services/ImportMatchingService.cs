@@ -1,4 +1,5 @@
 using Sportarr.Api.Data;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 using Microsoft.EntityFrameworkCore;
 using System.Text.RegularExpressions;
@@ -678,33 +679,17 @@ public class ImportMatchingService
         // The grab side already compares this way.
         if (sportsResult?.EventDate != null)
         {
-            var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
-            var daysDiff = Math.Abs((eventDate - sportsResult.EventDate.Value.Date).TotalDays);
-
-            // An exact date has to beat a neighbouring one outright. A
-            // baseball series puts the same two teams on the field on
-            // consecutive days, so the title says nothing that tells those
-            // events apart and the date is the only thing that does. The
-            // lead is ten points so a title with a suffix on the named day
-            // still beats a plain-titled neighbour.
-            if (daysDiff == 0)
-            {
-                confidence += 20;
-            }
-            // A fixture with a verified broadcast date is the game played on
-            // that date, and the day beside it is the next game of the same
-            // series, not a near miss. The grab side applies the same rule.
-            // An unverified date keeps the grace because a legacy backfill
-            // may still hold the UTC day.
-            else if (evt.BroadcastDateVerified && evt.HomeTeamId.HasValue && evt.AwayTeamId.HasValue)
+            var dateMatch = ImportDateMatchPolicy.Evaluate(evt, sportsResult.EventDate.Value);
+            if (dateMatch.Reject)
             {
                 confidence -= 100;
                 _logger.LogDebug("[Import Matching] Date mismatch REJECT: release {ReleaseDate} vs fixture {EventDate} for '{EventTitle}'",
-                    sportsResult.EventDate.Value.ToString("yyyy-MM-dd"), eventDate.ToString("yyyy-MM-dd"), evt.Title);
+                    sportsResult.EventDate.Value.ToString("yyyy-MM-dd"), dateMatch.EventDate.ToString("yyyy-MM-dd"), evt.Title);
             }
-            else if (daysDiff <= 1) confidence += 10;
-            else if (daysDiff <= 3) confidence += 8;
-            else if (daysDiff <= 7) confidence += 5;
+            else
+            {
+                confidence += dateMatch.Score;
+            }
         }
 
         // Part match for fighting sports = 20 points

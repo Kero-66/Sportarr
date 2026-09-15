@@ -354,7 +354,7 @@ public class LibraryImportService
                         MatchedLeagueName = matchedEvent?.League?.Name,
                         MatchedSeason = matchedEvent?.Season ?? matchedEvent?.SeasonNumber?.ToString() ?? (matchedEvent?.BroadcastDate ?? matchedEvent?.EventDate)?.Year.ToString(),
                         DestinationPreview = destinationPreview,
-                        MatchConfidence = matchConfidence > 0 ? matchConfidence : null,
+                        MatchConfidence = matchConfidence > 0 ? Math.Min(100, matchConfidence) : null,
                         Rejections = judged.Rejections
                     };
 
@@ -2068,17 +2068,14 @@ public class LibraryImportService
         // 19.07.2026" reached the 40-point floor against "Spain vs Saudi
         // Arabia" from June 21 on one shared team plus the year). Seven days
         // tolerates broadcast-vs-UTC dating and multi-day events.
+        ImportDateMatchResult? dateMatch = null;
         if (parsedDate.HasValue)
         {
-            var gateDiff = Math.Abs((evt.EventDate.Date - parsedDate.Value.Date).TotalDays);
-            if (evt.BroadcastDate.HasValue)
-            {
-                gateDiff = Math.Min(gateDiff, Math.Abs((evt.BroadcastDate.Value.Date - parsedDate.Value.Date).TotalDays));
-            }
-            if (gateDiff > 7)
+            dateMatch = ImportDateMatchPolicy.Evaluate(evt, parsedDate.Value);
+            if (dateMatch.Value.Reject || dateMatch.Value.DaysDifference > 7)
             {
                 logger?.LogDebug("[Match] Date gate: file dated {FileDate:yyyy-MM-dd}, event '{Event}' is {EventDate:yyyy-MM-dd} ({Diff:F0} days apart) - rejecting",
-                    parsedDate.Value, eventTitle, evt.EventDate, gateDiff);
+                    parsedDate.Value, eventTitle, dateMatch.Value.EventDate, dateMatch.Value.DaysDifference);
                 return 0;
             }
         }
@@ -2147,12 +2144,9 @@ public class LibraryImportService
         }
 
         // ── DATE PROXIMITY ──────────────────────────────────────────────────────
-        if (parsedDate != null)
+        if (dateMatch.HasValue)
         {
-            var daysDiff = Math.Abs((evt.EventDate - parsedDate.Value).TotalDays);
-            if (daysDiff <= 1) confidence += 15;
-            else if (daysDiff <= 3) confidence += 10;
-            else if (daysDiff <= 7) confidence += 5;
+            confidence += dateMatch.Value.Score;
         }
 
         // ── RECENCY ─────────────────────────────────────────────────────────────
@@ -2161,7 +2155,8 @@ public class LibraryImportService
             confidence += 5;
         }
 
-        return Math.Min(100, confidence);
+        // Keep the full score until candidate selection. An early cap can hide the exact date's lead.
+        return confidence;
     }
 
     /// <summary>

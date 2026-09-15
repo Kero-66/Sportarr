@@ -64,7 +64,7 @@ internal sealed class PackMemberLifecycleHarness : IAsyncDisposable
             typeof(QueueRemovalService), typeof(ImportMatchingService), typeof(ConfigService), typeof(DownloadClientService), typeof(NotificationService), typeof(SportarrApiClient),
             typeof(MediaFileParser), typeof(SportsFileNameParser), typeof(FileNamingService), typeof(EventPartDetector),
             typeof(DiskSpaceService), typeof(ImportFileSuppressionService), typeof(CustomFormatService),
-            typeof(CustomFormatMatchCache), typeof(ReleaseEvaluator), typeof(PackImportService), typeof(FileImportService),
+            typeof(CustomFormatMatchCache), typeof(ReleaseEvaluator), typeof(EpisodeNumberResolver), typeof(PackImportService), typeof(FileImportService),
             typeof(EventQueryService), typeof(DelayProfileService), typeof(ReleaseMatchingService), typeof(ReleaseCacheService),
             typeof(ReleaseMatchScorer), typeof(SearchResultCache), typeof(ReleaseProfileService), typeof(QualityDetectionService),
             typeof(IndexerStatusService), typeof(IndexerSearchService), typeof(AutomaticSearchService)
@@ -161,6 +161,10 @@ internal sealed class PackMemberLifecycleHarness : IAsyncDisposable
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var uri = request.RequestUri!;
+            if (uri.Host == "sportarr.net" &&
+                uri.AbsolutePath.StartsWith("/api/metadata/agents/episode/", StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(
+                    "{\"episode_number\":1,\"episode_number_authoritative\":true}", Encoding.UTF8, "application/json") };
             var body = request.Content == null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
             var form = body.Split('&', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Split('=', 2))
                 .ToDictionary(x => Uri.UnescapeDataString(x[0].Replace('+', ' ')),

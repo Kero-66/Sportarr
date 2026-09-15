@@ -2,11 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
+using System.Net;
 using System.Linq;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Sportarr.Api.Data;
@@ -40,6 +42,7 @@ public class ImportIdTokenClaimTests : IDisposable
             .Options;
         _db = new SportarrDbContext(options);
         var fileParser = new MediaFileParser(Mock.Of<ILogger<MediaFileParser>>());
+        var config = new ConfigService(new ConfigurationBuilder().Build(), Mock.Of<ILogger<ConfigService>>());
         _service = new LibraryImportService(
             _db,
             Mock.Of<ILogger<LibraryImportService>>(),
@@ -47,8 +50,8 @@ public class ImportIdTokenClaimTests : IDisposable
             new SportsFileNameParser(Mock.Of<ILogger<SportsFileNameParser>>()),
             new FileNamingService(Mock.Of<ILogger<FileNamingService>>()),
             new EventPartDetector(Mock.Of<ILogger<EventPartDetector>>()),
-            new ConfigService(new ConfigurationBuilder().Build(), Mock.Of<ILogger<ConfigService>>()),
-            null!,
+            config,
+            EpisodeResolverFixture.Create(_db, config),
             new DiskSpaceService(Mock.Of<ILogger<DiskSpaceService>>()),
             new CustomFormatService(fileParser),
             null!,
@@ -142,6 +145,7 @@ public class ImportUpgradeBehaviourTests : IDisposable
             .Options;
         _db = new SportarrDbContext(options);
         var fileParser = new MediaFileParser(Mock.Of<ILogger<MediaFileParser>>());
+        var config = new ConfigService(new ConfigurationBuilder().Build(), Mock.Of<ILogger<ConfigService>>());
         _service = new LibraryImportService(
             _db,
             Mock.Of<ILogger<LibraryImportService>>(),
@@ -149,8 +153,8 @@ public class ImportUpgradeBehaviourTests : IDisposable
             new SportsFileNameParser(Mock.Of<ILogger<SportsFileNameParser>>()),
             new FileNamingService(Mock.Of<ILogger<FileNamingService>>()),
             new EventPartDetector(Mock.Of<ILogger<EventPartDetector>>()),
-            new ConfigService(new ConfigurationBuilder().Build(), Mock.Of<ILogger<ConfigService>>()),
-            null!,
+            config,
+            EpisodeResolverFixture.Create(_db, config),
             new DiskSpaceService(Mock.Of<ILogger<DiskSpaceService>>()),
             new CustomFormatService(fileParser),
             new NotificationService(Mock.Of<IServiceProvider>(), Mock.Of<ILogger<NotificationService>>(), new HttpClient(), Mock.Of<IHttpClientFactory>()),
@@ -265,5 +269,34 @@ public class ImportUpgradeBehaviourTests : IDisposable
         File.Exists(copy).Should().BeTrue();
         var files = _db.EventFiles.Where(f => f.EventId == evt.Id).ToList();
         files.Should().ContainSingle().Which.FilePath.Should().Be(copy);
+    }
+}
+
+internal static class EpisodeResolverFixture
+{
+    public static EpisodeNumberResolver Create(SportarrDbContext db, ConfigService config)
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                ["SportarrApi:BaseUrl"] = "https://metadata.invalid/api/v2/json"
+            }).Build();
+        var api = new SportarrApiClient(
+            new HttpClient(new UnavailableHttpHandler()),
+            Mock.Of<ILogger<SportarrApiClient>>(),
+            configuration,
+            config,
+            new MemoryCache(new MemoryCacheOptions()));
+        return new EpisodeNumberResolver(db, api, Mock.Of<ILogger<EpisodeNumberResolver>>());
+    }
+
+    private sealed class UnavailableHttpHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+        }
     }
 }

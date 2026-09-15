@@ -71,7 +71,7 @@ internal sealed class PartIdentityIntegrationHarness : IAsyncDisposable
             typeof(ConfigService), typeof(DownloadClientService), typeof(NotificationService), typeof(SportarrApiClient),
             typeof(MediaFileParser), typeof(SportsFileNameParser), typeof(FileNamingService), typeof(EventPartDetector),
             typeof(DiskSpaceService), typeof(ImportFileSuppressionService), typeof(CustomFormatService),
-            typeof(CustomFormatMatchCache), typeof(ReleaseEvaluator), typeof(PackImportService), typeof(FileImportService),
+            typeof(CustomFormatMatchCache), typeof(ReleaseEvaluator), typeof(EpisodeNumberResolver), typeof(PackImportService), typeof(FileImportService),
             typeof(EventQueryService), typeof(DelayProfileService), typeof(ReleaseMatchingService), typeof(ReleaseCacheService),
             typeof(ReleaseMatchScorer), typeof(SearchResultCache), typeof(ReleaseProfileService), typeof(QualityDetectionService),
             typeof(IndexerStatusService), typeof(IndexerSearchService), typeof(AutomaticSearchService)
@@ -170,6 +170,10 @@ internal sealed class PartIdentityIntegrationHarness : IAsyncDisposable
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var uri = request.RequestUri!;
+            if (uri.Host == "sportarr.net" &&
+                uri.AbsolutePath.StartsWith("/api/metadata/agents/episode/", StringComparison.Ordinal))
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                    Content = new StringContent("{\"episode_number\":1,\"episode_number_authoritative\":true}", Encoding.UTF8, "application/json") });
             if (uri.Host == "part-source.invalid" && uri.AbsolutePath == "/api" && RssResponse != null)
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
                     Content = new StringContent(RssResponse, Encoding.UTF8, "application/rss+xml") });

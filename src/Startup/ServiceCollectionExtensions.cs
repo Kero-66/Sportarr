@@ -425,6 +425,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ImportFileSuppressionService>();
         services.AddScoped<SportsFileNameParser>();
         services.AddScoped<FileNamingService>();
+        services.AddScoped<EpisodeNumberResolver>();
         services.AddScoped<FileRenameService>();
         services.AddScoped<EventPartDetector>();
         services.AddScoped<FileFormatManager>();

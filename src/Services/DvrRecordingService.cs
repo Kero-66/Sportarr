@@ -54,6 +54,7 @@ public class DvrRecordingService
     private readonly DiskSpaceService _diskSpaceService;
     private readonly NotificationService _notificationService;
     private readonly SportarrApiClient _sportarrApiClient;
+    private readonly EpisodeNumberResolver _episodeNumberResolver;
     private readonly DvrEarlyFinishGuard _earlyFinishGuard;
 
     public DvrRecordingService(
@@ -66,6 +67,7 @@ public class DvrRecordingService
         DiskSpaceService diskSpaceService,
         NotificationService notificationService,
         SportarrApiClient sportarrApiClient,
+        EpisodeNumberResolver episodeNumberResolver,
         DvrEarlyFinishGuard earlyFinishGuard)
     {
         _logger = logger;
@@ -77,6 +79,7 @@ public class DvrRecordingService
         _diskSpaceService = diskSpaceService;
         _notificationService = notificationService;
         _sportarrApiClient = sportarrApiClient;
+        _episodeNumberResolver = episodeNumberResolver;
         _earlyFinishGuard = earlyFinishGuard;
     }
 
@@ -1595,7 +1598,7 @@ public class DvrRecordingService
 
             // IMPORTANT: Calculate episode number BEFORE building folder path
             // This ensures the {Episode} token in EventFolderFormat has the correct value
-            var episodeNumber = await CalculateEpisodeNumberAsync(eventInfo);
+        var episodeNumber = await _episodeNumberResolver.ResolveAsync(eventInfo);
 
             // Update event's episode number if needed
             if (!eventInfo.EpisodeNumber.HasValue || eventInfo.EpisodeNumber.Value != episodeNumber)
@@ -1914,39 +1917,6 @@ public class DvrRecordingService
 
         // Root folders live in the RootFolders table (loaded via RootFolderLoader).
         return settings;
-    }
-
-    /// <summary>
-    /// Calculate episode number for an event (same logic as FileImportService)
-    /// </summary>
-    private async Task<int> CalculateEpisodeNumberAsync(Event eventInfo)
-    {
-        if (!eventInfo.LeagueId.HasValue)
-            return 1;
-
-        var season = eventInfo.Season ?? eventInfo.SeasonNumber?.ToString() ?? (eventInfo.BroadcastDate ?? eventInfo.EventDate).Year.ToString();
-
-        var eventsInSeason = await _db.Events
-            .Where(e => e.LeagueId == eventInfo.LeagueId &&
-                       (e.Season == season ||
-                        (e.SeasonNumber.HasValue && e.SeasonNumber.ToString() == season) ||
-                        (e.BroadcastDate.HasValue ? e.BroadcastDate.Value.Year.ToString() == season : e.EventDate.Year.ToString() == season)))
-            .OrderBy(e => e.EventDate)
-            .ThenBy(e => e.ExternalId)
-            .Select(e => new { e.Id, e.EventDate, e.ExternalId })
-            .ToListAsync();
-
-        if (eventsInSeason.Count == 0)
-            return 1;
-
-        var position = eventsInSeason.FindIndex(e => e.Id == eventInfo.Id);
-        if (position < 0)
-        {
-            position = eventsInSeason.Count(e => e.EventDate < eventInfo.EventDate ||
-                (e.EventDate == eventInfo.EventDate && string.Compare(e.ExternalId, eventInfo.ExternalId, StringComparison.Ordinal) < 0));
-        }
-
-        return position + 1;
     }
 
     private static string SanitizeFileName(string name)

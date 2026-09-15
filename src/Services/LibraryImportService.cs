@@ -31,7 +31,7 @@ public class LibraryImportService
     private readonly FileNamingService _namingService;
     private readonly EventPartDetector _partDetector;
     private readonly ConfigService _configService;
-    private readonly SportarrApiClient _sportarrApiClient;
+    private readonly EpisodeNumberResolver _episodeNumberResolver;
     private readonly DiskSpaceService _diskSpaceService;
     private readonly NotificationService _notificationService;
     private readonly IMetadataWriterService _metadataWriterService;
@@ -46,7 +46,7 @@ public class LibraryImportService
         FileNamingService namingService,
         EventPartDetector partDetector,
         ConfigService configService,
-        SportarrApiClient sportarrApiClient,
+        EpisodeNumberResolver episodeNumberResolver,
         DiskSpaceService diskSpaceService,
         CustomFormatService customFormatService,
         NotificationService notificationService,
@@ -59,7 +59,7 @@ public class LibraryImportService
         _namingService = namingService;
         _partDetector = partDetector;
         _configService = configService;
-        _sportarrApiClient = sportarrApiClient;
+        _episodeNumberResolver = episodeNumberResolver;
         _diskSpaceService = diskSpaceService;
         _customFormatService = customFormatService;
         _notificationService = notificationService;
@@ -561,6 +561,7 @@ public class LibraryImportService
                         string destinationPath;
                         try
                         {
+                            await _episodeNumberResolver.ResolveAsync(existingEvent);
                             destinationPath = importInPlace ? request.FilePath : await TransferFileToLibraryAsync(
                                 request.FilePath,
                                 existingEvent,
@@ -992,7 +993,7 @@ public class LibraryImportService
         // IMPORTANT: Fetch episode number from API BEFORE building folder path
         // This ensures the {Episode} token in EventFolderFormat has the correct value
         // Episode number is the source of truth from sportarr.net API for Plex/Jellyfin/Emby metadata
-        var episodeNumber = await GetApiEpisodeNumberAsync(eventInfo);
+        var episodeNumber = await _episodeNumberResolver.ResolveAsync(eventInfo);
         if (episodeNumber != eventInfo.EpisodeNumber)
         {
             eventInfo.EpisodeNumber = episodeNumber;
@@ -2228,6 +2229,7 @@ public class LibraryImportService
     private async Task<string> BuildDestinationPreviewAsync(Event matchedEvent, string originalFileName, MediaManagementSettings settings)
     {
         var extension = Path.GetExtension(originalFileName);
+        var episodeNumber = await _episodeNumberResolver.ResolveAsync(matchedEvent);
 
         // Use FileNamingService to build folder path - this handles all token replacements
         // ({League}, {Season}, {Year}, {Month}, {Day}, {Episode}, {Event Title}, etc.)
@@ -2238,7 +2240,6 @@ public class LibraryImportService
         if (settings.RenameEvents && !string.IsNullOrEmpty(settings.StandardFileFormat))
         {
             // Use the actual file format with all tokens including episode number
-            var episodeNumber = matchedEvent.EpisodeNumber ?? 1;
             var brandingDate = matchedEvent.BroadcastDate ?? matchedEvent.EventDate.Date;
             // Parse the real filename so the preview shows the name the
             // import will actually produce. The old hardcoded
@@ -2323,60 +2324,6 @@ public class LibraryImportService
 
         // No year found
         return null;
-    }
-
-    /// <summary>
-    /// Get episode number from the sportarr.net API - this is the source of truth for Plex/Jellyfin/Emby metadata.
-    /// Falls back to existing episode number if API call fails.
-    /// </summary>
-    private async Task<int> GetApiEpisodeNumberAsync(Event eventInfo)
-    {
-        // If event already has an episode number from API sync, use it
-        if (eventInfo.EpisodeNumber.HasValue && eventInfo.EpisodeNumber.Value > 0)
-        {
-            _logger.LogDebug("[Episode Number] Using existing API episode number E{EpisodeNumber} for event {EventTitle}",
-                eventInfo.EpisodeNumber.Value, eventInfo.Title);
-            return eventInfo.EpisodeNumber.Value;
-        }
-
-        // No episode number - fetch from API
-        if (!eventInfo.LeagueId.HasValue)
-        {
-            _logger.LogWarning("[Episode Number] No league for event {EventTitle}, defaulting to episode 1", eventInfo.Title);
-            return 1;
-        }
-
-        var league = await _db.Leagues.FindAsync(eventInfo.LeagueId.Value);
-        if (league == null || string.IsNullOrEmpty(league.ExternalId))
-        {
-            _logger.LogWarning("[Episode Number] League not found or has no ExternalId for event {EventTitle}, defaulting to episode 1", eventInfo.Title);
-            return 1;
-        }
-
-        var season = eventInfo.Season ?? eventInfo.SeasonNumber?.ToString() ?? (eventInfo.BroadcastDate ?? eventInfo.EventDate).Year.ToString();
-
-        try
-        {
-            var apiEpisodeMap = await _sportarrApiClient.GetEpisodeNumbersFromApiAsync(league.ExternalId, season);
-            if (apiEpisodeMap != null && !string.IsNullOrEmpty(eventInfo.ExternalId) &&
-                apiEpisodeMap.TryGetValue(eventInfo.ExternalId, out var apiEpisodeNumber))
-            {
-                _logger.LogInformation("[Episode Number] Got episode E{EpisodeNumber} from API for event {EventTitle}",
-                    apiEpisodeNumber, eventInfo.Title);
-                return apiEpisodeNumber;
-            }
-            else
-            {
-                _logger.LogWarning("[Episode Number] Event {EventTitle} not found in API episode map (ExternalId: {ExternalId}), defaulting to episode 1",
-                    eventInfo.Title, eventInfo.ExternalId);
-                return 1;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "[Episode Number] Failed to fetch API episode number for event {EventTitle}, defaulting to episode 1", eventInfo.Title);
-            return 1;
-        }
     }
 
     /// <summary>

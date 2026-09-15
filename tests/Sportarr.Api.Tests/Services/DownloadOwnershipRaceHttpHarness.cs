@@ -79,7 +79,7 @@ internal sealed class DownloadOwnershipRaceHttpHarness : IAsyncDisposable
             typeof(DownloadClientService), typeof(NotificationService), typeof(SportarrApiClient),
             typeof(MediaFileParser), typeof(SportsFileNameParser), typeof(FileNamingService), typeof(EventPartDetector),
             typeof(DiskSpaceService), typeof(ImportFileSuppressionService), typeof(CustomFormatService),
-            typeof(CustomFormatMatchCache), typeof(ReleaseEvaluator), typeof(PackImportService), typeof(FileImportService),
+            typeof(CustomFormatMatchCache), typeof(ReleaseEvaluator), typeof(EpisodeNumberResolver), typeof(PackImportService), typeof(FileImportService),
             typeof(EventQueryService), typeof(DelayProfileService), typeof(ReleaseMatchingService), typeof(ReleaseCacheService),
             typeof(ReleaseMatchScorer), typeof(SearchResultCache), typeof(ReleaseProfileService), typeof(QualityDetectionService),
             typeof(IndexerStatusService), typeof(IndexerSearchService), typeof(AutomaticSearchService), typeof(LibraryImportService)
@@ -319,6 +319,9 @@ internal sealed class DownloadOwnershipRaceHttpHarness : IAsyncDisposable
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var uri = request.RequestUri!;
+            if (uri.Host == "sportarr.net" &&
+                uri.AbsolutePath.StartsWith("/api/metadata/agents/episode/", StringComparison.Ordinal))
+                return Json(new { episode_number = 1, episode_number_authoritative = true });
             if (uri.Host == "ownership-source.invalid")
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(
                     "<?xml version=\"1.0\"?><nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"fixture\" subject=\"fixture\" date=\"1599004800\"><groups><group>alt.test</group></groups><segments><segment bytes=\"4096\" number=\"1\">fixture@invalid</segment></segments></file></nzb>", Encoding.UTF8, "application/x-nzb") };

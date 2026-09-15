@@ -175,4 +175,53 @@ public class EventQueryServiceTeamSportTests
 
         service.BuildEventQueries(evt).Should().Equal("MLS 2026 09", "MLS 2026");
     }
+
+    [Theory]
+    [InlineData("FA Cup", "Chelsea vs Manchester City", "Chelsea", "Manchester City", "FA Cup Chelsea Manchester City")]
+    [InlineData("UEFA Europa League", "Nottingham Forest vs Porto", "Nottingham Forest", "FC Porto", "Nottingham Forest Porto")]
+    [InlineData("FIFA World Cup", "Spain vs Argentina", "Spain", "Argentina", "Argentina Spain")]
+    [InlineData("English Womens Super League", "Chelsea Women vs Manchester United WFC", "Chelsea Women", "Manchester United WFC", "WSL Chelsea Manchester United")]
+    public void BuildEventQueries_VerifiedCupOrWsl_UsesOneObservedParticipantQuery(
+        string leagueName,
+        string title,
+        string homeTeamName,
+        string awayTeamName,
+        string expected)
+    {
+        var service = CreateService();
+        var evt = new Event
+        {
+            Title = title,
+            Sport = "Soccer",
+            EventDate = new DateTime(2026, 9, 13, 0, 0, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 9, 13),
+            League = new League { Name = leagueName, Sport = "Soccer" },
+            HomeTeamId = 30,
+            AwayTeamId = 40,
+            HomeTeamName = homeTeamName,
+            AwayTeamName = awayTeamName
+        };
+
+        service.BuildEventQueries(evt).Should().Equal(expected);
+    }
+
+    [Fact]
+    public void BuildEventQueries_EnglishChampionship_UsesOneReusableLeagueYearQuery()
+    {
+        var service = CreateService();
+        var evt = new Event
+        {
+            Title = "Sheffield United vs Wolverhampton Wanderers",
+            Sport = "Soccer",
+            EventDate = new DateTime(2026, 9, 13, 11, 0, 0, DateTimeKind.Utc),
+            BroadcastDate = new DateTime(2026, 9, 13),
+            League = new League { Name = "English League Championship", Sport = "Soccer" },
+            HomeTeamId = 30,
+            AwayTeamId = 40,
+            HomeTeamName = "Sheffield United",
+            AwayTeamName = "Wolverhampton Wanderers"
+        };
+
+        service.BuildEventQueries(evt).Should().Equal("EFL Championship 2026");
+    }
 }

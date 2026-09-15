@@ -81,6 +81,9 @@ public class ReleaseMatchingService
         new Regex(@"\bpost[\s\.\-_]*race", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // post race, post-race, postrace
         new Regex(@"\b(?:the[\s\.\-_]*)?f1[\s\.\-_]+show\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // The F1 Show
         new Regex(@"\bpost[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),            // post match, post-match, postmatch
+        new Regex(@"\bpre[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // pre match, pre-match, prematch
+        new Regex(@"\bhalf[\s\.\-_]*time[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // halftime show
+        new Regex(@"\b(?:1st|first|2nd|second)[\s\.\-_]*half\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // partial match
         new Regex(@"\bwarm[\s\.\-_]*up\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // warm up (F1 pre-show)
         new Regex(@"\bweekend[\s\.\-_]*warm[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // weekend warm up (Sky F1)
         new Regex(@"\bted'?s?[\s\.\-_]*\w*[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // Ted's Notebook
@@ -555,6 +558,25 @@ public class ReleaseMatchingService
         // were missing in RssSyncService — causing team validation to be completely bypassed during RSS sync
         if (isTeamSport)
         {
+            if (evt.League != null &&
+                FootballReleaseNamePolicy.NamesDifferentCompetition(release.Title, evt.League.Name))
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Different competition found in release");
+            }
+
+            if (evt.League != null &&
+                FootballReleaseNamePolicy.IsEnglishWomensSuperLeague(evt.League.Name) &&
+                !TitleNamesLeague(release.Title, evt.League) &&
+                !(ContainsCanonicalTeamOrUserAlias(normalizedRelease, evt.HomeTeamName!, evt.HomeTeam) &&
+                  ContainsCanonicalTeamOrUserAlias(normalizedRelease, evt.AwayTeamName!, evt.AwayTeam)))
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Women's league identity not found in release");
+            }
+
             var (titleHomeName, titleAwayName) = ResolveTitleTeamAliases(evt);
             var teamMatch = ValidateTeamNames(
                 release.Title,
@@ -1469,6 +1491,16 @@ public class ReleaseMatchingService
         var awayMatches = ContainsTeamName(normalizedRelease, awayTeamName, awayTeam) ||
             (!string.IsNullOrWhiteSpace(titleAwayName) && ContainsTeamName(normalizedRelease, titleAwayName, awayTeam));
 
+        if (league != null && TitleNamesLeague(releaseTitle, league))
+        {
+            var baseHome = FootballReleaseNamePolicy.BaseParticipantName(titleHomeName ?? homeTeamName, league.Name);
+            var baseAway = FootballReleaseNamePolicy.BaseParticipantName(titleAwayName ?? awayTeamName, league.Name);
+            if (!homeMatches && !baseHome.Equals(titleHomeName ?? homeTeamName, StringComparison.OrdinalIgnoreCase))
+                homeMatches = ContainsTeamName(normalizedRelease, baseHome, homeTeam);
+            if (!awayMatches && !baseAway.Equals(titleAwayName ?? awayTeamName, StringComparison.OrdinalIgnoreCase))
+                awayMatches = ContainsTeamName(normalizedRelease, baseAway, awayTeam);
+        }
+
         var normalizedHomeTeam = NormalizeTitle(homeTeamName);
         var normalizedAwayTeam = NormalizeTitle(awayTeamName);
         var homeVariantMatches = !homeMatches
@@ -1668,6 +1700,22 @@ public class ReleaseMatchingService
         }
 
         return false;
+    }
+
+    private static bool ContainsCanonicalTeamOrUserAlias(
+        string normalizedRelease,
+        string teamName,
+        Team? team)
+    {
+        if (ContainsWholeWord(normalizedRelease, NormalizeTitle(teamName)))
+            return true;
+
+        if (team == null || string.IsNullOrWhiteSpace(team.UserAliases))
+            return false;
+
+        return SplitAliases(team.UserAliases)
+            .Select(NormalizeTitle)
+            .Any(alias => ContainsWholeWord(normalizedRelease, alias));
     }
 
     /// <summary>
@@ -1900,6 +1948,9 @@ public class ReleaseMatchingService
                 yield return alias;
         }
 
+        foreach (var alias in FootballReleaseNamePolicy.LeagueAliases(league))
+            yield return alias;
+
         // "<Word> <number>" series conventionally abbreviate to first letter
         // + number (Formula 1 → F1). Generated so leagues whose upstream
         // record carries no alternate names still match the common form.
@@ -2032,9 +2083,10 @@ public class ReleaseMatchingService
     /// </summary>
     private string? DetectNonEventContent(string releaseTitle)
     {
+        var searchableTitle = releaseTitle.Replace('_', ' ');
         foreach (var pattern in NonEventContentPatterns)
         {
-            var match = pattern.Match(releaseTitle);
+            var match = pattern.Match(searchableTitle);
             if (match.Success)
             {
                 // Return a human-readable description of what was detected

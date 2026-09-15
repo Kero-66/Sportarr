@@ -822,7 +822,18 @@ public class EventQueryService
             evt.AwayTeamId.HasValue &&
             evt.HomeTeamId.Value != evt.AwayTeamId.Value;
 
-        if (hasStablePair && (leaguePrefix == "NBA" || IsVerifiedCompactPairLeague(leagueName)))
+        if (hasStablePair && FootballReleaseNamePolicy.IsEnglishChampionship(leagueName))
+        {
+            queries.Add($"EFL Championship {year}");
+            AddTeamAliasQueries(evt, "EFL Championship", year, queries);
+            return;
+        }
+
+        if (hasStablePair && (leaguePrefix == "NBA" || IsVerifiedCompactPairLeague(leagueName) ||
+            FootballReleaseNamePolicy.IsFaCup(leagueName) ||
+            FootballReleaseNamePolicy.IsEuropaLeague(leagueName) ||
+            FootballReleaseNamePolicy.IsEnglishWomensSuperLeague(leagueName) ||
+            FootballReleaseNamePolicy.IsFifaWorldCup(leagueName)))
         {
             if (leaguePrefix == "NBA")
             {
@@ -840,7 +851,13 @@ public class EventQueryService
                     .Where(name => !string.IsNullOrWhiteSpace(name))
                     .ToArray();
                 var teamNames = titleTeams.Length == 2 ? titleTeams : new[] { homeName!, awayName! };
-                queries.Add(string.Join(" ", teamNames.Order(StringComparer.OrdinalIgnoreCase)));
+                var participantQuery = string.Join(" ", teamNames
+                    .Select(name => FootballReleaseNamePolicy.BaseParticipantName(name, leagueName))
+                    .Order(StringComparer.OrdinalIgnoreCase));
+                var queryPrefix = FootballReleaseNamePolicy.IsFaCup(leagueName) ? "FA Cup "
+                    : FootballReleaseNamePolicy.IsEnglishWomensSuperLeague(leagueName) ? "WSL "
+                    : "";
+                queries.Add(queryPrefix + participantQuery);
             }
 
             AddTeamAliasQueries(evt, leaguePrefix, year, queries);

@@ -549,7 +549,7 @@ public class SportsFileNameParser
     // European day-first dating ("Spain vs Argentina 19.07.2026"). Only
     // consulted when the year-first pattern found nothing; the lookarounds
     // keep the two-digit groups from binding inside longer digit runs.
-    private static readonly Regex DayFirstDatePattern = new(@"(?<!\d)(?<day>\d{2})[\.\-\s](?<month>\d{2})[\.\-\s](?<year>20[12]\d)(?!\d)", RegexOptions.Compiled);
+    private static readonly Regex DayFirstDatePattern = new(@"(?<!\d)(?<day>\d{2})[\.\-/\s](?<month>\d{2})[\.\-/\s](?<year>20[12]\d)(?!\d)", RegexOptions.Compiled);
     // Trailing day-month pair with the year elsewhere in the title
     // ("NBA Finals 2026 Knicks vs Spurs Game 5 13 06 1080p..."). The pair is
     // only trusted when it sits directly before the quality/source token (or
@@ -777,14 +777,13 @@ public class SportsFileNameParser
 
         if (result.EventDate == null)
         {
-            // Try season span extraction first (e.g., "2025-2026" or "2025-26").
-            // Span detection MUST run before the day-first date attempt: a
-            // title like "NBA.2025.2026.…10.28.2025" carries both, and the
-            // span (with its year-range matching semantics) is the signal the
-            // rest of the pipeline is built around.
+            // Prefer season spans over ambiguous dot dates. A slash date after
+            // a season span is an explicit event date and must take precedence.
             var seasonSpanMatch = SeasonSpanPattern.Match(cleanName);
-            if (!seasonSpanMatch.Success &&
-                DayFirstDatePattern.Match(cleanName) is { Success: true } dayFirstMatch &&
+            var dayFirstMatch = DayFirstDatePattern.Match(cleanName);
+            var hasExplicitSlashDate = dayFirstMatch.Success && dayFirstMatch.Value.Contains('/');
+            if ((!seasonSpanMatch.Success || hasExplicitSlashDate) &&
+                dayFirstMatch.Success &&
                 int.TryParse(dayFirstMatch.Groups["day"].Value, out var dfDay) &&
                 int.TryParse(dayFirstMatch.Groups["month"].Value, out var dfMonth) &&
                 int.TryParse(dayFirstMatch.Groups["year"].Value, out var dfYear))

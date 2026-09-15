@@ -33,6 +33,7 @@ internal sealed class CompetitionDateRouteHarness : IAsyncDisposable
     public SportarrDbContext Db { get; }
     public HttpClient Client { get; }
     public DateSourceTransport Transport { get; }
+    public string DropFolder => Path.Combine(_directory, "drop");
     public IServiceProvider Services => _app.Services;
     public Event Event { get; private set; } = null!;
     public Indexer Indexer { get; private set; } = null!;
@@ -198,6 +199,7 @@ internal sealed class CompetitionDateRouteHarness : IAsyncDisposable
         public List<Dictionary<string, string>> Searches { get; } = new();
         public List<string> Unexpected { get; } = new();
         public int DescriptorAttempts { get; private set; }
+        public bool DescriptorSucceeds { get; set; }
         public List<object> Responses { get; } = new();
         public Func<Dictionary<string, string>, IEnumerable<ReleaseSearchResult>> Results { get; set; } = _ => Array.Empty<ReleaseSearchResult>();
         public DateSourceTransport(string host) => Host = host;
@@ -214,9 +216,19 @@ internal sealed class CompetitionDateRouteHarness : IAsyncDisposable
             if (request.Method == HttpMethod.Get && uri.AbsolutePath == "/payload/athletics-date-offer")
             {
                 DescriptorAttempts++;
-                Responses.Add(new { path = uri.PathAndQuery, status = 410, body = "" });
-                // Selection is observable without simulating a successful download.
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Gone));
+                if (!DescriptorSucceeds)
+                {
+                    Responses.Add(new { path = uri.PathAndQuery, status = 410, body = "" });
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Gone));
+                }
+
+                var payload = Encoding.ASCII.GetBytes(
+                    "d8:announce31:http://tracker.invalid/announce4:infod6:lengthi1e4:name16:sportarr-fixture12:piece lengthi16384e6:pieces20:00000000000000000000ee");
+                Responses.Add(new { path = uri.PathAndQuery, status = 200, bytes = payload.Length });
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(payload)
+                });
             }
             if (request.Method != HttpMethod.Get || uri.AbsolutePath != "/api")
             {

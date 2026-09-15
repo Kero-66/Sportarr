@@ -1,3 +1,4 @@
+using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -12,6 +13,22 @@ namespace Sportarr.Api.Tests.SearchValidation;
 public sealed class CompetitionDateRouteDiagnosticTests(ITestOutputHelper output)
 {
     private const string LigueOneTitle = "Ligue 1 2026 Paris Saint Germain vs AS Monaco 04 09 1080p30fps EN beIN";
+
+    public static IEnumerable<object[]> VerifiedFootballRoutes()
+    {
+        var cases = new[]
+        {
+            new[] { "FA Cup", "Chelsea vs Manchester City", "Chelsea", "Manchester City", "2026-05-16", "FA Cup Chelsea Manchester City", "FA Cup Chelsea Vs Manchester City 16 05 2026 TNT Sports 2160p HDR10 Dolby Atmos WEB DL" },
+            new[] { "English League Championship", "Sheffield United vs Wolverhampton Wanderers", "Sheffield United", "Wolverhampton Wanderers", "2026-09-13", "EFL Championship 2026", "EFL Championship 2026 Sheffield United vs Wolverhampton 13 09 1080p60fps EN Paramount" },
+            new[] { "UEFA Europa League", "Nottingham Forest vs Porto", "Nottingham Forest", "FC Porto", "2026-04-16", "Nottingham Forest Porto", "UEFA Europa League Quarter Final 2026 Nottingham Forest vs Porto 2nd leg 16 04 720pEN50fps DAZN" },
+            new[] { "English Womens Super League", "Chelsea Women vs Manchester United WFC", "Chelsea Women", "Manchester United WFC", "2022-11-06", "WSL Chelsea Manchester United", "BWSL.2022.11.06.Manchester.United.vs.Chelsea.720p.WEB.h264-ULTRAS" },
+            new[] { "FIFA World Cup", "Switzerland vs Colombia", "Switzerland", "Colombia", "2026-07-07", "Colombia Switzerland", "FIFA WC 2026 R16 Switzerland vs Colombia 2160pEN NOWHK HDTV H265 THECiG" }
+        };
+
+        foreach (var route in new[] { "manual", "automatic", "rss" })
+        foreach (var values in cases)
+            yield return new object[] { route }.Concat(values).ToArray();
+    }
 
     [Theory]
     [InlineData("manual", 0)]
@@ -184,5 +201,102 @@ public sealed class CompetitionDateRouteDiagnosticTests(ITestOutputHelper output
             Assert.Null(task.Exception);
             Assert.Equal(1, rig.Transport.DescriptorAttempts);
         }
+    }
+
+    [Theory]
+    [MemberData(nameof(VerifiedFootballRoutes))]
+    public async Task ObservedFootballOfferTraversesEverySearchRouteWithOneQuery(
+        string route,
+        string leagueName,
+        string eventTitle,
+        string homeTeam,
+        string awayTeam,
+        string eventDate,
+        string expectedQuery,
+        string releaseTitle)
+    {
+        await using var rig = await CompetitionDateRouteHarness.CreateAsync(0);
+        rig.Event.Title = eventTitle;
+        rig.Event.Sport = "Soccer";
+        rig.Event.ExternalId = "fixture:" + leagueName.Replace(" ", "-", StringComparison.Ordinal).ToLowerInvariant();
+        rig.Event.EventDate = DateTime.SpecifyKind(DateTime.Parse(eventDate), DateTimeKind.Utc);
+        rig.Event.BroadcastDate = rig.Event.EventDate.Date;
+        rig.Event.BroadcastDateVerified = true;
+        rig.Event.HomeTeamId = 30;
+        rig.Event.AwayTeamId = 40;
+        rig.Event.HomeTeamName = homeTeam;
+        rig.Event.AwayTeamName = awayTeam;
+        rig.Event.League!.Name = leagueName;
+        rig.Event.League.Sport = "Soccer";
+        rig.Event.League.SearchQueryTemplate = null;
+        rig.Transport.DescriptorSucceeds = true;
+        rig.Profile.Items.Clear();
+        await rig.Db.SaveChangesAsync();
+
+        var release = new ReleaseSearchResult
+        {
+            Title = releaseTitle,
+            Guid = "football-route-offer",
+            DownloadUrl = "http://" + rig.Transport.Host + "/payload/athletics-date-offer",
+            Indexer = rig.Indexer.Name,
+            IndexerId = rig.Indexer.Id,
+            Protocol = "Torrent",
+            Seeders = 20,
+            PublishDate = rig.Publication,
+            Size = 4_294_967_296
+        };
+        rig.Transport.Results = query => route == "rss" || query.GetValueOrDefault("q") == expectedQuery
+            ? new[] { release }
+            : Array.Empty<ReleaseSearchResult>();
+
+        List<ReleaseSearchResult>? manual = null;
+        AppTask? task = null;
+        if (route == "manual")
+        {
+            var response = await rig.RequestAsync("POST", $"/api/event/{rig.Event.Id}/search");
+            manual = response.GetProperty("results")
+                .Deserialize<List<ReleaseSearchResult>>(new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        }
+        else
+        {
+            task = await rig.RunTaskAsync(route);
+        }
+
+        var query = Assert.Single(rig.Transport.Searches);
+        Assert.Equal("search", query["t"]);
+        if (route == "rss") Assert.False(query.ContainsKey("q"));
+        else Assert.Equal(expectedQuery, query["q"]);
+        Assert.Empty(rig.Transport.Unexpected);
+
+        if (manual != null)
+        {
+            var result = Assert.Single(manual);
+            Assert.Equal(releaseTitle, result.Title);
+            Assert.True(result.Approved, string.Join("; ", result.Rejections));
+            var grabBody = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+                JsonSerializer.Serialize(result))!;
+            grabBody["eventId"] = JsonSerializer.SerializeToElement(rig.Event.Id);
+            using var grabResponse = await rig.Client.PostAsJsonAsync("/api/release/grab", grabBody);
+            var grabResponseBody = await grabResponse.Content.ReadAsStringAsync();
+            Assert.True(grabResponse.IsSuccessStatusCode, grabResponseBody);
+        }
+        else
+        {
+            Assert.NotNull(task);
+            Assert.Equal(Sportarr.Api.Models.TaskStatus.Completed, task.Status);
+            Assert.Null(task.Exception);
+            Assert.Equal(1, rig.Transport.DescriptorAttempts);
+        }
+
+        Assert.Equal(1, rig.Transport.DescriptorAttempts);
+        using var scope = rig.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
+        var queue = Assert.Single(await db.DownloadQueue.AsNoTracking().ToListAsync());
+        Assert.Equal(rig.Event.Id, queue.EventId);
+        Assert.Equal(releaseTitle, queue.Title);
+        var history = Assert.Single(await db.GrabHistory.AsNoTracking().ToListAsync());
+        Assert.Equal(rig.Event.Id, history.EventId);
+        Assert.Equal(releaseTitle, history.Title);
+        Assert.Single(Directory.GetFiles(rig.DropFolder, "*.torrent"));
     }
 }

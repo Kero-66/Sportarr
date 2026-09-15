@@ -644,6 +644,7 @@ public class NotificationService : INotificationService
             NotificationTrigger.OnRecordingStarted => "onRecordingStarted",
             NotificationTrigger.OnRecordingCompleted => "onRecordingCompleted",
             NotificationTrigger.OnRecordingFailed => "onRecordingFailed",
+            NotificationTrigger.OnEpgSyncCompleted => "onEpgSyncCompleted",
             NotificationTrigger.Test => null, // Always send test notifications
             _ => null
         };
@@ -966,6 +967,7 @@ public class NotificationService : INotificationService
         [NotificationTrigger.OnRecordingStarted] = "RecordingStarted",
         [NotificationTrigger.OnRecordingCompleted] = "RecordingCompleted",
         [NotificationTrigger.OnRecordingFailed] = "RecordingFailed",
+        [NotificationTrigger.OnEpgSyncCompleted] = "EpgSyncCompleted",
         [NotificationTrigger.Test] = "Test"
     };
 
@@ -1013,7 +1015,13 @@ public class NotificationService : INotificationService
             PendingCount = data?.PendingCount,
             RecordingId = data?.RecordingId,
             RecordingTitle = data?.RecordingTitle,
-            ChannelId = data?.ChannelId
+            ChannelId = data?.ChannelId,
+            EpgSourceId = data?.EpgSourceId,
+            EpgSourceName = data?.EpgSourceName,
+            ChannelCount = data?.ChannelCount,
+            ProgramCount = data?.ProgramCount,
+            AutoMappedChannelCount = data?.AutoMappedChannelCount,
+            CompletedAt = data?.CompletedAt
         };
 
         // Series: event/league/sport identity, whenever this trigger concerns a specific
@@ -2042,5 +2050,6 @@ public enum NotificationTrigger
     OnRecordingStarted,
     OnRecordingCompleted,
     OnRecordingFailed,
+    OnEpgSyncCompleted,
     Test
 }

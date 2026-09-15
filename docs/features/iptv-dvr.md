@@ -122,6 +122,12 @@ The TV Guide provides an EPG-style grid of your IPTV channels and their programm
 
 Access it from **IPTV > TV Guide** in the navigation.
 
+EPG downloads are limited to 256 MB by default. Change **EPG download limit
+(MB)** under **IPTV > Sources > Refresh and Guide Limits** when a
+provider supplies a larger XMLTV file. The allowed range is 1 through 512 MB.
+A separate 512 MB limit still applies after decompression to protect Sportarr
+from damaged or unexpectedly large compressed guides.
+
 ## Filtered M3U/EPG export
 
 Sportarr can serve filtered playlists and EPG data for external IPTV apps like TiviMate or IPTV Smarters:

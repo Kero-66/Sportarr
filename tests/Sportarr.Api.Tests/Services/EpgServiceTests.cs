@@ -6,6 +6,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Configuration;
 using Moq;
 
 namespace Sportarr.Api.Tests.Services;
@@ -37,7 +38,10 @@ public class EpgServiceTests : IDisposable
     {
         var httpClientFactory = new Mock<IHttpClientFactory>();
         httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(new HttpClient());
-        var xmltvParser = new XmltvParserService(NullLogger<XmltvParserService>.Instance, httpClientFactory.Object);
+        var xmltvParser = new XmltvParserService(
+            NullLogger<XmltvParserService>.Instance,
+            httpClientFactory.Object,
+            new ConfigService(new ConfigurationBuilder().Build(), NullLogger<ConfigService>.Instance));
         return new EpgService(NullLogger<EpgService>.Instance, db, xmltvParser);
     }
 

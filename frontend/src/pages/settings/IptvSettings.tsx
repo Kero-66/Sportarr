@@ -20,6 +20,7 @@ import { runSettingsSave } from '../../hooks/useSettings';
 import PageHeader from '../../components/PageHeader';
 import PageShell from '../../components/PageShell';
 import EpgSourcesPanel from '../../components/EpgSourcesPanel';
+import { BUTTON_PRIMARY } from '../../utils/designTokens';
 
 // IPTV Source Types
 type IptvSourceType = 'M3U' | 'Xtream';
@@ -286,11 +287,12 @@ export default function IptvSettings() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Automatic refresh intervals (hours; 0 = disabled). Stored in the global
-  // settings and consumed by the background refresh service.
+  // Playlist and guide limits stored in the global settings.
   const [iptvRefreshHours, setIptvRefreshHours] = useState(168);
   const [epgRefreshHours, setEpgRefreshHours] = useState(48);
-  const [savingRefresh, setSavingRefresh] = useState(false);
+  const [epgMaxDownloadSizeMb, setEpgMaxDownloadSizeMb] = useState('256');
+  const [iptvSettingsLoadState, setIptvSettingsLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [savingIptvSettings, setSavingIptvSettings] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -298,14 +300,23 @@ export default function IptvSettings() {
         const { data } = await apiClient.get('/settings');
         if (typeof data.iptvPlaylistRefreshHours === 'number') setIptvRefreshHours(data.iptvPlaylistRefreshHours);
         if (typeof data.epgRefreshHours === 'number') setEpgRefreshHours(data.epgRefreshHours);
+        if (typeof data.epgMaxDownloadSizeMb === 'number') setEpgMaxDownloadSizeMb(String(data.epgMaxDownloadSizeMb));
+        setIptvSettingsLoadState('ready');
       } catch {
-        // Non-fatal: the card just shows defaults.
+        setIptvSettingsLoadState('error');
       }
     })();
   }, []);
 
-  const saveRefreshIntervals = async () => {
-    setSavingRefresh(true);
+  const saveIptvSettings = async () => {
+    if (iptvSettingsLoadState !== 'ready') return;
+
+    setSavingIptvSettings(true);
+    const requestedLimit = Number(epgMaxDownloadSizeMb);
+    const normalizedLimit = Number.isFinite(requestedLimit)
+      ? Math.min(512, Math.max(1, Math.trunc(requestedLimit)))
+      : 256;
+    setEpgMaxDownloadSizeMb(String(normalizedLimit));
     try {
       // PUT expects the full settings object, so merge onto the current one,
       // inside the shared chain so a save from another settings page cannot
@@ -316,12 +327,13 @@ export default function IptvSettings() {
           ...current,
           iptvPlaylistRefreshHours: Math.max(0, iptvRefreshHours),
           epgRefreshHours: Math.max(0, epgRefreshHours),
+          epgMaxDownloadSizeMb: normalizedLimit,
         });
       });
     } catch {
-      setError('Failed to save refresh intervals');
+      setError('Failed to save IPTV settings');
     } finally {
-      setSavingRefresh(false);
+      setSavingIptvSettings(false);
     }
   };
 
@@ -1184,22 +1196,28 @@ export default function IptvSettings() {
         {/* External App Subscription URLs - playlists derived from your sources and guide */}
         <SubscriptionUrlsSection />
 
-        {/* Automatic refresh intervals - background sync settings, rarely touched */}
+        {/* Refresh intervals and guide download limits. */}
         <div className="mb-8 rounded-lg border border-gray-800 bg-gray-900/70 p-6">
-          <h3 className="text-lg font-semibold text-white mb-1">Automatic Refresh</h3>
+          <h3 className="text-lg font-semibold text-white mb-1">Refresh and Guide Limits</h3>
           <p className="text-sm text-gray-400 mb-4">
-            Playlists and guide data are re-synced in the background when older than these intervals.
-            Manual syncs reset the clock. Set to 0 to disable.
+            Control background refresh timing and the largest XMLTV download Sportarr will accept.
+            Set a refresh interval to 0 to disable it.
           </p>
+          {iptvSettingsLoadState === 'error' && (
+            <p className="mb-4 text-sm text-red-400">
+              Unable to load these settings. Reload the page to try again.
+            </p>
+          )}
           <div className="flex flex-wrap gap-6">
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">Playlist refresh (hours)</label>
               <input
                 type="number"
                 min={0}
+                disabled={iptvSettingsLoadState !== 'ready'}
                 value={iptvRefreshHours}
                 onChange={(e) => setIptvRefreshHours(Math.max(0, Number(e.target.value)))}
-                className="w-32 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+                className="w-32 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600 disabled:cursor-not-allowed disabled:opacity-50"
               />
               <p className="text-xs text-gray-500 mt-1">Default 168 (weekly)</p>
             </div>
@@ -1208,19 +1226,37 @@ export default function IptvSettings() {
               <input
                 type="number"
                 min={0}
+                disabled={iptvSettingsLoadState !== 'ready'}
                 value={epgRefreshHours}
                 onChange={(e) => setEpgRefreshHours(Math.max(0, Number(e.target.value)))}
-                className="w-32 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+                className="w-32 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600 disabled:cursor-not-allowed disabled:opacity-50"
               />
               <p className="text-xs text-gray-500 mt-1">Default 48 (every 2 days)</p>
             </div>
+            <div>
+              <label htmlFor="epg-download-limit" className="block text-sm font-medium text-gray-300 mb-2">
+                EPG download limit (MB)
+              </label>
+              <input
+                id="epg-download-limit"
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={512}
+                disabled={iptvSettingsLoadState !== 'ready'}
+                value={epgMaxDownloadSizeMb}
+                onChange={(e) => setEpgMaxDownloadSizeMb(e.target.value)}
+                className="w-32 rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-white focus:border-red-600 focus:outline-none focus:ring-1 focus:ring-red-500 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <p className="text-xs text-gray-500 mt-1">Default 256. Maximum 512.</p>
+            </div>
             <div className="flex items-end">
               <button
-                onClick={saveRefreshIntervals}
-                disabled={savingRefresh}
-                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors disabled:opacity-50"
+                onClick={saveIptvSettings}
+                disabled={savingIptvSettings || iptvSettingsLoadState !== 'ready'}
+                className={BUTTON_PRIMARY}
               >
-                {savingRefresh ? 'Saving...' : 'Save Intervals'}
+                {savingIptvSettings ? 'Saving...' : 'Save Settings'}
               </button>
             </div>
           </div>

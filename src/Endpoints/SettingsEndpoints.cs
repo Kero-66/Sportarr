@@ -218,6 +218,10 @@ app.MapGet("/api/settings", async (ConfigService configService, SportarrDbContex
         IndexerMinimumAgeMinutes = config.IndexerMinimumAgeMinutes,
         IptvPlaylistRefreshHours = config.IptvPlaylistRefreshHours,
         EpgRefreshHours = config.EpgRefreshHours,
+        EpgMaxDownloadSizeMb = Math.Clamp(
+            config.EpgMaxDownloadSizeMb,
+            Config.MinimumEpgMaxDownloadSizeMb,
+            Config.MaximumEpgMaxDownloadSizeMb),
         MaxRssReleasesPerIndexer = config.MaxRssReleasesPerIndexer,
         RssReleaseAgeLimit = config.RssReleaseAgeLimit,
 
@@ -585,6 +589,10 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
         config.IndexerMinimumAgeMinutes = Math.Max(0, updatedSettings.IndexerMinimumAgeMinutes); // Clamp at 0 (no negative delays)
         config.IptvPlaylistRefreshHours = Math.Max(0, updatedSettings.IptvPlaylistRefreshHours); // 0 = disabled
         config.EpgRefreshHours = Math.Max(0, updatedSettings.EpgRefreshHours); // 0 = disabled
+        config.EpgMaxDownloadSizeMb = Math.Clamp(
+            updatedSettings.EpgMaxDownloadSizeMb,
+            Config.MinimumEpgMaxDownloadSizeMb,
+            Config.MaximumEpgMaxDownloadSizeMb);
         config.MaxRssReleasesPerIndexer = Math.Max(1, updatedSettings.MaxRssReleasesPerIndexer);
         config.RssReleaseAgeLimit = Math.Max(0, updatedSettings.RssReleaseAgeLimit); // 0 = no age limit
 

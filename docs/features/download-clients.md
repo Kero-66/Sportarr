@@ -34,7 +34,9 @@ With **Remove Completed Downloads** enabled on a client, a move import finishes 
 
 ### A file for an event that already has one
 
-Sportarr keeps one file per event, or per part of an event. Every way a file can arrive is judged by the same rule. A lower quality never replaces the file you have. The same quality replaces it unless it is an older revision while propers and repacks are preferred, or its custom format score is lower. A higher quality always replaces it.
+Sportarr keeps one file per event, or per part of an event. Automatic searches, RSS grabs, completed downloads, and library scans all use the assigned quality profile. Qualities nearer the top of the profile are preferred. A lower-ranked quality never replaces a higher-ranked file, while a higher-ranked quality can replace a lower-ranked file even when its custom format score is lower.
+
+Qualities placed in the same profile group have equal rank. The **Propers and Repacks** setting applies next. **Prefer and Upgrade** lets a newer revision win, **Do Not Upgrade Automatically** blocks an older revision without treating a newer revision as an upgrade, and **Do Not Prefer** ignores the revision. The custom format score follows. Use a group when those qualities should compete as equals instead of being ordered separately.
 
 A copy that is equal to the file an event already holds is not swapped in. It is listed in Activity with the reason, so you decide whether to import it, ignore it or remove it.
 

@@ -90,7 +90,12 @@ internal sealed class PartIdentityIntegrationHarness : IAsyncDisposable
         var rootPath = Path.Combine(directory, "library"); Directory.CreateDirectory(rootPath);
         var root = new RootFolder { Path = rootPath };
         var profile = new QualityProfile { Name = "Part identity", IsDefault = true,
-            Items = new List<QualityItem> { new() { Name = "WEBDL-720p", Quality = 5, Allowed = true } } };
+            Items = new List<QualityItem>
+            {
+                new() { Name = "WEBDL-2160p", Quality = 19, Allowed = true },
+                new() { Name = "WEBDL-1080p", Quality = 15, Allowed = true },
+                new() { Name = "WEBDL-720p", Quality = 5, Allowed = true },
+            } };
         rig.Db.AddRange(root, profile); await rig.Db.SaveChangesAsync();
         var league = new League { Name = leagueName, Sport = sport, Monitored = true,
             RootFolderId = root.Id, QualityProfileId = profile.Id, MonitoredParts = "Main Card,Prelims" };

@@ -178,7 +178,13 @@ app.MapGet("/api/wanted/cutoff-unmet", async (int page, int pageSize, SportarrDb
             .AsNoTracking()
             .Where(e => e.Monitored && e.HasFile && e.Quality != null)
             .OrderBy(e => e.EventDate)
-            .Select(e => new { e.Id, e.QualityProfileId, e.Quality })
+            .Select(e => new
+            {
+                e.Id,
+                e.QualityProfileId,
+                LeagueQualityProfileId = e.League != null ? e.League.QualityProfileId : null,
+                e.Quality,
+            })
             .ToListAsync();
 
         logger.LogDebug("[Wanted] Found {Count} total events with files and quality", candidates.Count);
@@ -192,7 +198,7 @@ app.MapGet("/api/wanted/cutoff-unmet", async (int page, int pageSize, SportarrDb
             .ToDictionaryAsync(p => p.Id);
 
         var belowCutoff = candidates
-            .Where(e => IsBelowCutoff(e.QualityProfileId, e.Quality, profiles))
+            .Where(e => IsBelowCutoff(e.QualityProfileId, e.LeagueQualityProfileId, e.Quality, profiles))
             .Select(e => e.Id)
             .ToList();
 
@@ -278,14 +284,22 @@ app.MapPost("/api/wanted/cutoff-unmet/search-all", async (SportarrDbContext db, 
 {
     var events = await db.Events
         .Where(e => e.Monitored && e.HasFile && e.Quality != null)
-        .Select(e => new { e.Id, e.Quality, e.QualityProfileId })
+        .Select(e => new
+        {
+            e.Id,
+            e.Quality,
+            e.QualityProfileId,
+            LeagueQualityProfileId = e.League != null ? e.League.QualityProfileId : null,
+        })
         .ToListAsync();
 
     // Items is JSON-converted and loads with the row; Include would throw.
     var profiles = await db.QualityProfiles
         .ToDictionaryAsync(p => p.Id);
 
-    var cutoffUnmet = events.Where(e => IsBelowCutoff(e.QualityProfileId, e.Quality, profiles)).ToList();
+    var cutoffUnmet = events
+        .Where(e => IsBelowCutoff(e.QualityProfileId, e.LeagueQualityProfileId, e.Quality, profiles))
+        .ToList();
 
     var snapshot = searchQueueService.GetQueueStatus();
     var alreadyQueued = snapshot.PendingSearches.Select(s => s.EventId)
@@ -312,34 +326,21 @@ app.MapPost("/api/wanted/cutoff-unmet/search-all", async (SportarrDbContext db, 
     /// cutoff and upgrades are allowed. Shared by the cutoff-unmet listing
     /// and its search-all action so the two can never disagree.
     /// </summary>
-    private static bool IsBelowCutoff(int? qualityProfileId, string? quality, Dictionary<int, QualityProfile> profiles)
+    private static bool IsBelowCutoff(
+        int? qualityProfileId,
+        int? leagueQualityProfileId,
+        string? quality,
+        Dictionary<int, QualityProfile> profiles)
     {
-        if (!qualityProfileId.HasValue || !profiles.TryGetValue(qualityProfileId.Value, out var profile))
+        QualityProfile? profile = null;
+        if (qualityProfileId.HasValue)
+            profiles.TryGetValue(qualityProfileId.Value, out profile);
+        if (profile == null && leagueQualityProfileId.HasValue)
+            profiles.TryGetValue(leagueQualityProfileId.Value, out profile);
+        profile ??= profiles.Values.FirstOrDefault(p => p.IsDefault)
+            ?? profiles.Values.OrderBy(p => p.Id).FirstOrDefault();
+        if (profile == null)
             return false;
-        if (!profile.UpgradesAllowed)
-            return false;
-
-        var qualities = profile.Items
-            .SelectMany(parent =>
-            {
-                if (parent.Items != null && parent.Items.Count > 0)
-                    return parent.Items;
-                return new List<QualityItem> { parent };
-            }).ToList();
-
-        // Profile "quality" field is not reliable - SDTV might have quality=1 and WEB-480p has quality=0
-        // The order of the profiles appears to follow the displayed order
-        var currentIndex = qualities.FindIndex(q =>
-            string.Equals(q.Name, quality, StringComparison.OrdinalIgnoreCase));
-
-        var cutoffIndex = qualities.FindIndex(q =>
-            q.Quality == profile.CutoffQuality);
-
-        if (currentIndex < 0 || cutoffIndex < 0)
-        {
-            return false;
-        }
-        // profiles are ordered from highest quality to lowest
-        return currentIndex > cutoffIndex;
+        return Helpers.QualityProfileRanker.IsBelowCutoff(profile, quality);
     }
 }

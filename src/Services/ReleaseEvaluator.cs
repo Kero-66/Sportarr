@@ -288,13 +288,14 @@ public class ReleaseEvaluator
     }
 
     /// <summary>
-    /// Calculate quality score using deterministic resolution + source scoring.
-    /// Higher resolution and better source = higher score.
-    /// This is independent of profile item ordering to avoid inversion bugs.
+    /// Calculate the configured quality profile rank.
+    /// Fall back to deterministic scoring when no profile is available.
     /// </summary>
     private static int CalculateQualityScore(QualityParser.QualityDefinition quality, QualityProfile? profile)
     {
-        return CalculateQualityScoreFromDefinition(quality);
+        return profile?.Items?.Count > 0
+            ? Helpers.QualityProfileRanker.GetRank(profile, quality.Name)
+            : CalculateQualityScoreFromDefinition(quality);
     }
 
     /// <summary>

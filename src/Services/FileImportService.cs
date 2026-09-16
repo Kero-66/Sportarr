@@ -569,14 +569,14 @@ public class FileImportService : IFileImportService
 
             if (upgradedFile != null)
             {
-                // One rule for every import path (ImportUpgradeRule): a lower
-                // quality never replaces, the same quality replaces unless it is
-                // a revision downgrade or a lower custom format score, a higher
-                // quality always replaces.
+                var qualityProfiles = await _db.QualityProfiles.AsNoTracking().ToListAsync();
+                var qualityProfile = RssSyncService.ResolveQualityProfile(eventInfo, qualityProfiles);
+                // One rule covers every import path. A lower profile rank never
+                // replaces. Equal ranks use revision and custom format score.
                 var decision = ImportUpgradeRule.Evaluate(
                     upgradedFile.Quality, upgradedFile.CustomFormatScore, upgradedFile.OriginalTitle ?? upgradedFile.Quality,
                     qualityString, download.CustomFormatScore, download.Title,
-                    config.DownloadPropersAndRepacks);
+                    config.DownloadPropersAndRepacks, qualityProfile);
                 if (!decision.IsUpgrade)
                 {
                     _logger.LogWarning("[Import] {Rejection} ({Title})", decision.Rejection, download.Title);

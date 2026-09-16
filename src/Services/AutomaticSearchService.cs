@@ -1033,7 +1033,7 @@ public class AutomaticSearchService : IAutomaticSearchService
 
             // Select best release using delay profile and protocol priority (from validated releases only)
             var bestRelease = _delayProfileService.SelectBestReleaseWithDelayProfile(
-                matchedReleases, delayProfile, qualityProfile);
+                matchedReleases, delayProfile, qualityProfile, config.DownloadPropersAndRepacks);
 
             if (bestRelease == null)
             {
@@ -1165,15 +1165,15 @@ public class AutomaticSearchService : IAutomaticSearchService
                 // 2. Check if UpgradesAllowed is enabled on the quality profile
                 // 3. Check if existing file meets or exceeds CutoffQuality
                 // 4. Check if existing file meets or exceeds CutoffFormatScore
-                // 5. Compare quality/format scores to determine if new release is actually better
+                // 5. Compare profile rank and format score
                 if (relevantFile != null)
                 {
-                    // Always recalculate quality scores from quality strings using deterministic scoring.
-                    // Don't trust stored QualityScore. CalculateQualityScoreFromName returns 0 for null,
-                    // empty, "Unknown", or any other unparseable string, so this works as a single signal.
+                    // Use deterministic scoring only to identify an unreadable existing quality.
+                    // Use the profile rank for preference decisions.
                     var existingQualityScore = ReleaseEvaluator.CalculateQualityScoreFromName(relevantFile.Quality);
+                    var existingQualityRank = Helpers.QualityProfileRanker.GetRank(qualityProfile, relevantFile.Quality);
                     var existingFormatScore = relevantFile.CustomFormatScore;
-                    var newReleaseQualityScore = ReleaseEvaluator.CalculateQualityScoreFromName(bestRelease.Quality);
+                    var newReleaseQualityRank = Helpers.QualityProfileRanker.GetRank(qualityProfile, bestRelease.Quality);
                     var newReleaseFormatScore = bestRelease.CustomFormatScore;
 
                     // REFUSE-UNKNOWN-UPGRADE GATE: Library imports whose filenames lacked a quality keyword
@@ -1203,22 +1203,22 @@ public class AutomaticSearchService : IAutomaticSearchService
                         return result;
                     }
 
-                    _logger.LogInformation("[Automatic Search] Upgrade check - Existing: Quality={ExistingQuality} (score={ExistingQScore}), Format={ExistingFScore} | New: Quality={NewQuality} (score={NewQScore}), Format={NewFScore}",
-                        relevantFile.Quality ?? "null", existingQualityScore, existingFormatScore,
-                        bestRelease.Quality, newReleaseQualityScore, newReleaseFormatScore);
+                    _logger.LogInformation("[Automatic Search] Upgrade check - Existing: Quality={ExistingQuality} (profile rank={ExistingRank}), Format={ExistingFScore} | New: Quality={NewQuality} (profile rank={NewRank}), Format={NewFScore}",
+                        relevantFile.Quality ?? "null", existingQualityRank, existingFormatScore,
+                        bestRelease.Quality, newReleaseQualityRank, newReleaseFormatScore);
 
                     // CHECK 2: CutoffQuality
                     // If existing file quality meets or exceeds cutoff, don't upgrade based on quality alone
                     bool qualityCutoffMet = false;
                     if (qualityProfile.CutoffQuality.HasValue)
                     {
-                        var cutoffScore = GetCutoffQualityScore(qualityProfile, qualityProfile.CutoffQuality.Value);
-                        qualityCutoffMet = existingQualityScore >= cutoffScore;
+                        var cutoffRank = Helpers.QualityProfileRanker.GetCutoffRank(qualityProfile, qualityProfile.CutoffQuality.Value);
+                        qualityCutoffMet = cutoffRank > 0 && existingQualityRank >= cutoffRank;
 
                         if (qualityCutoffMet)
                         {
-                            _logger.LogInformation("[Automatic Search] Quality cutoff met (existing={Existing} >= cutoff={Cutoff})",
-                                existingQualityScore, cutoffScore);
+                            _logger.LogInformation("[Automatic Search] Quality cutoff met (existing rank={Existing} >= cutoff rank={Cutoff})",
+                                existingQualityRank, cutoffRank);
                         }
                     }
 
@@ -1236,8 +1236,15 @@ public class AutomaticSearchService : IAutomaticSearchService
                         }
                     }
 
+                    var propersSetting = (await _configService.GetConfigAsync()).DownloadPropersAndRepacks;
+                    var revisionComparison = Helpers.ReleaseRevision.Parse(bestRelease.Title)
+                        .CompareTo(Helpers.ReleaseRevision.Parse(relevantFile.OriginalTitle ?? relevantFile.Quality));
+                    var revisionUpgrade = propersSetting == "preferAndUpgrade"
+                        && newReleaseQualityRank == existingQualityRank
+                        && revisionComparison > 0;
+
                     // Both cutoffs met = no upgrade needed
-                    if (qualityCutoffMet && (formatCutoffMet || !qualityProfile.CutoffFormatScore.HasValue))
+                    if (!revisionUpgrade && qualityCutoffMet && (formatCutoffMet || !qualityProfile.CutoffFormatScore.HasValue))
                     {
                         result.Success = false;
                         result.Message = $"Cutoff met - existing file ({relevantFile.Quality ?? "null"}) meets quality profile requirements. No upgrade needed.";
@@ -1246,43 +1253,36 @@ public class AutomaticSearchService : IAutomaticSearchService
                     }
 
                     // CHECK 4: Is the new release actually better?
-                    // Compare quality scores first, then format scores as tiebreaker
-                    bool isQualityUpgrade = newReleaseQualityScore > existingQualityScore;
+                    // Compare profile rank before custom format score.
+                    bool isQualityUpgrade = newReleaseQualityRank > existingQualityRank;
                     bool isFormatUpgrade = newReleaseFormatScore > existingFormatScore &&
                                           (newReleaseFormatScore - existingFormatScore) >= qualityProfile.FormatScoreIncrement;
 
                     // If quality cutoff not met, allow quality upgrades
                     // If quality cutoff met but format cutoff not met, only allow format upgrades
-                    var propersSetting = (await _configService.GetConfigAsync()).DownloadPropersAndRepacks;
                     bool shouldUpgrade;
                     string upgradeReason;
 
                     if (!qualityCutoffMet && isQualityUpgrade)
                     {
                         shouldUpgrade = true;
-                        upgradeReason = $"quality upgrade ({existingQualityScore} -> {newReleaseQualityScore})";
+                        upgradeReason = $"quality profile upgrade ({existingQualityRank} -> {newReleaseQualityRank})";
+                    }
+                    else if (revisionUpgrade)
+                    {
+                        shouldUpgrade = true;
+                        upgradeReason = "proper/repack revision of the same quality rank";
                     }
                     else if (qualityCutoffMet && !formatCutoffMet && isFormatUpgrade)
                     {
                         shouldUpgrade = true;
                         upgradeReason = $"format score upgrade ({existingFormatScore} -> {newReleaseFormatScore})";
                     }
-                    else if (!qualityCutoffMet && newReleaseQualityScore == existingQualityScore && isFormatUpgrade)
+                    else if (!qualityCutoffMet && newReleaseQualityRank == existingQualityRank && isFormatUpgrade)
                     {
                         // Same quality but better format score
                         shouldUpgrade = true;
                         upgradeReason = $"format score upgrade at same quality ({existingFormatScore} -> {newReleaseFormatScore})";
-                    }
-                    else if (propersSetting == "preferAndUpgrade" &&
-                             newReleaseQualityScore == existingQualityScore &&
-                             newReleaseFormatScore == existingFormatScore &&
-                             Helpers.ReleaseRevision.Parse(bestRelease.Title) >
-                             Helpers.ReleaseRevision.Parse(relevantFile.OriginalTitle ?? relevantFile.Quality))
-                    {
-                        // Proper/repack of the same quality: the original
-                        // was broken and re-released fixed.
-                        shouldUpgrade = true;
-                        upgradeReason = "proper/repack revision of the same quality";
                     }
                     else
                     {
@@ -1290,20 +1290,17 @@ public class AutomaticSearchService : IAutomaticSearchService
                         upgradeReason = "not better than existing";
                     }
 
-                    // QUALITY-FIRST GUARD (automatic grabs only): the import judges
-                    // quality first (ImportUpgradeRule), so a lower quality never
-                    // replaces the existing file whatever its custom format score,
-                    // and a higher quality always may. A grab the importer would
-                    // refuse is a wasted download. Manual searches keep the user's
+                    // The import applies the same profile rank before revision
+                    // and custom format score. Manual searches keep the user's
                     // explicit choice.
-                    if (shouldUpgrade && !isManualSearch && newReleaseQualityScore < existingQualityScore)
+                    if (shouldUpgrade && !isManualSearch && newReleaseQualityRank < existingQualityRank)
                     {
                         shouldUpgrade = false;
-                        upgradeReason = $"lower quality than the existing file ({existingQualityScore} > {newReleaseQualityScore})";
+                        upgradeReason = $"lower quality profile rank than the existing file ({existingQualityRank} > {newReleaseQualityRank})";
                     }
-                    else if (shouldUpgrade && !isManualSearch && newReleaseQualityScore == existingQualityScore
+                    else if (shouldUpgrade && !isManualSearch && newReleaseQualityRank == existingQualityRank
                              && propersSetting != "doNotPrefer"
-                             && Helpers.ReleaseRevision.Parse(bestRelease.Title) < Helpers.ReleaseRevision.Parse(relevantFile.OriginalTitle ?? relevantFile.Quality))
+                             && revisionComparison < 0)
                     {
                         // An older revision of the same quality: the importer refuses it.
                         shouldUpgrade = false;
@@ -1942,10 +1939,6 @@ public class AutomaticSearchService : IAutomaticSearchService
     }
 
     /// <summary>
-    /// Get quality score for a cutoff quality index from the profile.
-    /// Looks up the quality name by index, then uses deterministic scoring.
-    /// </summary>
-    /// <summary>
     /// Postponed / cancelled events must never be searched — they won't appear
     /// in indexer results and aren't "missing". Case-insensitive because the DB
     /// stores both Title-case (local) and lowercase (hub) status strings.
@@ -1958,25 +1951,6 @@ public class AutomaticSearchService : IAutomaticSearchService
         return status.Equals("Postponed", StringComparison.OrdinalIgnoreCase)
             || status.Equals("Cancelled", StringComparison.OrdinalIgnoreCase)
             || status.Equals("Canceled", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static int GetCutoffQualityScore(QualityProfile profile, int qualityIndex)
-    {
-        // Find the quality item matching this index
-        var qualityItem = profile.Items.FirstOrDefault(i => i.Quality == qualityIndex);
-        // Also check inside quality groups
-        if (qualityItem == null)
-        {
-            foreach (var item in profile.Items)
-            {
-                if (item.IsGroup && item.Items != null)
-                {
-                    qualityItem = item.Items.FirstOrDefault(i => i.Quality == qualityIndex);
-                    if (qualityItem != null) break;
-                }
-            }
-        }
-        return ReleaseEvaluator.CalculateQualityScoreFromName(qualityItem?.Name);
     }
 
     /// <summary>

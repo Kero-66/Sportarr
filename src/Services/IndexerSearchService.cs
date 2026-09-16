@@ -415,8 +415,8 @@ public class IndexerSearchService : IIndexerSearchService
         // Sort by ranking priority (quality trumps all):
         // 1. Approved status (approved first)
         // 2. Quality score (profile position)
-        // 3. Custom format score
-        // 4. Revision (repack > proper > none) unless propers are set to Do Not Prefer
+        // 3. Revision (repack > proper > none) unless propers are set to Do Not Prefer
+        // 4. Custom format score
         // 5. Indexer flags (freeleech etc.) when Prefer Indexer Flags is on
         // 6. Seeders (for torrents)
         // 7. Size score (proximity to preferred size, or larger if no preferred)
@@ -426,8 +426,8 @@ public class IndexerSearchService : IIndexerSearchService
         allResults = allResults
             .OrderByDescending(r => r.Approved)
             .ThenByDescending(r => r.QualityScore)
-            .ThenByDescending(r => r.CustomFormatScore)
             .ThenByDescending(r => preferRevisions ? Helpers.ReleaseRevision.Parse(r.Title) : 0)
+            .ThenByDescending(r => r.CustomFormatScore)
             .ThenByDescending(r => preferIndexerFlags && !string.IsNullOrEmpty(r.IndexerFlags) ? 1 : 0)
             .ThenByDescending(r => r.Seeders ?? 0)
             .ThenByDescending(r => r.SizeScore)

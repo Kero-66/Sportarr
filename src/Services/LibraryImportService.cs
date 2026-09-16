@@ -524,7 +524,7 @@ public class LibraryImportService
                         if (occupant != null)
                         {
                             var decision = await DecideUpgradeAsync(occupant, request.FilePath,
-                                request.Quality ?? _fileParser.BuildQualityString(parsedInfo), existingEvent.League);
+                                request.Quality ?? _fileParser.BuildQualityString(parsedInfo), existingEvent);
                             importInPlace = IsBesideOccupant(request.FilePath, occupant.FilePath);
                             if (request.OnlyIfUpgrade
                                 && (!decision.IsUpgrade || (decision.Equal && (importInPlace || importMode != LibraryImportMode.Move))))
@@ -1566,7 +1566,7 @@ public class LibraryImportService
         var occupant = ImportUpgradeRule.ExistingFileForPart(held, partNumber, filePath, config.EnableMultiPartEpisodes);
         if (occupant == null) return none;
         var inPlace = IsBesideOccupant(filePath, occupant.FilePath);
-        var decision = await DecideUpgradeAsync(occupant, filePath, _fileParser.BuildQualityString(parsedInfo), evt.League);
+        var decision = await DecideUpgradeAsync(occupant, filePath, _fileParser.BuildQualityString(parsedInfo), evt);
         // The same test the import makes, so the scan shows every copy an
         // automatic import would leave out, the equal one included.
         var leftOut = decision.Equal
@@ -1579,32 +1579,40 @@ public class LibraryImportService
     /// <summary>
     /// The shared rule applied to one incoming file against the file the
     /// event holds. Custom format scores are read from both names against
-    /// the league's quality profile, so a file that arrived without a grab
-    /// is judged the same way as one that did.
+    /// the event's resolved quality profile. This judges a file that arrived
+    /// without a grab the same way as one that did.
     /// </summary>
-    private async Task<ImportUpgradeRule.Decision> DecideUpgradeAsync(EventFile occupant, string incomingPath, string? incomingQuality, League? league)
+    private async Task<ImportUpgradeRule.Decision> DecideUpgradeAsync(EventFile occupant, string incomingPath, string? incomingQuality, Event evt)
     {
         var config = await _configService.GetConfigAsync();
         var incomingName = Path.GetFileNameWithoutExtension(incomingPath);
         var occupantName = occupant.OriginalTitle ?? Path.GetFileNameWithoutExtension(occupant.FilePath ?? string.Empty);
+        var profile = await QualityProfileAsync(evt);
         return ImportUpgradeRule.Evaluate(
-            occupant.Quality, await FormatScoreAsync(occupantName, league), occupantName,
-            incomingQuality, await FormatScoreAsync(incomingName, league), incomingName,
-            config.DownloadPropersAndRepacks);
+            occupant.Quality, await FormatScoreAsync(occupantName, profile), occupantName,
+            incomingQuality, await FormatScoreAsync(incomingName, profile), incomingName,
+            config.DownloadPropersAndRepacks, profile);
     }
 
     // Custom formats and a profile's scores, loaded once per service
     // lifetime (one request or one scan), keyed by profile id.
     private readonly Dictionary<int, (List<CustomFormat> Formats, Dictionary<int, int> Scores)> _formatScoreCache = new();
 
-    private async Task<int> FormatScoreAsync(string title, League? league)
+    private List<QualityProfile>? _qualityProfiles;
+
+    private async Task<QualityProfile?> QualityProfileAsync(Event evt)
     {
-        if (string.IsNullOrEmpty(title) || league?.QualityProfileId == null) return 0;
-        var profileId = league.QualityProfileId.Value;
+        _qualityProfiles ??= await _db.QualityProfiles.AsNoTracking().ToListAsync();
+        return RssSyncService.ResolveQualityProfile(evt, _qualityProfiles);
+    }
+
+    private async Task<int> FormatScoreAsync(string title, QualityProfile? profile)
+    {
+        if (string.IsNullOrEmpty(title) || profile == null) return 0;
+        var profileId = profile.Id;
         if (!_formatScoreCache.TryGetValue(profileId, out var cached))
         {
-            var profile = await _db.QualityProfiles.AsNoTracking().FirstOrDefaultAsync(p => p.Id == profileId);
-            var scores = profile?.FormatItems?.ToDictionary(fi => fi.FormatId, fi => fi.Score) ?? new Dictionary<int, int>();
+            var scores = profile.FormatItems?.ToDictionary(fi => fi.FormatId, fi => fi.Score) ?? new Dictionary<int, int>();
             var formats = scores.Count == 0 ? new List<CustomFormat>() : await _db.CustomFormats.AsNoTracking().ToListAsync();
             cached = (formats, scores);
             _formatScoreCache[profileId] = cached;

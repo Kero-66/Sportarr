@@ -712,8 +712,8 @@ public class RssSyncService : BackgroundService
 
     /// <summary>
     /// Check if we should grab this release for the matched event.
-    /// Now part-aware and uses total score (QualityScore + CustomFormatScore) for comparisons.
-    /// Can upgrade queued items if a higher-scored release is found.
+    /// The profile rank wins before revision and custom format score.
+    /// A preferred release can replace a queued item.
     /// </summary>
     private async Task<(bool Grab, string Reason, string? ReleasePart)> ShouldGrabReleaseAsync(
         SportarrDbContext db,
@@ -787,8 +787,10 @@ public class RssSyncService : BackgroundService
 
         // 2. Check if already in queue (PART-AWARE) - with upgrade logic
         DownloadQueueItem? itemToReplace = null;
-        var replacedScore = 0;
-        var replacementScore = 0;
+        var replacedRank = 0;
+        var replacementRank = 0;
+        var replacedFormatScore = 0;
+        var replacementFormatScore = 0;
 
         var existingQueueItem = await db.DownloadQueue.AsNoTracking()
             .Where(d => d.EventId == evt.Id &&
@@ -799,23 +801,27 @@ public class RssSyncService : BackgroundService
 
         if (existingQueueItem != null)
         {
-            // Recalculate quality scores from quality strings (don't trust stored values from old inverted scoring)
-            var existingTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(existingQueueItem.Quality) + existingQueueItem.CustomFormatScore;
-            var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
+            var preference = Helpers.ReleasePreferenceComparer.Compare(
+                profile,
+                release.Quality, release.Title, release.CustomFormatScore,
+                existingQueueItem.Quality, existingQueueItem.Title, existingQueueItem.CustomFormatScore,
+                config.DownloadPropersAndRepacks);
 
-            if (newTotalScore > existingTotalScore)
+            if (preference > 0)
             {
                 // The new release wins, but do not cancel the running download
                 // yet. Every check below can still reject this release, and a
                 // cancel here deletes the files of a download that nothing
                 // replaces. The swap happens once the decision is final.
                 itemToReplace = existingQueueItem;
-                replacedScore = existingTotalScore;
-                replacementScore = newTotalScore;
+                replacedRank = Helpers.QualityProfileRanker.GetRank(profile, existingQueueItem.Quality);
+                replacementRank = Helpers.QualityProfileRanker.GetRank(profile, release.Quality);
+                replacedFormatScore = existingQueueItem.CustomFormatScore;
+                replacementFormatScore = release.CustomFormatScore;
             }
             else
             {
-                return (false, $"Better or equal release already queued (score: {existingTotalScore})", releasePart);
+                return (false, "Better or equal release already queued", releasePart);
             }
         }
 
@@ -970,10 +976,10 @@ public class RssSyncService : BackgroundService
                 return (false, refusal, releasePart);
             }
 
-            var existingTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(existingFile.Quality) + existingFile.CustomFormatScore;
-            var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
-            _logger.LogInformation("[RSS Sync] File upgrade detected: {OldScore} -> {NewScore} for {Part}",
-                existingTotalScore, newTotalScore, releasePart ?? "full event");
+            _logger.LogInformation("[RSS Sync] File upgrade detected: profile rank {OldRank}, CF {OldCf} -> profile rank {NewRank}, CF {NewCf} for {Part}",
+                Helpers.QualityProfileRanker.GetRank(profile, existingFile.Quality), existingFile.CustomFormatScore,
+                Helpers.QualityProfileRanker.GetRank(profile, release.Quality), release.CustomFormatScore,
+                releasePart ?? "full event");
         }
 
         // 5b. CASCADING UPGRADE: When downloading a higher quality part, search for other parts at the new quality
@@ -988,15 +994,9 @@ public class RssSyncService : BackgroundService
             if (otherPartFiles.Any())
             {
                 var newResolution = ExtractResolution(release.Quality);
-                var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
-
                 // Find parts that need upgrading to match the new release quality
                 var partsNeedingUpgrade = otherPartFiles
-                    .Where(f =>
-                    {
-                        var existingScore = ReleaseEvaluator.CalculateQualityScoreFromName(f.Quality) + f.CustomFormatScore;
-                        return newTotalScore > existingScore;
-                    })
+                    .Where(f => Helpers.QualityProfileRanker.Compare(profile, release.Quality, f.Quality) > 0)
                     .Select(f => f.PartName!)
                     .ToList();
 
@@ -1130,8 +1130,9 @@ public class RssSyncService : BackgroundService
         if (itemToReplace != null)
         {
             await RemoveAndCancelQueueItemAsync(db, itemToReplace, downloadClientService, cancellationToken);
-            _logger.LogInformation("[RSS Sync] Replacing queued item with better release: {OldScore} -> {NewScore} for {Part}",
-                replacedScore, replacementScore, releasePart ?? "full event");
+            _logger.LogInformation("[RSS Sync] Replacing queued item with better release: profile rank {OldRank}, CF {OldCf} -> profile rank {NewRank}, CF {NewCf} for {Part}",
+                replacedRank, replacedFormatScore, replacementRank, replacementFormatScore,
+                releasePart ?? "full event");
         }
 
         return (true, "OK", releasePart);

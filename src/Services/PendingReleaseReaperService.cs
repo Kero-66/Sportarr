@@ -135,8 +135,12 @@ public class PendingReleaseReaperService : BackgroundService
                 continue;
             }
 
+            var profile = RssSyncService.ResolveQualityProfile(evt, qualityProfiles);
             var winner = group
-                .OrderByDescending(p => p.QualityScore)
+                .OrderByDescending(p => Helpers.QualityProfileRanker.GetRank(profile, p.Quality))
+                .ThenByDescending(p => string.Equals(config.DownloadPropersAndRepacks, "doNotPrefer", StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : Helpers.ReleaseRevision.Parse(p.Title))
                 .ThenByDescending(p => p.CustomFormatScore)
                 .ThenByDescending(p => p.Score)
                 .ThenByDescending(p => p.MatchScore)
@@ -169,8 +173,6 @@ public class PendingReleaseReaperService : BackgroundService
                 // here skipped the default and gave the gate a null profile for
                 // an event pointing at a profile that no longer exists, which
                 // switched off the upgrades-allowed and increment rules.
-                var profile = RssSyncService.ResolveQualityProfile(evt, qualityProfiles);
-
                 var refusal = Helpers.ExistingFileUpgradeGate.RefusalReason(
                     partFile, winner.Title, winner.Quality, winner.CustomFormatScore, profile, config);
                 if (refusal != null)
@@ -198,13 +200,16 @@ public class PendingReleaseReaperService : BackgroundService
                 loser.Reason = $"Superseded by {winner.Title}";
             }
 
-            var outcome = await TryGrabPendingAsync(db, downloadClientService, notificationService, evt, winner, eventDecision, cancellationToken);
+            var outcome = await TryGrabPendingAsync(
+                db, downloadClientService, notificationService, evt, winner, profile, config,
+                eventDecision, cancellationToken);
 
             if (outcome == GrabOutcome.Grabbed)
             {
                 _logger.LogInformation(
-                    "[Pending Release Reaper] Released best-of-window for '{Event}': {Winner} (score {Score})",
-                    evt.Title, winner.Title, winner.QualityScore + winner.CustomFormatScore);
+                    "[Pending Release Reaper] Released best-of-window for '{Event}': {Winner} (profile rank {Rank}, CF {Cf})",
+                    evt.Title, winner.Title,
+                    Helpers.QualityProfileRanker.GetRank(profile, winner.Quality), winner.CustomFormatScore);
             }
             else if (outcome == GrabOutcome.Superseded || outcome == GrabOutcome.Importing)
             {
@@ -288,6 +293,8 @@ public class PendingReleaseReaperService : BackgroundService
         NotificationService notificationService,
         Event evt,
         PendingRelease pending,
+        QualityProfile? profile,
+        Config config,
         AcquisitionLease eventDecision,
         CancellationToken cancellationToken)
     {
@@ -347,14 +354,17 @@ public class PendingReleaseReaperService : BackgroundService
             .Where(q => q.Status == DownloadStatus.Queued || q.Status == DownloadStatus.Downloading)
             .ToListAsync(cancellationToken);
 
-        var pendingScore = ReleaseEvaluator.CalculateQualityScoreFromName(pending.Quality) + pending.CustomFormatScore;
         foreach (var queued in losers)
         {
-            var queuedScore = ReleaseEvaluator.CalculateQualityScoreFromName(queued.Quality) + queued.CustomFormatScore;
-            if (queuedScore >= pendingScore)
+            var preference = Helpers.ReleasePreferenceComparer.Compare(
+                profile,
+                pending.Quality, pending.Title, pending.CustomFormatScore,
+                queued.Quality, queued.Title, queued.CustomFormatScore,
+                config.DownloadPropersAndRepacks);
+            if (preference <= 0)
             {
-                _logger.LogInformation("[Pending Release Reaper] '{Queued}' already queued for '{Event}' scores {QueuedScore} against {PendingScore}; '{Title}' is dropped",
-                    queued.Title, evt.Title, queuedScore, pendingScore, pending.Title);
+                _logger.LogInformation("[Pending Release Reaper] '{Queued}' already queued for '{Event}' has equal or higher preference; '{Title}' is dropped",
+                    queued.Title, evt.Title, pending.Title);
                 return GrabOutcome.Superseded;
             }
         }

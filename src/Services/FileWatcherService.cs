@@ -440,14 +440,10 @@ public class FileWatcherService : BackgroundService
             // in the manual import queue with an Import button while the
             // recorder still holds it. The DVR imports its own recording
             // when it finishes, so the watcher leaves an active one alone.
-            var isActiveRecording = await db.DvrRecordings.AnyAsync(r =>
-                r.OutputPath == filePath &&
-                (r.Status == DvrRecordingStatus.Recording ||
-                 r.Status == DvrRecordingStatus.Scheduled));
-            if (isActiveRecording)
+            if (await IsDvrOwnedFileAsync(db, filePath))
             {
                 _logger.LogDebug(
-                    "[File Watcher] Skipping file still being recorded by the DVR: {Path}", filePath);
+                    "[File Watcher] Skipping file owned by the DVR: {Path}", filePath);
                 return;
             }
 
@@ -460,6 +456,22 @@ public class FileWatcherService : BackgroundService
             // still gets a pending record below, just never an auto-import.
             var stable = await WaitForStableFileAsync(filePath, TimeSpan.FromMinutes(10));
             if (!File.Exists(filePath)) return;
+
+            // The recorder can claim or finish this file while the stability
+            // wait is running. Check again before matching or importing it.
+            var trackedWhileWaiting = await db.Events.AnyAsync(e => e.FilePath == filePath) ||
+                                      await db.EventFiles.AnyAsync(ef => ef.FilePath == filePath);
+            if (trackedWhileWaiting)
+            {
+                return;
+            }
+
+            if (await IsDvrOwnedFileAsync(db, filePath))
+            {
+                _logger.LogDebug(
+                    "[File Watcher] Skipping file claimed by the DVR while waiting: {Path}", filePath);
+                return;
+            }
 
             var fileInfo = new FileInfo(filePath);
 
@@ -655,6 +667,41 @@ public class FileWatcherService : BackgroundService
         {
             _inFlightNewFiles.TryRemove(filePath, out _);
         }
+    }
+
+    internal static bool IsSameDvrCapture(string recordingPath, string candidatePath)
+    {
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        var recordingDirectory = Path.TrimEndingDirectorySeparator(
+            Path.GetDirectoryName(recordingPath) ?? string.Empty);
+        var candidateDirectory = Path.TrimEndingDirectorySeparator(
+            Path.GetDirectoryName(candidatePath) ?? string.Empty);
+        if (!string.Equals(recordingDirectory, candidateDirectory, comparison))
+        {
+            return false;
+        }
+
+        var recordingStem = Path.GetFileNameWithoutExtension(recordingPath).TrimStart('.');
+        var candidateStem = Path.GetFileNameWithoutExtension(candidatePath).TrimStart('.');
+        return string.Equals(recordingStem, candidateStem, comparison);
+    }
+
+    internal static async Task<bool> IsDvrOwnedFileAsync(
+        SportarrDbContext db,
+        string candidatePath)
+    {
+        var dvrPaths = await db.DvrRecordings
+            .AsNoTracking()
+            .Where(r => r.OutputPath != null &&
+                (r.Status == DvrRecordingStatus.Recording ||
+                 r.Status == DvrRecordingStatus.Scheduled ||
+                 r.Status == DvrRecordingStatus.Completed ||
+                 r.Status == DvrRecordingStatus.Importing))
+            .Select(r => r.OutputPath!)
+            .ToListAsync();
+        return dvrPaths.Any(path => IsSameDvrCapture(path, candidatePath));
     }
 
     /// <summary>

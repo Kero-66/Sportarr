@@ -265,6 +265,13 @@ Sportarr is made better by everyone who has contributed code. Thank you.
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/niels288">
+                    <img src="https://avatars.githubusercontent.com/u/26470818?v=4" width="72;" alt="niels288"/>
+                    <br />
+                    <sub><b>niels288</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/Percentnineteen">
                     <img src="https://avatars.githubusercontent.com/u/12090180?v=4" width="72;" alt="Percentnineteen"/>
                     <br />
@@ -278,6 +285,8 @@ Sportarr is made better by everyone who has contributed code. Thank you.
                     <sub><b>Pukabyte</b></sub>
                 </a>
             </td>
+		</tr>
+		<tr>
             <td align="center">
                 <a href="https://github.com/schlort">
                     <img src="https://avatars.githubusercontent.com/u/6138053?v=4" width="72;" alt="schlort"/>
@@ -285,8 +294,6 @@ Sportarr is made better by everyone who has contributed code. Thank you.
                     <sub><b>schlort</b></sub>
                 </a>
             </td>
-		</tr>
-		<tr>
             <td align="center">
                 <a href="https://github.com/skjaere">
                     <img src="https://avatars.githubusercontent.com/u/183823742?v=4" width="72;" alt="skjaere"/>

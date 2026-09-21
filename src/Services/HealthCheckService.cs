@@ -329,46 +329,12 @@ public class HealthCheckService
                 continue;
             }
 
-            // Existing is not the same as usable. A read-only mount, or one
-            // owned by another user, passed this check as healthy while every
-            // import and every rename into it failed, and nothing warned
-            // anybody until files started going missing.
-            var writeError = DescribeWriteFailure(folder.Path);
-            if (writeError != null)
-            {
-                results.Add(new HealthCheckResult
-                {
-                    Type = HealthCheckType.RootFolderInaccessible,
-                    Level = HealthCheckLevel.Error,
-                    Message = $"Root folder is not writable: {folder.Path}",
-                    Details = $"Imports and renames into this folder will fail. {writeError}"
-                });
-            }
+            // RootFolderValidator proves writability when the folder is added.
+            // Recurring health checks stay read-only so they do not wake idle
+            // media disks and parity just to repeat that probe.
         }
 
         return results;
-    }
-
-    /// <summary>
-    /// Try to create and remove a file in a folder. Returns null when that
-    /// worked, or a description of why it did not.
-    /// </summary>
-    private static string? DescribeWriteFailure(string path)
-    {
-        var probe = Path.Combine(path, $".sportarr-write-test-{Guid.NewGuid():N}");
-        try
-        {
-            File.WriteAllBytes(probe, Array.Empty<byte>());
-            return null;
-        }
-        catch (Exception ex)
-        {
-            return ex.Message;
-        }
-        finally
-        {
-            try { if (File.Exists(probe)) File.Delete(probe); } catch { /* nothing left to do */ }
-        }
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Collections.Concurrent;
 using Sportarr.Api.Data;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services;
@@ -329,5 +330,28 @@ public class HealthCheckServiceTests : IDisposable
         var backups = results.Should().ContainSingle(r => r.Type == HealthCheckType.BackupsFailing).Subject;
         backups.Level.Should().Be(HealthCheckLevel.Warning);
         backups.Message.Should().Contain("stopped");
+    }
+
+    [Fact]
+    public async Task PerformAllChecksAsync_DoesNotWriteToAnIdleRootFolder()
+    {
+        using var db = CreateDb();
+        var root = Path.Combine(_tempDataPath, "library");
+        Directory.CreateDirectory(root);
+        db.RootFolders.Add(new RootFolder { Path = root });
+        await db.SaveChangesAsync();
+        var writes = new ConcurrentBag<string>();
+        using var watcher = new FileSystemWatcher(root)
+        {
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+            EnableRaisingEvents = true
+        };
+        watcher.Created += (_, args) => writes.Add(args.Name ?? string.Empty);
+        watcher.Changed += (_, args) => writes.Add(args.Name ?? string.Empty);
+
+        await CreateService(db).PerformAllChecksAsync();
+        await Task.Delay(100);
+
+        writes.Should().BeEmpty("recurring health checks must not wake an idle media disk");
     }
 }

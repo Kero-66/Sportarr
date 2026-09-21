@@ -16,6 +16,7 @@ import {
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
 import apiClient from '../api/client';
+import { AsyncOperationQueue, isPlaybackGenerationCurrent } from './streamPlaybackGeneration';
 
 // LocalStorage key for the user's preferred volume + mute state.
 // Persisted across modal opens so they don't have to re-set volume
@@ -166,6 +167,8 @@ export default function StreamPlayerModal({
   // Reading the session from a ref instead is what makes the stop actually
   // run, rather than leaving the transcode alive on the server.
   const ffmpegSessionIdRef = useRef<string | null>(null);
+  const playbackGenerationRef = useRef(0);
+  const ffmpegOperationsRef = useRef(new AsyncOperationQueue());
   const [videoReady, setVideoReady] = useState(false);
   const [isPip, setIsPip] = useState(false);
   const ffmpegInitializingRef = useRef(false);
@@ -287,52 +290,66 @@ export default function StreamPlayerModal({
   };
 
   // Start FFmpeg HLS stream
-  const startFfmpegStream = async (): Promise<string | null> => {
+  const startFfmpegStream = async (generation: number): Promise<string | null> => {
     if (!channelId) return null;
 
-    try {
-      log('info', 'Starting FFmpeg HLS stream', { channelId });
-      const response = await apiClient.post(`/v1/stream/${channelId}/start`);
+    return ffmpegOperationsRef.current.enqueue(async () => {
+      try {
+        log('info', 'Starting FFmpeg HLS stream', { channelId });
+        const response = await apiClient.post(`/v1/stream/${channelId}/start`);
 
-      if (response.data.success) {
-        log('info', 'FFmpeg stream started', { sessionId: response.data.sessionId, playlistUrl: response.data.playlistUrl });
-        ffmpegSessionIdRef.current = response.data.sessionId;
-        setFfmpegSessionId(response.data.sessionId);
-        return response.data.sessionId;
-      } else {
-        log('error', 'FFmpeg stream failed', response.data.error);
+        if (response.data.success) {
+          log('info', 'FFmpeg stream started', { sessionId: response.data.sessionId, playlistUrl: response.data.playlistUrl });
+          if (!isPlaybackGenerationCurrent(generation, playbackGenerationRef.current)) {
+            await apiClient.post(
+              `/v1/stream/${channelId}/stop?sessionId=${encodeURIComponent(response.data.sessionId)}`
+            );
+            return null;
+          }
+
+          ffmpegSessionIdRef.current = response.data.sessionId;
+          setFfmpegSessionId(response.data.sessionId);
+          return response.data.sessionId;
+        } else {
+          log('error', 'FFmpeg stream failed', response.data.error);
+          return null;
+        }
+      } catch (err) {
+        log('error', 'Failed to start FFmpeg stream', err);
         return null;
       }
-    } catch (err) {
-      log('error', 'Failed to start FFmpeg stream', err);
-      return null;
-    }
+    });
   };
 
   // Stop FFmpeg stream
   const stopFfmpegStream = async () => {
-    if (channelId && ffmpegSessionIdRef.current) {
-      // Cleared before the request so a re-entrant call does not stop twice,
-      // but restored when the request fails. Forgetting the id on failure
-      // meant no later cleanup could stop the session, and the server-side
-      // transcode kept pulling the channel.
-      const sessionId = ffmpegSessionIdRef.current;
-      ffmpegSessionIdRef.current = null;
-      try {
-        log('info', 'Stopping FFmpeg stream', { channelId });
-        await apiClient.post(`/v1/stream/${channelId}/stop`);
-        setFfmpegSessionId(null);
-      } catch (err) {
-        if (ffmpegSessionIdRef.current === null) {
-          ffmpegSessionIdRef.current = sessionId;
+    await ffmpegOperationsRef.current.enqueue(async () => {
+      if (channelId && ffmpegSessionIdRef.current) {
+        // Cleared before the request so a re-entrant call does not stop twice,
+        // but restored when the request fails. Forgetting the id on failure
+        // meant no later cleanup could stop the session, and the server-side
+        // transcode kept pulling the channel.
+        const sessionId = ffmpegSessionIdRef.current;
+        ffmpegSessionIdRef.current = null;
+        try {
+          log('info', 'Stopping FFmpeg stream', { channelId });
+          await apiClient.post(
+            `/v1/stream/${channelId}/stop?sessionId=${encodeURIComponent(sessionId)}`
+          );
+          setFfmpegSessionId(null);
+        } catch (err) {
+          if (ffmpegSessionIdRef.current === null) {
+            ffmpegSessionIdRef.current = sessionId;
+          }
+          log('warn', 'Failed to stop FFmpeg stream', err);
         }
-        log('warn', 'Failed to stop FFmpeg stream', err);
       }
-    }
+    });
   };
 
   // Cleanup function
   const cleanup = async () => {
+    playbackGenerationRef.current += 1;
     log('debug', 'Cleaning up player resources');
     if (hlsRef.current) {
       hlsRef.current.destroy();
@@ -393,6 +410,7 @@ export default function StreamPlayerModal({
     }
 
     const video = videoRef.current;
+    const generation = ++playbackGenerationRef.current;
     setError(null);
     setErrorDetails(null);
     setIsLoading(true);
@@ -410,9 +428,12 @@ export default function StreamPlayerModal({
           video.removeAttribute('src');
           video.load();
 
-          const sessionId = await startFfmpegStream();
+          const sessionId = await startFfmpegStream(generation);
           if (!sessionId) {
             ffmpegInitializingRef.current = false;
+            if (!isPlaybackGenerationCurrent(generation, playbackGenerationRef.current)) {
+              return;
+            }
             setError('Failed to start FFmpeg transcoding');
             setErrorDetails('FFmpeg may not be installed or the stream URL is invalid.');
             setIsLoading(false);
@@ -423,7 +444,7 @@ export default function StreamPlayerModal({
           await new Promise(resolve => setTimeout(resolve, 2000));
 
           // Re-check video element is still available after wait
-          if (!videoRef.current) {
+          if (!isPlaybackGenerationCurrent(generation, playbackGenerationRef.current) || !videoRef.current) {
             log('warn', 'Video element no longer available after FFmpeg startup');
             ffmpegInitializingRef.current = false;
             return;

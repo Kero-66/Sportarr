@@ -1396,8 +1396,7 @@ public class NotificationService : INotificationService
     private async Task<(bool Success, string Message)> TestJellyfinConnectionAsync(string host, string apiKey)
     {
         var client = _httpClientFactory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-MediaBrowser-Token", apiKey);
-        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        ConfigureJellyfinClient(client, apiKey);
 
         var url = $"{host.TrimEnd('/')}/System/Info";
         using var response = await client.GetAsync(url);
@@ -1415,6 +1414,17 @@ public class NotificationService : INotificationService
         return response.StatusCode == System.Net.HttpStatusCode.Unauthorized
             ? (false, "Authentication failed - check your API key")
             : (false, $"Connection failed: {response.StatusCode}");
+    }
+
+    private static void ConfigureJellyfinClient(HttpClient client, string apiKey)
+    {
+        var token = apiKey.Trim()
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "MediaBrowser",
+            $"Client=\"Sportarr\", Device=\"Sportarr\", DeviceId=\"sportarr\", Version=\"1\", Token=\"{token}\"");
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
     private async Task<bool> RefreshJellyfinLibraryAsync(Dictionary<string, JsonElement> config, string? filePath)
@@ -1444,8 +1454,7 @@ public class NotificationService : INotificationService
         try
         {
             var client = _httpClientFactory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-MediaBrowser-Token", apiKey);
-            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            ConfigureJellyfinClient(client, apiKey);
 
             var baseUrl = host.TrimEnd('/');
             var serverPath = ApplyPathMapping(filePath, config);

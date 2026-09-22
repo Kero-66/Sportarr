@@ -64,6 +64,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GHCR requires a lowercase repository name; the owner login is mixed case.
+      - name: Compute image name
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/sportarr" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -71,4 +76,4 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: CACHEBUST=${{ github.run_id }}
-          tags: ghcr.io/${{ github.repository_owner }}/sportarr:${{ inputs.tag }}
+          tags: ${{ steps.img.outputs.name }}:${{ inputs.tag }}

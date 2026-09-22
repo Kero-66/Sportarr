@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
   detectStreamType,
+  getFfmpegStartPath,
   getHlsPlaybackConfig,
   isPlaybackGenerationCurrent,
 } from './streamPlaybackConfig';
 
 describe('detectStreamType', () => {
-  it('uses native playback for extensionless provider streams', () => {
+  it('uses HLS playback for extensionless provider streams', () => {
     expect(detectStreamType('https://provider.example/live/user/token/200163456'))
-      .toBe('native');
+      .toBe('hls');
+  });
+
+  it('builds explicit FFmpeg normalization requests', () => {
+    expect(getFfmpegStartPath(24, false)).toBe('/v1/stream/24/start?normalize=false');
+    expect(getFfmpegStartPath(24, true)).toBe('/v1/stream/24/start?normalize=true');
   });
 
   it('exposes bounded live playback profiles for runtime tuning', () => {

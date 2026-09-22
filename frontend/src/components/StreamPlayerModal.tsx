@@ -19,6 +19,7 @@ import apiClient from '../api/client';
 import { BUTTON_SECONDARY } from '../utils/designTokens';
 import {
   detectStreamType,
+  getFfmpegStartPath,
   getHlsPlaybackConfig,
   isPlaybackGenerationCurrent,
   type HlsPlaybackProfile,
@@ -134,6 +135,7 @@ export default function StreamPlayerModal({
   const [isLoading, setIsLoading] = useState(true);
   const [streamType, setStreamType] = useState<StreamType>('unknown');
   const [playbackMode, setPlaybackMode] = useState<PlaybackMode>('proxy');
+  const [normalizeFfmpeg, setNormalizeFfmpeg] = useState(false);
   const [hlsPlaybackProfile, setHlsPlaybackProfile] = useState<HlsPlaybackProfile>('balanced');
   const [retryCount, setRetryCount] = useState(0);
   const [showDebug, setShowDebug] = useState(false);
@@ -149,6 +151,7 @@ export default function StreamPlayerModal({
   const [videoReady, setVideoReady] = useState(false);
   const [isPip, setIsPip] = useState(false);
   const ffmpegInitializingRef = useRef(false);
+  const normalizeFfmpegRef = useRef(normalizeFfmpeg);
   const hlsPlaybackProfileRef = useRef<HlsPlaybackProfile>(hlsPlaybackProfile);
   const playbackGenerationRef = useRef(0);
   const ffmpegRequestedGenerationRef = useRef<number | null>(null);
@@ -280,7 +283,9 @@ export default function StreamPlayerModal({
     const startRequest = (async (): Promise<string | null> => {
       try {
         log('info', 'Starting FFmpeg HLS stream', { channelId });
-        const response = await apiClient.post(`/v1/stream/${channelId}/start`);
+        const response = await apiClient.post(
+          getFfmpegStartPath(channelId, normalizeFfmpegRef.current),
+        );
 
         if (!response.data.success) {
           log('error', 'FFmpeg stream failed', response.data.error);
@@ -467,6 +472,17 @@ export default function StreamPlayerModal({
   const restartFfmpegStream = async () => {
     if (playbackMode !== 'ffmpeg') return;
     log('info', 'Restarting FFmpeg playback session');
+    const cleanupGeneration = playbackGenerationRef.current + 1;
+    await cleanup();
+    if (playbackGenerationRef.current !== cleanupGeneration) return;
+    setRetryCount(prev => prev + 1);
+  };
+
+  const applyFfmpegNormalization = async (normalize: boolean) => {
+    normalizeFfmpegRef.current = normalize;
+    setNormalizeFfmpeg(normalize);
+    if (playbackMode !== 'ffmpeg') return;
+
     const cleanupGeneration = playbackGenerationRef.current + 1;
     await cleanup();
     if (playbackGenerationRef.current !== cleanupGeneration) return;
@@ -1477,6 +1493,21 @@ export default function StreamPlayerModal({
                         </select>
                       </div>
                     )}
+
+                    <label className="mb-3 flex min-h-11 cursor-pointer items-start gap-3 rounded-lg bg-gray-800 p-3">
+                      <input
+                        type="checkbox"
+                        checked={normalizeFfmpeg}
+                        onChange={(event) => void applyFfmpegNormalization(event.target.checked)}
+                        className="mt-0.5 h-5 w-5 shrink-0 accent-red-600"
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-xs font-semibold text-gray-300">Normalize FFmpeg video</span>
+                        <span className="block text-[10px] text-gray-500">
+                          Re-encode H.264 for sources that fail in stream-copy mode. Uses more CPU and restarts an active FFmpeg preview.
+                        </span>
+                      </span>
+                    </label>
 
                     {loadingDebug && (
                       <div className="text-center py-4 text-gray-400">

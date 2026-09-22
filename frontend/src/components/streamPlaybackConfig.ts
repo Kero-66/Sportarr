@@ -140,5 +140,9 @@ export function detectStreamType(url: string): StreamType {
     return 'native';
   }
 
-  return 'native';
+  return 'hls';
+}
+
+export function getFfmpegStartPath(channelId: number, normalize: boolean): string {
+  return `/v1/stream/${channelId}/start?normalize=${normalize}`;
 }

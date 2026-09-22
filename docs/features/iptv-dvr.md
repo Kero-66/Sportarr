@@ -39,6 +39,27 @@ Sportarr includes experimental support for recording live sports events directly
 !!! tip "Keeping a league off DVR"
     Each league has an **Automatic DVR scheduling** toggle, available as an **Enable IPTV DVR** checkbox when adding the league and as its own toggle on the league detail page (DVR section) afterward. Turn it off to keep a league on indexer downloads only; the auto-scheduler will never resolve a channel or schedule recordings for it, including through EPG/broadcaster matching with no channel manually mapped, while manual recordings still work. This is what lets you run, say, Formula 1 through indexers only while recording football over IPTV.
 
+## Live channel preview
+
+Channel previews start through the normal stream proxy. Use **Retry** to switch
+to FFmpeg HLS when a provider format does not play reliably in the browser. In
+FFmpeg mode, **Restart FFmpeg** replaces the current preview process and **Live
+edge** moves playback back to the newest available segment.
+
+Open **Stream Diagnostics** to select a live playback profile:
+
+- **Low latency** keeps a smaller buffer and follows the live edge closely.
+- **Balanced** is the default for normal playback.
+- **Resilient** uses longer buffers and more retries for unstable sources.
+
+The selected profile applies only to the current browser session. It changes
+browser buffering and retry behavior without restarting FFmpeg.
+
+Enable **Normalize FFmpeg video** when a source still stutters or produces
+invalid segments in the default stream-copy mode. Normalization re-encodes the
+video as H.264, uses more CPU, and restarts an active FFmpeg preview when the
+option changes.
+
 ## Live event timing
 
 **Settings > DVR Recordings** has two controls for event-linked live captures.

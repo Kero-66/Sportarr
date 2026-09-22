@@ -100,7 +100,7 @@ public class ReleaseMatchingService
         new(@"\bRace\s*(\d{1,3})\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     // One file can hold two races, and its title says so ("Races 26 and 27").
     private static readonly Regex _releaseRaceNumberPattern =
-        new(@"\bRaces?\s*(\d{1,3})(?:\s*(?:and|&|\+|,)\s*(\d{1,3}))?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        new(@"\bRaces?[\s._\-]*(\d{1,3})(?:[\s._\-]*(?:and|&|\+|,)[\s._\-]*(\d{1,3}))?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _releaseRoundTokenPattern =
         new(@"\b(?:round|rd)\s*\.?\s*\d{1,2}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex[] _eventNumberPatterns = new[]

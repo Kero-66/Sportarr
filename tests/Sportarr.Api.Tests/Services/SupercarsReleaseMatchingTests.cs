@@ -156,6 +156,30 @@ public class SupercarsReleaseMatchingTests
             .IsHardRejection.Should().BeTrue("race 28 is not in that file");
     }
 
+    // Scene releases separate every token with a dot, so "Race.03" carries the
+    // same race number as "Race 3". The pattern only allowed whitespace after
+    // "Race", so it read no number at all from a dotted title, the race check
+    // was skipped entirely, and race 3 at Sydney validated against race 28 at
+    // Ipswich. Same shape as the underscore fix in #218.
+    [Fact]
+    public void ADottedSceneTitleStillCarriesItsRaceNumber()
+    {
+        var release = Rel("Supercars.Championship.2026.Race.03.Dunlop.Sydney.500.1080p.HDTV.H264-DARKSPORT");
+
+        _matchingSvc.ValidateRelease(release, Ipswich2026Race28())
+            .IsHardRejection.Should().BeTrue("race 3 is not race 28, however the title spells it");
+    }
+
+    [Fact]
+    public void ADottedSceneTitleStillMatchesItsOwnRace()
+    {
+        var release = Rel("Supercars.Championship.2026.Race.03.Dunlop.Sydney.500.1080p.HDTV.H264-DARKSPORT");
+        var evt = Race("DUNLOP Sydney 500 - Race 3", "1", 3, 2026, 2, 22);
+
+        _matchingSvc.ValidateRelease(release, evt)
+            .IsHardRejection.Should().BeFalse("the release is exactly this race");
+    }
+
     [Fact]
     public void TheRaceNumberScoresTheRightEventHigher()
     {

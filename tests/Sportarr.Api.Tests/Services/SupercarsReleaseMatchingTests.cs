@@ -180,6 +180,28 @@ public class SupercarsReleaseMatchingTests
             .IsHardRejection.Should().BeFalse("the release is exactly this race");
     }
 
+    // RuTracker names the round straight after the season ("S2026. 8 -"), with
+    // no Round/Rd/R keyword for ExtractRoundNumber to find. The round guard then
+    // never fired and a round 8 Perth pack validated against a round 9 Ipswich
+    // event - automatic search picked it and started a 7.6GB download.
+    [Fact]
+    public void ASeasonDotRoundTitleIsRejectedForAnotherRound()
+    {
+        var release = Rel("Repco Supercars Championship. S2026. 8 - Bosch Power Tools Perth Super 440. 1-3 [ HDTV/720p/50fps, MKV/H.264, EN]");
+
+        _matchingSvc.ValidateRelease(release, Ipswich2026Race28())
+            .IsHardRejection.Should().BeTrue("round 8 is not round 9");
+    }
+
+    [Fact]
+    public void ASeasonDotRoundTitleIsKeptForItsOwnRound()
+    {
+        var release = Rel("Repco Supercars Championship. S2026. 9 - Century Batteries Ipswich Super 440. 1-3 [ HDTV/720p/50fps, MKV/H.264, EN]");
+
+        _matchingSvc.ValidateRelease(release, Ipswich2026Race28())
+            .IsHardRejection.Should().BeFalse("round 9 is exactly this event's round");
+    }
+
     [Fact]
     public void TheRaceNumberScoresTheRightEventHigher()
     {

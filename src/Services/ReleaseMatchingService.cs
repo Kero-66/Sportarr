@@ -136,6 +136,12 @@ public class ReleaseMatchingService
         // rather than \b so underscore-delimited titles (Formula_1_2026x02_...)
         // match too -- '_' is a word char, so \b would not fire around it.
         new Regex(@"(?<![0-9A-Za-z])20[12]\dx(\d{1,2})(?![0-9A-Za-z])", RegexOptions.Compiled | RegexOptions.IgnoreCase), // 2026x02
+        // "S2026. 8 - Bosch Power Tools Perth Super 440" - the season carries the
+        // round straight after it, with no Round/Rd/R keyword anywhere in the
+        // title. Without this the round-mismatch guard never fires for these and
+        // a round 8 pack validated against a round 9 event. Listed last so every
+        // explicit form above still wins.
+        new Regex(@"(?<![0-9A-Za-z])S20[12]\d[\s.\-]+(\d{1,2})(?![0-9A-Za-z])", RegexOptions.Compiled | RegexOptions.IgnoreCase), // S2026. 8
     };
 
     private static readonly Regex _splitSeparatorsRegex = new(

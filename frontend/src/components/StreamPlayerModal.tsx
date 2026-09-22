@@ -19,6 +19,7 @@ import apiClient from '../api/client';
 import { BUTTON_SECONDARY } from '../utils/designTokens';
 import {
   detectStreamType,
+  getAutomaticPlaybackRecovery,
   getFfmpegStartPath,
   getHlsPlaybackConfig,
   isPlaybackGenerationCurrent,
@@ -148,6 +149,7 @@ export default function StreamPlayerModal({
   // Reading the session from a ref instead is what makes the stop actually
   // run, rather than leaving the transcode alive on the server.
   const ffmpegSessionIdRef = useRef<string | null>(null);
+  const ffmpegLeaseIdRef = useRef<string | null>(null);
   const [videoReady, setVideoReady] = useState(false);
   const [isPip, setIsPip] = useState(false);
   const ffmpegInitializingRef = useRef(false);
@@ -163,6 +165,7 @@ export default function StreamPlayerModal({
   // reset). One silent retry recovers most of these without showing the
   // error UI; we only surface the error if retries are exhausted.
   const autoRetryCountRef = useRef(0);
+  const automaticFallbackCountRef = useRef(0);
   const MAX_AUTO_RETRIES = 2;
 
   // Reset state when modal opens or channel changes
@@ -178,6 +181,7 @@ export default function StreamPlayerModal({
       setErrorDetails(null);
       setIsLoading(true);
       autoRetryCountRef.current = 0;
+      automaticFallbackCountRef.current = 0;
       ffmpegInitializingRef.current = false;
       setPlaybackMode('proxy');
       // Restore the user's last-used audio state from localStorage so
@@ -303,13 +307,14 @@ export default function StreamPlayerModal({
           // until its result is released. Stop it before a newer generation
           // is allowed to issue its own start request.
           if (ffmpegStartGenerationRef.current === generation && response.data.sessionId) {
-            await stopFfmpegStream(response.data.sessionId);
+            await stopFfmpegStream(response.data.sessionId, response.data.leaseId);
           }
           return null;
         }
 
         log('info', 'FFmpeg stream started', { sessionId: response.data.sessionId, playlistUrl: response.data.playlistUrl });
         ffmpegSessionIdRef.current = response.data.sessionId;
+        ffmpegLeaseIdRef.current = response.data.leaseId ?? null;
         setFfmpegSessionId(response.data.sessionId);
         return response.data.sessionId;
       } catch (err) {
@@ -331,9 +336,10 @@ export default function StreamPlayerModal({
   };
 
   // Stop FFmpeg stream
-  const stopFfmpegStream = async (sessionIdOverride?: string) => {
+  const stopFfmpegStream = async (sessionIdOverride?: string, leaseIdOverride?: string) => {
     const sessionId = sessionIdOverride ?? ffmpegSessionIdRef.current;
-    if (channelId && sessionId) {
+    const leaseId = leaseIdOverride ?? ffmpegLeaseIdRef.current;
+    if (channelId && sessionId && leaseId) {
       // Cleared before the request so a re-entrant call does not stop twice,
       // but restored when the request fails. Forgetting the id on failure
       // meant no later cleanup could stop the session, and the server-side
@@ -341,11 +347,12 @@ export default function StreamPlayerModal({
       const ownsCurrentSession = ffmpegSessionIdRef.current === sessionId;
       if (ownsCurrentSession) {
         ffmpegSessionIdRef.current = null;
+        ffmpegLeaseIdRef.current = null;
       }
       try {
         log('info', 'Stopping FFmpeg stream', { channelId });
         await apiClient.post(
-          `/v1/stream/${channelId}/stop?sessionId=${encodeURIComponent(sessionId)}`,
+          `/v1/stream/${channelId}/stop?sessionId=${encodeURIComponent(sessionId)}&leaseId=${encodeURIComponent(leaseId)}`,
         );
         if (ownsCurrentSession && ffmpegSessionIdRef.current === null) {
           setFfmpegSessionId(null);
@@ -353,11 +360,29 @@ export default function StreamPlayerModal({
       } catch (err) {
         if (ownsCurrentSession && ffmpegSessionIdRef.current === null) {
           ffmpegSessionIdRef.current = sessionId;
+          ffmpegLeaseIdRef.current = leaseId;
         }
         log('warn', 'Failed to stop FFmpeg stream', err);
       }
     }
   };
+
+  useEffect(() => {
+    if (!channelId || playbackMode !== 'ffmpeg' || !ffmpegSessionId) return;
+
+    const heartbeat = () => {
+      const leaseId = ffmpegLeaseIdRef.current;
+      if (!leaseId || ffmpegSessionIdRef.current !== ffmpegSessionId) return;
+      void apiClient.post(
+        `/v1/stream/${channelId}/heartbeat?sessionId=${encodeURIComponent(ffmpegSessionId)}&leaseId=${encodeURIComponent(leaseId)}`,
+      ).catch((err) => {
+        log('warn', 'FFmpeg viewer heartbeat failed', err);
+      });
+    };
+
+    const interval = window.setInterval(heartbeat, 30_000);
+    return () => window.clearInterval(interval);
+  }, [channelId, ffmpegSessionId, playbackMode]);
 
   // Cleanup function. Queue teardown synchronously before awaiting an older
   // cleanup so a prop change cannot slip a new player between two teardown
@@ -508,6 +533,23 @@ export default function StreamPlayerModal({
       setPlaybackMode('proxy');
       log('info', 'Switching to proxy mode');
     }
+  };
+
+  const tryAutomaticFallback = async (reason: string) => {
+    const recovery = getAutomaticPlaybackRecovery(playbackMode, automaticFallbackCountRef.current);
+    if (!recovery || !channelId) return false;
+
+    automaticFallbackCountRef.current += 1;
+    normalizeFfmpegRef.current = recovery.normalize;
+    setNormalizeFfmpeg(recovery.normalize);
+    log('info', 'Automatically recovering playback', { from: playbackMode, to: recovery.mode, reason });
+
+    const cleanupGeneration = playbackGenerationRef.current + 1;
+    await cleanup();
+    if (playbackGenerationRef.current !== cleanupGeneration) return false;
+    setPlaybackMode(recovery.mode);
+    setRetryCount((current) => current + 1);
+    return true;
   };
 
   // Get next mode label for retry button
@@ -724,6 +766,10 @@ export default function StreamPlayerModal({
                       hls.startLoad();
                       break;
                     }
+                    if (playbackMode === 'proxy' && channelId) {
+                      void tryAutomaticFallback(data.details);
+                      break;
+                    }
                     if (data.response?.code === 0) {
                       setError('Stream server blocked the request');
                       setErrorDetails(`Possible CORS / network issue. Response code: ${data.response?.code}. Try the Retry button to switch to FFmpeg or Direct mode.`);
@@ -741,6 +787,10 @@ export default function StreamPlayerModal({
                         details: data.details,
                       });
                       hls.recoverMediaError();
+                      break;
+                    }
+                    if (playbackMode === 'proxy' && channelId) {
+                      void tryAutomaticFallback(data.details);
                       break;
                     }
                     setError(`Media decoding failed`);
@@ -781,6 +831,10 @@ export default function StreamPlayerModal({
               });
             });
           } else {
+            if (playbackMode === 'proxy' && channelId) {
+              void tryAutomaticFallback('HLS is not supported by this browser');
+              return;
+            }
             setError('HLS is not supported in this browser');
             setErrorDetails('Your browser does not support HLS playback. Try Chrome, Firefox, or Safari.');
             setIsLoading(false);
@@ -813,6 +867,10 @@ export default function StreamPlayerModal({
             player.on(mpegts.Events.ERROR, (errorType, errorDetail, errorInfo) => {
               if (!isCurrent()) return;
               log('error', 'MPEG-TS error', { errorType, errorDetail, errorInfo });
+              if (playbackMode === 'proxy' && channelId) {
+                void tryAutomaticFallback(String(errorDetail));
+                return;
+              }
               setError(`Stream error: ${errorType}`);
               setErrorDetails(String(errorDetail));
             });
@@ -857,6 +915,10 @@ export default function StreamPlayerModal({
             }, 5000);
           } else {
             log('error', 'MPEG-TS not supported in this browser');
+            if (playbackMode === 'proxy' && channelId) {
+              void tryAutomaticFallback('MPEG-TS is not supported by this browser');
+              return;
+            }
             setError('MPEG-TS/FLV is not supported in this browser');
             setErrorDetails('Your browser does not support MPEG-TS playback. Try Chrome or Edge.');
             setIsLoading(false);
@@ -875,6 +937,10 @@ export default function StreamPlayerModal({
           video.addEventListener('error', (e) => {
             if (!isCurrent()) return;
             log('error', 'Native video error', e);
+            if (playbackMode === 'proxy' && channelId) {
+              void tryAutomaticFallback(video.error?.message || 'Native video error');
+              return;
+            }
             setError('Failed to load video');
             setErrorDetails(`Video element error: ${video.error?.message || 'Unknown error'}`);
             setIsLoading(false);
@@ -888,6 +954,10 @@ export default function StreamPlayerModal({
               if (!isCurrent()) return;
               if (data.fatal) {
                 log('error', 'Default HLS error', data);
+                if (playbackMode === 'proxy' && channelId) {
+                  void tryAutomaticFallback(data.details);
+                  return;
+                }
                 setError('Could not play this stream format');
                 setErrorDetails(`HLS error: ${data.details}`);
                 setIsLoading(false);
@@ -904,6 +974,10 @@ export default function StreamPlayerModal({
         if (!isCurrent()) return;
         const errorMessage = err instanceof Error ? err.message : (typeof err === 'string' ? err : JSON.stringify(err));
         log('error', 'Player initialization error', { message: errorMessage, type: typeof err, err });
+        if (playbackMode === 'proxy' && channelId) {
+          void tryAutomaticFallback(errorMessage || 'Player initialization error');
+          return;
+        }
         setError(`Failed to initialize player`);
         setErrorDetails(errorMessage || 'Unknown initialization error');
         setIsLoading(false);
@@ -933,6 +1007,13 @@ export default function StreamPlayerModal({
         return;
       }
       log('error', 'Video element error', { error: videoEl.error });
+      if (hlsRef.current || mpegtsPlayerRef.current) {
+        return;
+      }
+      if (playbackMode === 'proxy' && channelId) {
+        void tryAutomaticFallback(videoEl.error?.message || 'Video element error');
+        return;
+      }
       if (!error) {
         setError('Failed to play stream');
         setErrorDetails(`Error code: ${videoEl.error?.code}, Message: ${videoEl.error?.message}`);
@@ -992,6 +1073,7 @@ export default function StreamPlayerModal({
     setPlaybackMode('proxy');
     setRetryCount(0);
     ffmpegSessionIdRef.current = null;
+    ffmpegLeaseIdRef.current = null;
     setFfmpegSessionId(null);
     setVideoReady(false);
     onClose();
@@ -1220,16 +1302,6 @@ export default function StreamPlayerModal({
                     <Dialog.Title className="text-lg font-bold text-white truncate">
                       {channelName}
                     </Dialog.Title>
-                    <span className="px-2 py-0.5 text-xs rounded bg-blue-600/30 text-blue-300 border border-blue-500/30">
-                      {getStreamTypeLabel()}
-                    </span>
-                    <span className={`px-2 py-0.5 text-xs rounded ${
-                      playbackMode === 'proxy' ? 'bg-green-600/30 text-green-300' :
-                      playbackMode === 'ffmpeg' ? 'bg-purple-600/30 text-purple-300' :
-                      'bg-yellow-600/30 text-yellow-300'
-                    }`}>
-                      {playbackMode === 'proxy' ? 'Proxy' : playbackMode === 'ffmpeg' ? 'FFmpeg' : 'Direct'}
-                    </span>
                   </div>
                   <div className="flex items-center gap-1 flex-shrink-0">
                     {/* Picture-in-picture button — pops the video into a
@@ -1390,54 +1462,12 @@ export default function StreamPlayerModal({
                         {Math.round((isMuted ? 0 : volume) * 100)}%
                       </span>
                     </div>
-                    <button
-                      onClick={handleRetry}
-                      disabled={isLoading}
-                      className="p-2 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      title="Retry stream"
-                    >
-                      <ArrowPathIcon className="w-6 h-6 text-white" />
-                    </button>
-                    {playbackMode === 'ffmpeg' && (
-                      <button
-                        onClick={restartFfmpegStream}
-                        disabled={isLoading}
-                        className={BUTTON_SECONDARY}
-                        title="Stop and start the FFmpeg producer again"
-                      >
-                        Restart FFmpeg
-                      </button>
-                    )}
-                    {Hls.isSupported() && (playbackMode === 'ffmpeg' || streamType === 'hls') && (
-                      <button
-                        onClick={seekToLiveEdge}
-                        disabled={isLoading || !!error}
-                        className={BUTTON_SECONDARY}
-                        title="Seek to the current HLS live edge"
-                      >
-                        Live edge
-                      </button>
-                    )}
                   </div>
 
                   <div className="flex items-center gap-2">
                     <span className={`px-2 py-1 text-xs rounded ${isPlaying ? 'bg-green-600/30 text-green-300' : 'bg-yellow-600/30 text-yellow-300'}`}>
                       {isLoading ? 'Loading...' : isPlaying ? 'Playing' : 'Paused'}
                     </span>
-                    <button
-                      onClick={() => {
-                        setShowDebug(!showDebug);
-                        if (!showDebug && !debugInfo) {
-                          fetchDebugInfo();
-                        } else {
-                          setLogs([...globalLogs]);
-                        }
-                      }}
-                      className={`p-2 rounded-lg transition-colors ${showDebug ? 'bg-orange-600 hover:bg-orange-700' : 'bg-gray-700 hover:bg-gray-600'}`}
-                      title="Debug stream"
-                    >
-                      <BugAntIcon className="w-6 h-6 text-white" />
-                    </button>
                     <button
                       onClick={toggleFullscreen}
                       disabled={isLoading || !!error}
@@ -1447,6 +1477,24 @@ export default function StreamPlayerModal({
                     </button>
                   </div>
                 </div>
+
+                <button
+                  onClick={() => {
+                    setShowDebug(!showDebug);
+                    if (!showDebug && !debugInfo) {
+                      fetchDebugInfo();
+                    } else {
+                      setLogs([...globalLogs]);
+                    }
+                  }}
+                  className="flex min-h-11 w-full items-center justify-between border-t border-gray-800 bg-black/20 px-4 py-2 text-left text-sm text-gray-400 transition-colors hover:bg-gray-800/50 hover:text-white"
+                  aria-expanded={showDebug}
+                >
+                  <span className="flex items-center gap-2">
+                    <BugAntIcon className="h-4 w-4" /> Playback details
+                  </span>
+                  <span className="text-xs text-gray-500">{getStreamTypeLabel()} · {playbackMode}</span>
+                </button>
 
                 {/* Debug Panel */}
                 {showDebug && (
@@ -1473,6 +1521,22 @@ export default function StreamPlayerModal({
                           Copy
                         </button>
                       </div>
+                    </div>
+
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      <button onClick={handleRetry} disabled={isLoading} className={BUTTON_SECONDARY}>
+                        Try another method
+                      </button>
+                      {playbackMode === 'ffmpeg' && (
+                        <button onClick={restartFfmpegStream} disabled={isLoading} className={BUTTON_SECONDARY}>
+                          Restart FFmpeg
+                        </button>
+                      )}
+                      {Hls.isSupported() && (playbackMode === 'ffmpeg' || streamType === 'hls') && (
+                        <button onClick={seekToLiveEdge} disabled={isLoading || !!error} className={BUTTON_SECONDARY}>
+                          Move to live edge
+                        </button>
+                      )}
                     </div>
 
                     {Hls.isSupported() && (playbackMode === 'ffmpeg' || streamType === 'hls') && (

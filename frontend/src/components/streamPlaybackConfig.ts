@@ -3,6 +3,11 @@ export type HlsPlaybackProfile = 'low-latency' | 'balanced' | 'resilient';
 export type StreamType = 'hls' | 'mpegts' | 'native' | 'unknown';
 export type PlaybackMode = 'proxy' | 'direct' | 'ffmpeg';
 
+export interface AutomaticPlaybackRecovery {
+  mode: PlaybackMode;
+  normalize: false;
+}
+
 interface HlsRetryConfig {
   maxNumRetry: number;
   retryDelayMs: number;
@@ -119,6 +124,14 @@ export function isPlaybackGenerationCurrent(
   cancelled: boolean,
 ): boolean {
   return !cancelled && generation === currentGeneration;
+}
+
+export function getAutomaticPlaybackRecovery(
+  mode: PlaybackMode,
+  automaticFallbackCount: number,
+): AutomaticPlaybackRecovery | null {
+  if (mode !== 'proxy' || automaticFallbackCount > 0) return null;
+  return { mode: 'ffmpeg', normalize: false };
 }
 
 export function detectStreamType(url: string): StreamType {

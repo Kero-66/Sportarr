@@ -34,6 +34,7 @@ app.MapGet("/api/dvr/stats", async (SportarrDbContext db) =>
         recordingCount = recordings.Count(r => r.Status == DvrRecordingStatus.Recording),
         completedCount = recordings.Count(r => r.Status == DvrRecordingStatus.Completed),
         importedCount = recordings.Count(r => r.Status == DvrRecordingStatus.Imported),
+        importingCount = recordings.Count(r => r.Status == DvrRecordingStatus.Importing),
         failedCount = recordings.Count(r => r.Status == DvrRecordingStatus.Failed),
         cancelledCount = recordings.Count(r => r.Status == DvrRecordingStatus.Cancelled),
         // Bytes sitting in the DVR folders, and only those. Recordings are a

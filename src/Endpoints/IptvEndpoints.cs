@@ -492,6 +492,7 @@ app.MapGet("/api/iptv/channels", async (
     string? countries,
     string? groups,
     bool? hasEpgOnly,
+    bool? attentionOnly,
     int? limit,
     int offset = 0) =>
 {
@@ -507,8 +508,13 @@ app.MapGet("/api/iptv/channels", async (
     {
         countryList = countries.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
     }
-    var channels = await iptvService.GetAllChannelsAsync(sportsOnly, enabledOnly, favoritesOnly, search, countryList, groupList, hasEpgOnly, limit, offset);
+    var channels = await iptvService.GetAllChannelsAsync(sportsOnly, enabledOnly, favoritesOnly, search, countryList, groupList, hasEpgOnly, attentionOnly, limit, offset);
     return Results.Ok(channels.Select(IptvChannelResponse.FromEntity));
+});
+
+app.MapGet("/api/iptv/channels/attention-count", async (IptvSourceService iptvService) =>
+{
+    return Results.Ok(new { count = await iptvService.GetAttentionChannelCountAsync() });
 });
 
 // Get a single channel by ID
@@ -1863,6 +1869,7 @@ app.MapPost("/api/v1/stream/{channelId:int}/start", async (
     {
         success = true,
         sessionId = result.SessionId,
+        leaseId = result.LeaseId,
         playlistUrl = result.PlaylistUrl
     });
 });
@@ -1870,16 +1877,28 @@ app.MapPost("/api/v1/stream/{channelId:int}/start", async (
 // Stop an FFmpeg HLS stream
 app.MapPost("/api/v1/stream/{channelId:int}/stop", async (
     int channelId,
-    string? sessionId,
+    string sessionId,
+    string leaseId,
     FFmpegStreamService streamService,
     ILogger<Program> logger) =>
 {
     logger.LogInformation(
         "[HLSStream] Stopping HLS stream for channel {ChannelId}, session {SessionId}",
         channelId,
-        sessionId ?? "any");
-    await streamService.StopStreamAsync(channelId.ToString(), sessionId);
+        sessionId);
+    await streamService.StopStreamAsync(channelId.ToString(), sessionId, leaseId);
     return Results.Ok(new { success = true });
+});
+
+app.MapPost("/api/v1/stream/{channelId:int}/heartbeat", (
+    int channelId,
+    string sessionId,
+    string leaseId,
+    FFmpegStreamService streamService) =>
+{
+    return streamService.RefreshViewerLease(channelId.ToString(), sessionId, leaseId)
+        ? Results.Ok(new { success = true })
+        : Results.NotFound(new { error = "Stream viewer lease not found" });
 });
 
 // Get HLS playlist file (AllowAnonymous - HLS.js makes its own requests without API key)

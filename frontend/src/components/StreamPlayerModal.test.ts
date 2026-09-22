@@ -3,6 +3,7 @@ import {
   detectStreamType,
   getFfmpegStartPath,
   getHlsPlaybackConfig,
+  getAutomaticPlaybackRecovery,
   isPlaybackGenerationCurrent,
 } from './streamPlaybackConfig';
 
@@ -58,5 +59,15 @@ describe('detectStreamType', () => {
     expect(isPlaybackGenerationCurrent(4, 4, false)).toBe(true);
     expect(isPlaybackGenerationCurrent(4, 5, false)).toBe(false);
     expect(isPlaybackGenerationCurrent(4, 4, true)).toBe(false);
+  });
+
+  it('uses one bounded stream-copy fallback without enabling normalization', () => {
+    expect(getAutomaticPlaybackRecovery('proxy', 0)).toEqual({
+      mode: 'ffmpeg',
+      normalize: false,
+    });
+    expect(getAutomaticPlaybackRecovery('proxy', 1)).toBeNull();
+    expect(getAutomaticPlaybackRecovery('ffmpeg', 0)).toBeNull();
+    expect(getAutomaticPlaybackRecovery('direct', 0)).toBeNull();
   });
 });

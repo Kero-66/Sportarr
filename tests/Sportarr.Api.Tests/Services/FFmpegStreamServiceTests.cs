@@ -14,6 +14,39 @@ namespace Sportarr.Api.Tests.Services;
 public class FFmpegStreamServiceTests
 {
     [Fact]
+    public void Viewer_leases_keep_a_shared_stream_alive_until_the_last_viewer_leaves()
+    {
+        var leases = new StreamViewerLeaseSet();
+
+        var first = leases.Acquire();
+        var second = leases.Acquire();
+
+        first.Should().NotBe(second);
+        leases.Release(first).Should().Be(1);
+        leases.Release(first).Should().Be(1);
+        leases.Release(second).Should().Be(0);
+    }
+
+    [Fact]
+    public void Viewer_leases_expire_without_heartbeats_and_refresh_while_active()
+    {
+        var now = new DateTime(2026, 9, 21, 12, 0, 0, DateTimeKind.Utc);
+        var leases = new StreamViewerLeaseSet(TimeSpan.FromMinutes(1), () => now);
+
+        var active = leases.Acquire();
+        var abandoned = leases.Acquire();
+        now = now.AddSeconds(45);
+
+        leases.Refresh(active).Should().BeTrue();
+        now = now.AddSeconds(20);
+
+        leases.RemoveExpired().Should().Be(1);
+        leases.Count.Should().Be(1);
+        leases.Release(active).Should().Be(0);
+        leases.Refresh(abandoned).Should().BeFalse();
+    }
+
+    [Fact]
     public void Hls_playlist_keeps_enough_segments_to_absorb_live_source_jitter()
     {
         using var service = new FFmpegStreamService(NullLogger<FFmpegStreamService>.Instance);
@@ -142,8 +175,17 @@ public class FFmpegStreamServiceTests
             var first = await service.StartStreamAsync(channelId, sourceServer.Url.ToString());
             first.Success.Should().BeTrue(first.Error);
             first.SessionId.Should().NotBeNullOrWhiteSpace();
+            first.LeaseId.Should().NotBeNullOrWhiteSpace();
             var firstSessionId = first.SessionId!;
             service.GetHlsFilePath(firstSessionId, "playlist.m3u8").Should().NotBeNull();
+
+            var secondViewer = await service.StartStreamAsync(channelId, sourceServer.Url.ToString());
+            secondViewer.Success.Should().BeTrue(secondViewer.Error);
+            secondViewer.SessionId.Should().Be(firstSessionId);
+            secondViewer.LeaseId.Should().NotBe(first.LeaseId);
+
+            await service.StopStreamAsync(channelId, firstSessionId, first.LeaseId);
+            service.IsSessionActive(firstSessionId).Should().BeTrue();
 
             var failedReplacement = await service.StartStreamAsync(
                 channelId,
@@ -155,7 +197,7 @@ public class FFmpegStreamServiceTests
             await service.StopStreamAsync(channelId, "not-the-active-session");
             service.IsSessionActive(firstSessionId).Should().BeTrue();
 
-            await service.StopStreamAsync(channelId, firstSessionId);
+            await service.StopStreamAsync(channelId, firstSessionId, secondViewer.LeaseId);
             service.IsSessionActive(firstSessionId).Should().BeFalse();
 
             var second = await service.StartStreamAsync(channelId, sourceServer.Url.ToString());
@@ -178,19 +220,11 @@ public class FFmpegStreamServiceTests
             var copyResult = concurrentResults[0];
             var normalizeResult = concurrentResults[1];
 
-            concurrentResults.Should().OnlyContain(result => result.Success, because: string.Join(" | ", concurrentResults.Select(result => result.Error)));
-            copyResult.SessionId.Should().NotBe(normalizeResult.SessionId);
+            concurrentResults.Count(result => result.Success).Should().Be(1);
+            concurrentResults.Count(result => !result.Success).Should().Be(1);
 
             var active = service.GetActiveSessions().Single(session => session.ChannelId == concurrentChannelId);
-            if (active.SessionId == copyResult.SessionId)
-            {
-                active.Normalize.Should().BeFalse();
-            }
-            else
-            {
-                active.SessionId.Should().Be(normalizeResult.SessionId);
-                active.Normalize.Should().BeTrue();
-            }
+            active.ViewerCount.Should().Be(1);
 
             await service.StopStreamAsync(concurrentChannelId, active.SessionId);
         }

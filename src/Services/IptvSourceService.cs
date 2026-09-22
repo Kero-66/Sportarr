@@ -851,6 +851,7 @@ public class IptvSourceService
         List<string>? countries = null,
         List<string>? groups = null,
         bool? hasEpgOnly = null,
+        bool? attentionOnly = null,
         int? limit = null,
         int offset = 0)
     {
@@ -872,6 +873,16 @@ public class IptvSourceService
         if (favoritesOnly == true)
         {
             query = query.Where(c => c.IsFavorite);
+        }
+
+        if (attentionOnly == true)
+        {
+            query = query.Where(c =>
+                !c.IsEnabled ||
+                c.Status == IptvChannelStatus.Offline ||
+                c.Status == IptvChannelStatus.Error ||
+                (c.IsSportsChannel &&
+                 ((c.TvgId == null || c.TvgId.Trim() == "") || !c.LeagueMappings.Any())));
         }
 
         if (!string.IsNullOrEmpty(search))
@@ -921,6 +932,17 @@ public class IptvSourceService
         }
 
         return await query.ToListAsync();
+    }
+
+    public Task<int> GetAttentionChannelCountAsync()
+    {
+        return _db.IptvChannels.CountAsync(c =>
+            c.Source != null && c.Source.IsActive &&
+            (!c.IsEnabled ||
+             c.Status == IptvChannelStatus.Offline ||
+             c.Status == IptvChannelStatus.Error ||
+             (c.IsSportsChannel &&
+              ((c.TvgId == null || c.TvgId.Trim() == "") || !c.LeagueMappings.Any()))));
     }
 
     /// <summary>

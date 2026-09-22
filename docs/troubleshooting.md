@@ -88,4 +88,4 @@ Because the whole domain belongs to Sportarr here, one `location /` block that p
 The event must be monitored, the league needs a mapped channel (or EPG/broadcaster match), and the league's **Automatic DVR scheduling** toggle must be on.
 
 **Recording fails at startup with a connection timed out error?**
-Some providers take 15 to 25 seconds to deliver the first byte of a cold stream. In **Settings > DVR Recordings**, keep **Read Timeout** at 0 or above the slowest start you see, and raise **Max Retry Wait** if the source refuses the stream for the first few seconds.
+Some providers take 15 to 25 seconds to deliver the first byte of a cold stream. In **IPTV > Options > Recording > Advanced**, keep **Read Timeout** at 0 or above the slowest start you see, and raise **Max Retry Wait** if the source refuses the stream for the first few seconds.

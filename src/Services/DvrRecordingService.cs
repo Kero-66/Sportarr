@@ -1712,7 +1712,7 @@ public class DvrRecordingService
             {
                 throw new InvalidOperationException(
                     $"The configured DVR Recording Path '{configuredDvrPath}' is not accessible ({ex.Message}). " +
-                    "Fix the path in Settings > IPTV/DVR or clear it to record into a Media Management root folder.",
+                    "Fix the path in IPTV > Options > Recording or clear it to record into a Media Management root folder.",
                     ex);
             }
             basePath = configuredDvrPath;
@@ -1738,7 +1738,7 @@ public class DvrRecordingService
                 // cannot find and will lose.
                 throw new InvalidOperationException(
                     "No DVR Recording Path is set and no accessible root folder exists, so there is nowhere " +
-                    "durable to record. Set a path in Settings > IPTV/DVR, or add a root folder in " +
+                    "durable to record. Set a path in IPTV > Options > Recording, or add a root folder in " +
                     "Settings > Media Management.");
             }
 

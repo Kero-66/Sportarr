@@ -11,6 +11,8 @@ namespace Sportarr.Api.Services;
 public class FFmpegStreamService : IDisposable
 {
     private const int HlsPlaylistSize = 10;
+    private static readonly TimeSpan ViewerLeaseTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan ViewerLeaseSweepInterval = TimeSpan.FromSeconds(15);
     private readonly ILogger<FFmpegStreamService> _logger;
     private readonly ConcurrentDictionary<string, StreamSession> _sessions = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _channelLocks = new();
@@ -85,7 +87,17 @@ public class FFmpegStreamService : IDisposable
             {
                 Success = true,
                 SessionId = existingSession.SessionId,
+                LeaseId = existingSession.ViewerLeases.Acquire(),
                 PlaylistUrl = $"/api/v1/stream/{existingSession.SessionId}/playlist.m3u8"
+            };
+        }
+
+        if (existingSession is { IsActive: true } && existingSession.ViewerLeases.Count > 0)
+        {
+            return new StreamResult
+            {
+                Success = false,
+                Error = "This channel is already being watched with a different playback mode."
             };
         }
 
@@ -162,8 +174,10 @@ public class FFmpegStreamService : IDisposable
                 StandardErrorTask = stderrTask,
                 OutputPath = sessionPath,
                 PlaylistPath = playlistPath,
-                StartTime = DateTime.UtcNow
+                StartTime = DateTime.UtcNow,
+                ViewerLeases = new StreamViewerLeaseSet(ViewerLeaseTimeout)
             };
+            var leaseId = candidate.ViewerLeases.Acquire();
 
             // Wait for playlist to be created (with timeout)
             var waitStart = DateTime.UtcNow;
@@ -214,6 +228,7 @@ public class FFmpegStreamService : IDisposable
 
             _sessions[channelId] = candidate;
             candidate.MonitorTask = MonitorStreamAsync(candidate);
+            candidate.LeaseMonitorTask = MonitorViewerLeasesAsync(candidate);
 
             if (existingSession != null)
             {
@@ -224,6 +239,7 @@ public class FFmpegStreamService : IDisposable
             {
                 Success = true,
                 SessionId = sessionId,
+                LeaseId = leaseId,
                 PlaylistUrl = $"/api/v1/stream/{sessionId}/playlist.m3u8"
             };
         }
@@ -262,6 +278,13 @@ public class FFmpegStreamService : IDisposable
     /// stream another request had just put up for the same channel.
     /// </remarks>
     public async Task StopStreamAsync(string channelId, string? expectedSessionId)
+        => await StopStreamAsync(channelId, expectedSessionId, leaseId: null);
+
+    /// <summary>
+    /// Release one viewer. The shared process stops after the final viewer leaves.
+    /// A missing lease keeps the force-stop behavior used by service maintenance.
+    /// </summary>
+    public async Task StopStreamAsync(string channelId, string? expectedSessionId, string? leaseId)
     {
         if (!_sessions.ContainsKey(channelId))
         {
@@ -275,6 +298,15 @@ public class FFmpegStreamService : IDisposable
             if (!_sessions.TryGetValue(channelId, out var session)
                 || (expectedSessionId != null && session.SessionId != expectedSessionId))
             {
+                return;
+            }
+
+            if (leaseId != null && session.ViewerLeases.Release(leaseId) > 0)
+            {
+                _logger.LogDebug(
+                    "[Stream] Keeping shared stream for channel {ChannelId}; {ViewerCount} viewers remain",
+                    channelId,
+                    session.ViewerLeases.Count);
                 return;
             }
 
@@ -292,10 +324,18 @@ public class FFmpegStreamService : IDisposable
         }
     }
 
+    public bool RefreshViewerLease(string channelId, string sessionId, string leaseId)
+    {
+        return _sessions.TryGetValue(channelId, out var session)
+            && session.SessionId == sessionId
+            && session.ViewerLeases.Refresh(leaseId);
+    }
+
     private async Task StopSessionAsync(StreamSession session)
     {
         try
         {
+            session.LeaseMonitorCancellation.Cancel();
             _logger.LogInformation("[Stream] Stopping stream for channel {ChannelId}", session.ChannelId);
 
             if (!session.Process.HasExited)
@@ -402,6 +442,7 @@ public class FFmpegStreamService : IDisposable
                 SessionId = s.SessionId,
                 ChannelId = s.ChannelId,
                 Normalize = s.Normalize,
+                ViewerCount = s.ViewerLeases.Count,
                 StartTime = s.StartTime,
                 DurationSeconds = (int)(DateTime.UtcNow - s.StartTime).TotalSeconds
             })
@@ -491,6 +532,61 @@ public class FFmpegStreamService : IDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "[Stream] Error monitoring stream for channel {ChannelId}", session.ChannelId);
+        }
+    }
+
+    private async Task MonitorViewerLeasesAsync(StreamSession session)
+    {
+        while (!session.LeaseMonitorCancellation.IsCancellationRequested && session.IsActive)
+        {
+            try
+            {
+                await Task.Delay(ViewerLeaseSweepInterval, session.LeaseMonitorCancellation.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            var removed = session.ViewerLeases.RemoveExpired();
+            if (removed > 0)
+            {
+                _logger.LogDebug(
+                    "[Stream] Expired {LeaseCount} abandoned viewer leases for channel {ChannelId}",
+                    removed,
+                    session.ChannelId);
+            }
+
+            if (session.ViewerLeases.Count > 0)
+            {
+                continue;
+            }
+
+            var channelLock = _channelLocks.GetOrAdd(session.ChannelId, _ => new SemaphoreSlim(1, 1));
+            await channelLock.WaitAsync();
+            try
+            {
+                if (!_sessions.TryGetValue(session.ChannelId, out var current)
+                    || !ReferenceEquals(current, session))
+                {
+                    return;
+                }
+
+                if (session.ViewerLeases.Count > 0)
+                {
+                    continue;
+                }
+
+                ((ICollection<KeyValuePair<string, StreamSession>>)_sessions)
+                    .Remove(new KeyValuePair<string, StreamSession>(session.ChannelId, session));
+            }
+            finally
+            {
+                channelLock.Release();
+            }
+
+            await StopSessionAsync(session);
+            return;
         }
     }
 
@@ -647,9 +743,12 @@ internal class StreamSession
     public required Process Process { get; set; }
     public required Task<string> StandardErrorTask { get; set; }
     public Task? MonitorTask { get; set; }
+    public Task? LeaseMonitorTask { get; set; }
+    public CancellationTokenSource LeaseMonitorCancellation { get; } = new();
     public required string OutputPath { get; set; }
     public required string PlaylistPath { get; set; }
     public DateTime StartTime { get; set; }
+    public StreamViewerLeaseSet ViewerLeases { get; init; } = new();
 
     public bool IsActive => !Process.HasExited;
 }
@@ -662,6 +761,7 @@ public class StreamResult
     public bool Success { get; set; }
     public string? Error { get; set; }
     public string? SessionId { get; set; }
+    public string? LeaseId { get; set; }
     public string? PlaylistUrl { get; set; }
 }
 
@@ -673,6 +773,79 @@ public class StreamSessionInfo
     public required string SessionId { get; set; }
     public required string ChannelId { get; set; }
     public bool Normalize { get; set; }
+    public int ViewerCount { get; set; }
     public DateTime StartTime { get; set; }
     public int DurationSeconds { get; set; }
+}
+
+internal sealed class StreamViewerLeaseSet
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<string, DateTime> _leases = [];
+    private readonly TimeSpan _timeout;
+    private readonly Func<DateTime> _utcNow;
+
+    public StreamViewerLeaseSet(TimeSpan? timeout = null, Func<DateTime>? utcNow = null)
+    {
+        _timeout = timeout ?? TimeSpan.FromSeconds(90);
+        _utcNow = utcNow ?? (() => DateTime.UtcNow);
+    }
+
+    public int Count
+    {
+        get
+        {
+            lock (_gate) return _leases.Count;
+        }
+    }
+
+    public string Acquire()
+    {
+        lock (_gate)
+        {
+            string leaseId;
+            do
+            {
+                leaseId = Guid.NewGuid().ToString("N");
+            } while (!_leases.TryAdd(leaseId, _utcNow()));
+
+            return leaseId;
+        }
+    }
+
+    public int Release(string leaseId)
+    {
+        lock (_gate)
+        {
+            _leases.Remove(leaseId);
+            return _leases.Count;
+        }
+    }
+
+    public bool Refresh(string leaseId)
+    {
+        lock (_gate)
+        {
+            if (!_leases.ContainsKey(leaseId)) return false;
+            _leases[leaseId] = _utcNow();
+            return true;
+        }
+    }
+
+    public int RemoveExpired()
+    {
+        lock (_gate)
+        {
+            var cutoff = _utcNow() - _timeout;
+            var expired = _leases
+                .Where(lease => lease.Value <= cutoff)
+                .Select(lease => lease.Key)
+                .ToList();
+            foreach (var leaseId in expired)
+            {
+                _leases.Remove(leaseId);
+            }
+            return expired.Count;
+        }
+    }
 }
